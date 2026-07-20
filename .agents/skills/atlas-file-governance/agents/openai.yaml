@@ -1,0 +1,7 @@
+interface:
+  display_name: "Atlas 0.1 File Governance"
+  short_description: "Use the project-local Atlas 0.1 safety workflows"
+  default_prompt: "Use $atlas-file-governance to verify the local Atlas runtime and govern this file task within its implemented 0.1 capabilities."
+
+policy:
+  allow_implicit_invocation: true

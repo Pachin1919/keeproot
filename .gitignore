@@ -1,0 +1,30 @@
+# Atlas runtime state: Ledger, WAL/SHM files, snapshots, demos, and receipts
+/.atlas/
+
+# Test and generated output
+/test/.tmp/
+/coverage/
+/test-results/
+/tmp/
+/temp/
+
+# Dependencies and project-local caches
+/node_modules/
+/.npm/
+/.cache/
+
+# SQLite safety net if a state directory is configured outside .atlas
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# Logs and local secrets
+*.log
+.env
+.env.*
+!.env.example
+
+# Operating-system files
+.DS_Store
+Thumbs.db
