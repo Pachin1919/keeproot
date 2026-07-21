@@ -30,6 +30,12 @@ function timestamp() {
   return new Date().toISOString();
 }
 
+function stateConflict(message) {
+  const error = new Error(message);
+  error.code = 'ATLAS_STATE_CONFLICT';
+  return error;
+}
+
 function makeScanId() {
   const date = timestamp().replace(/[-:.TZ]/g, '').slice(0, 14);
   return `ENV-${date}-${crypto.randomUUID().slice(0, 8)}`;
@@ -410,7 +416,76 @@ function buildDefaultProfilePredictions(recommendation) {
   return predictions;
 }
 
-function compileEnvironmentPolicy(detail, profilePrediction, acceptedPredictions) {
+function buildLibraryContract(detail, recommendation, predictionIds) {
+  const predictionIdSet = new Set(predictionIds);
+  const zones = recommendation.mappings.map((mapping) => ({
+    area_role: mapping.area_role,
+    purpose: mapping.purpose,
+    accepts: mapping.accepts,
+    required: mapping.required,
+    status: mapping.status,
+    current_path: mapping.existing_path,
+    candidates: mapping.candidates,
+    proposed_path: mapping.suggested_path,
+  }));
+  const routes = Object.entries(recommendation.profile.derived_routes)
+    .map(([role, route]) => ({ role, ...route }));
+  const questions = zones
+    .filter((zone) => zone.status === 'ambiguous')
+    .slice(0, 3)
+    .map((zone) => ({
+      kind: 'choose_existing_area',
+      area_role: zone.area_role,
+      candidates: zone.candidates,
+      prompt: `Which existing directory should represent ${zone.area_role}?`,
+    }));
+  const candidate = {
+    schema: 'atlas-library-contract-candidate.v1',
+    scan_id: detail.scan.id,
+    source_fingerprint: detail.scan.fingerprint,
+    root: detail.scan.root_path,
+    scan_mode: detail.summary.scan_mode,
+    status: questions.length ? 'needs_input' : 'ready',
+    profile: {
+      id: recommendation.profile.id,
+      version: recommendation.profile.version,
+      name: recommendation.profile.name,
+      summary: recommendation.profile.summary,
+      selection: recommendation.selection,
+      confidence: recommendation.confidence,
+      evidence: recommendation.evidence,
+      alternatives: recommendation.alternatives,
+    },
+    zones,
+    routes,
+    questions,
+    suggestions: recommendation.structure_plan.operations
+      .filter((operation) => operation.operation !== 'map_existing_directory'),
+    source_changes: [],
+    approval: {
+      action: 'adopt_library_contract',
+      prediction_ids: [...predictionIds],
+      deferred_prediction_count: detail.predictions.filter(
+        (prediction) => !predictionIdSet.has(prediction.id) && !prediction.review,
+      ).length,
+    },
+  };
+  const hashMaterial = {
+    ...candidate,
+    approval: {
+      action: candidate.approval.action,
+      prediction_ids: candidate.approval.prediction_ids,
+    },
+  };
+  const hash = sha256Buffer(Buffer.from(JSON.stringify(hashMaterial), 'utf8'));
+  return {
+    schema: candidate.schema,
+    contract_id: `CONTRACT-${hash.slice(0, 16)}`,
+    ...Object.fromEntries(Object.entries(candidate).filter(([key]) => key !== 'schema')),
+  };
+}
+
+function compileEnvironmentPolicy(detail, profilePrediction, acceptedPredictions, libraryContract = null) {
   const profileId = profilePrediction.evidence.profile_id;
   const profile = getLibraryProfile(profileId);
   if (profile.version !== profilePrediction.evidence.profile_version) {
@@ -443,6 +518,15 @@ function compileEnvironmentPolicy(detail, profilePrediction, acceptedPredictions
     source_mutation_policy: profile.source_mutation_policy,
     artifact_roles: ARTIFACT_ROLES,
     role_transitions: ROLE_TRANSITIONS,
+    library_contract: libraryContract ? {
+      schema: 'atlas-library-contract.v1',
+      contract_id: libraryContract.contract_id,
+      profile_id: libraryContract.profile.id,
+      profile_version: libraryContract.profile.version,
+      zones: libraryContract.zones,
+      routes: libraryContract.routes,
+      source_changes: [],
+    } : null,
     area_mappings: acceptedMappings,
     derived_routes: profile.derived_routes,
     custom_routing_rules: customRouting,
@@ -1030,6 +1114,57 @@ export class Bootstrap {
     };
   }
 
+  contract(scanId, { profileId = null } = {}) {
+    const detail = this.show(scanId);
+    if (detail.scan.status === 'initialized') {
+      throw new Error('A new Library Contract requires a new Bootstrap scan after Initialize.');
+    }
+    const recommendation = recommendLibraryProfile(detail.entries, { profileId });
+    const receipt = this.recommend(scanId, { profileId });
+    return buildLibraryContract(this.show(scanId), recommendation, receipt.prediction_ids);
+  }
+
+  adoptContract(scanId, { contractId, profileId = null, reason = null }) {
+    if (!contractId) throw new Error('Library Contract adoption requires a contract ID.');
+    if (!reason?.trim()) throw new Error('Library Contract adoption requires a reason.');
+    const existing = this.show(scanId);
+    if (existing.scan.status === 'initialized') {
+      if (existing.receipt.contract_id !== contractId) {
+        throw stateConflict('The scan is already initialized with a different Library Contract.');
+      }
+      return existing.receipt;
+    }
+
+    const contract = this.contract(scanId, { profileId });
+    if (contract.contract_id !== contractId) {
+      throw stateConflict('Library Contract does not match the current scan and Profile; it may be stale or changed.');
+    }
+    if (contract.status !== 'ready') {
+      throw new Error(`Library Contract still needs input for ${contract.questions.length} question(s).`);
+    }
+
+    const acceptedIds = new Set(contract.approval.prediction_ids);
+    const current = this.show(scanId);
+    for (const prediction of current.predictions.filter((item) => acceptedIds.has(item.id))) {
+      if (prediction.review && prediction.review.decision !== 'accepted') {
+        throw new Error(
+          `Library Contract conflicts with an existing ${prediction.review.decision} review: ${prediction.id}.`,
+        );
+      }
+    }
+    for (const prediction of current.predictions) {
+      if (prediction.review) continue;
+      const decision = acceptedIds.has(prediction.id) ? 'accepted' : 'deferred';
+      this.review(prediction.id, {
+        decision,
+        reason: decision === 'accepted'
+          ? reason.trim()
+          : `Deferred by ${contract.contract_id}; not accepted or rejected.`,
+      });
+    }
+    return this.initialize(scanId, { libraryContract: contract });
+  }
+
   propose(scanId, { predictions, caller = {} }) {
     const detail = this.show(scanId);
     if (detail.scan.status === 'initialized') {
@@ -1051,8 +1186,8 @@ export class Bootstrap {
   }
 
   review(predictionId, { decision, reason = null }) {
-    if (!['accepted', 'rejected', 'corrected'].includes(decision)) {
-      throw new Error('Bootstrap review decision must be accepted, rejected, or corrected.');
+    if (!['accepted', 'rejected', 'corrected', 'deferred'].includes(decision)) {
+      throw new Error('Bootstrap review decision must be accepted, rejected, corrected, or deferred.');
     }
     return this.ledger.reviewBootstrapPrediction(predictionId, {
       decision,
@@ -1061,7 +1196,7 @@ export class Bootstrap {
     });
   }
 
-  initialize(scanId) {
+  initialize(scanId, { libraryContract = null } = {}) {
     const detail = this.show(scanId);
     if (detail.scan.status === 'initialized') return detail.receipt;
     const unreviewed = detail.predictions.filter((prediction) => !prediction.review);
@@ -1115,7 +1250,12 @@ export class Bootstrap {
         (prediction) => prediction.kind === 'structure_plan_candidate'
           && prediction.evidence?.profile_id === selectedProfile.id,
       )?.evidence?.plan ?? null;
-      const policy = compileEnvironmentPolicy(detail, profilePredictions[0], acceptedPredictions);
+      const policy = compileEnvironmentPolicy(
+        detail,
+        profilePredictions[0],
+        acceptedPredictions,
+        libraryContract,
+      );
       activePolicy = this.ledger.activateEnvironmentPolicy({
         runId: scanId,
         root: detail.scan.root_path,
@@ -1166,6 +1306,7 @@ export class Bootstrap {
       profile_id: selectedProfile?.id ?? null,
       active_policy_id: activePolicy?.id ?? null,
       active_rule_version_id: activePolicy?.rule_version_id ?? null,
+      contract_id: libraryContract?.contract_id ?? null,
       initialized_at: initializedAt,
     };
     this.ledger.finishBootstrapInitialize(scanId, receipt, initializedAt);

@@ -65,9 +65,12 @@ test('repository Agent Skill is complete, project-local, and references the impl
   assert.match(skill, /--scan-mode structure/);
   assert.match(workflows, /--scan-mode structure/);
   for (const command of [
-    'bootstrap scan', 'bootstrap profiles', 'bootstrap recommend', 'bootstrap context',
-    'bootstrap propose', 'begin', 'close', 'show', 'abort', 'rollback', 'guarded prepare',
+    'bootstrap scan', 'bootstrap profiles', 'bootstrap recommend', 'bootstrap contract',
+    'bootstrap adopt', 'bootstrap context',
+    'bootstrap propose', 'intake prepare', 'intake execute', 'task prepare', 'task fulfill', 'task show', 'task complete', 'task rollback',
+    'begin', 'close', 'show', 'abort', 'rollback', 'guarded prepare',
     'derive recommend', 'derive prepare', 'derive preview', 'derive revise', 'derive promote',
+    'project evolve', 'evolve prepare', 'evolve preview', 'evolve approve', 'evolve execute',
     'work stage', 'storage plan',
   ]) {
     assert.match(workflows, new RegExp(command.replace(' ', '\\s+')));
@@ -91,6 +94,17 @@ test('Skill command sequence completes Agent Bootstrap, Derived, Tracked Direct,
   assert.ok(capabilities.workflows.guarded.includes('execute'));
   assert.ok(capabilities.workflows.bootstrap.includes('propose'));
   assert.ok(capabilities.workflows.bootstrap.includes('recommend'));
+  assert.ok(capabilities.workflows.bootstrap.includes('contract'));
+  assert.ok(capabilities.workflows.bootstrap.includes('adopt'));
+  assert.ok(capabilities.workflows.intake.includes('execute'));
+  assert.ok(capabilities.workflows.evolution.includes('execute'));
+  assert.deepEqual(capabilities.evolution_operations, [
+    'create_directory', 'move_file', 'migrate_project',
+  ]);
+  assert.ok(capabilities.workflows.registry.includes('evolve'));
+  assert.deepEqual(capabilities.intake_origins, [
+    'human_submitted', 'human_written', 'agent_generated', 'download',
+  ]);
   assert.ok(capabilities.workflows.derived.includes('execute'));
   assert.ok(capabilities.workflows.derived.includes('promote'));
   assert.ok(capabilities.workflows.work.includes('stage'));
@@ -208,4 +222,112 @@ test('Skill command sequence completes Agent Bootstrap, Derived, Tracked Direct,
   agentCli(stateDir, ['guarded', 'rollback', prepared.run_id]);
   assert.equal(fs.readFileSync(path.join(vault, 'allowed-b.md'), 'utf8'), baselineB);
   assert.equal(fs.existsSync(path.join(caseRoot, 'vault', '.atlas')), false);
+});
+
+test('Skill can adopt one compact Library Contract through the JSON CLI', () => {
+  const { vault, stateDir } = setup('skill-library-contract');
+  const before = fs.readdirSync(vault, { recursive: true }).sort();
+  const scan = agentCli(stateDir, [
+    'bootstrap', 'scan', '--root', vault, '--scan-mode', 'structure', ...callerArgs,
+  ]);
+  const contract = agentCli(stateDir, [
+    'bootstrap', 'contract', scan.scan_id, '--profile', 'project-work',
+  ]);
+  assert.equal(contract.status, 'ready');
+  assert.equal(contract.questions.length, 0);
+  assert.deepEqual(contract.source_changes, []);
+
+  const adopted = agentCli(stateDir, [
+    'bootstrap', 'adopt', scan.scan_id,
+    '--contract', contract.contract_id,
+    '--profile', 'project-work',
+    '--reason', 'Skill fixture accepts the compact Contract.',
+  ]);
+  assert.equal(adopted.contract_id, contract.contract_id);
+  assert.equal(adopted.status, 'initialized');
+  assert.deepEqual(fs.readdirSync(vault, { recursive: true }).sort(), before);
+});
+
+test('Skill completes one reviewed physical Evolution and reconciles through Preview', () => {
+  const { vault, stateDir } = setup('skill-evolution');
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas'), { recursive: true });
+  const prepared = agentCli(stateDir, [
+    'evolve', 'prepare', '--root', vault, '--operation', 'create_directory',
+    '--target', 'Projects/Atlas/Working', '--intent', 'Create the missing Contract area.',
+    ...callerArgs,
+  ]);
+  assert.equal(prepared.requires_approval, true);
+  let preview = agentCli(stateDir, ['evolve', 'preview', prepared.run_id]);
+  assert.deepEqual(preview.run.caller, expectedCaller);
+  assert.equal(preview.plan.source_changes[0].change, 'create_directory');
+  assert.equal(fs.existsSync(path.join(vault, prepared.target)), false);
+  agentCli(stateDir, [
+    'evolve', 'approve', prepared.run_id, '--reason', 'Accept this one structural change.',
+  ]);
+  assert.equal(agentCli(stateDir, ['evolve', 'execute', prepared.run_id]).verified, true);
+  preview = agentCli(stateDir, ['evolve', 'preview', prepared.run_id]);
+  assert.equal(preview.run.status, 'executed');
+  assert.equal(fs.statSync(path.join(vault, prepared.target)).isDirectory(), true);
+  agentCli(stateDir, ['evolve', 'rollback', prepared.run_id]);
+  assert.equal(fs.existsSync(path.join(vault, prepared.target)), false);
+});
+
+test('Skill receives a stable state-conflict error for an invented Library Contract ID', () => {
+  const { vault, stateDir } = setup('skill-library-contract-conflict');
+  const scan = agentCli(stateDir, [
+    'bootstrap', 'scan', '--root', vault, '--scan-mode', 'structure', ...callerArgs,
+  ]);
+  agentCli(stateDir, ['bootstrap', 'contract', scan.scan_id, '--profile', 'project-work']);
+  const result = spawnSync(process.execPath, [
+    cliPath, 'bootstrap', 'adopt', scan.scan_id,
+    '--contract', 'CONTRACT-0000000000000000', '--profile', 'project-work',
+    '--reason', 'Must fail.', '--json',
+  ], {
+    cwd: projectRoot,
+    windowsHide: true,
+    encoding: 'utf8',
+    env: { ...process.env, ATLAS_STATE_DIR: stateDir },
+  });
+  assert.equal(result.status, 1);
+  const envelope = JSON.parse(result.stdout);
+  assert.equal(envelope.ok, false);
+  assert.equal(envelope.error.code, 'ATLAS_STATE_CONFLICT');
+  assert.equal(agentCli(stateDir, ['bootstrap', 'show', scan.scan_id]).scan.status, 'scanned');
+});
+
+test('Skill routes and executes a high-confidence Agent Intake without another user pause', () => {
+  const { caseRoot, vault, stateDir } = setup('skill-intake');
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Working'), { recursive: true });
+  const scan = agentCli(stateDir, [
+    'bootstrap', 'scan', '--root', vault, '--scan-mode', 'structure', ...callerArgs,
+  ]);
+  const contract = agentCli(stateDir, [
+    'bootstrap', 'contract', scan.scan_id, '--profile', 'project-work',
+  ]);
+  agentCli(stateDir, [
+    'bootstrap', 'adopt', scan.scan_id, '--contract', contract.contract_id,
+    '--profile', 'project-work', '--reason', 'Use the Project Work Contract.',
+  ]);
+  const project = agentCli(stateDir, [
+    'project', 'create', '--name', 'Atlas', '--path', 'Projects/Atlas',
+  ]);
+  const candidateFile = path.join(caseRoot, 'agent-animation-demo.html');
+  fs.writeFileSync(candidateFile, '<main>agent demo</main>\n', 'utf8');
+  const prepared = agentCli(stateDir, [
+    'intake', 'prepare', '--root', vault, '--candidate-file', candidateFile,
+    '--origin', 'agent_generated', '--kind', 'demo', '--project', project.project_id,
+    '--intent', 'Keep the demo outside website source code.', ...callerArgs,
+  ]);
+  assert.equal(prepared.auto_execute, true);
+  assert.equal(prepared.target, 'Projects/Atlas/Working/agent-animation-demo.html');
+  const executed = agentCli(stateDir, [
+    'intake', 'execute', prepared.run_id,
+    '--reason', 'The user asked Atlas to organize generated project files.',
+  ]);
+  assert.equal(executed.status, 'executed');
+  const shown = agentCli(stateDir, ['intake', 'show', prepared.run_id]);
+  assert.equal(shown.placement.policy.intake.kind, 'demo');
+  assert.equal(shown.inputs.length, 0);
+  agentCli(stateDir, ['intake', 'rollback', prepared.run_id]);
+  assert.equal(fs.existsSync(path.join(vault, prepared.target)), false);
 });

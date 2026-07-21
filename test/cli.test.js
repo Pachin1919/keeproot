@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { Bootstrap } from '../src/bootstrap.js';
+import { Registry } from '../src/registry.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cliPath = path.join(projectRoot, 'bin', 'atlas.js');
@@ -28,6 +30,52 @@ function cli(stateDir, args, extraEnv = {}) {
     env: { ...process.env, ATLAS_STATE_DIR: stateDir, ...extraEnv },
   });
 }
+
+test('CLI exposes the bounded Task Contract create and rollback flow', () => {
+  const { caseRoot, vault, stateDir } = setup('cli-task-contract');
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Sources'), { recursive: true });
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Outputs'), { recursive: true });
+  fs.writeFileSync(path.join(vault, 'Projects', 'Atlas', 'Sources', 'source.md'), 'bounded source\n', 'utf8');
+  const bootstrap = new Bootstrap({ stateDir });
+  const scan = bootstrap.scan({ root: vault, scanMode: 'structure' });
+  const contract = bootstrap.contract(scan.scan_id, { profileId: 'project-work' });
+  bootstrap.adoptContract(scan.scan_id, {
+    contractId: contract.contract_id, profileId: 'project-work', reason: 'CLI Task fixture.',
+  });
+  bootstrap.dispose();
+  const registry = new Registry({ stateDir });
+  const project = registry.create({ name: 'Atlas', currentPath: 'Projects/Atlas' });
+  registry.dispose();
+  const requestFile = path.join(caseRoot, 'task-request.json');
+  fs.writeFileSync(requestFile, JSON.stringify({
+    intent: 'Create one governed report.',
+    project_id: project.project_id,
+    inputs: [{ path: 'Projects/Atlas/Sources/source.md', required: true }],
+    output: {
+      target: 'Projects/Atlas/Outputs/report.md', role: 'report',
+      data_class: 'generated_output', action: 'auto',
+    },
+  }), 'utf8');
+  const preparedResult = cli(stateDir, ['task', 'prepare', '--root', vault, '--request-file', requestFile, '--json']);
+  assert.equal(preparedResult.status, 0, preparedResult.stderr);
+  const prepared = JSON.parse(preparedResult.stdout).data;
+  assert.equal(prepared.status, 'ready');
+  assert.equal(prepared.read.selected.length, 1);
+  const candidateFile = path.join(caseRoot, 'candidate.md');
+  fs.writeFileSync(candidateFile, '# Governed report\n', 'utf8');
+  const fulfilledResult = cli(stateDir, [
+    'task', 'fulfill', prepared.task_id, '--candidate-file', candidateFile,
+    '--reason', 'Exact Task authorization.', '--json',
+  ]);
+  assert.equal(fulfilledResult.status, 0, fulfilledResult.stderr);
+  const fulfilled = JSON.parse(fulfilledResult.stdout).data;
+  assert.equal(fulfilled.status, 'completed');
+  assert.equal(fulfilled.write_run.mode, 'derived');
+  const shown = cli(stateDir, ['task', 'show', prepared.task_id, '--json']);
+  assert.equal(JSON.parse(shown.stdout).data.run.status, 'completed');
+  assert.equal(cli(stateDir, ['task', 'rollback', prepared.task_id, '--json']).status, 0);
+  assert.equal(fs.existsSync(path.join(vault, 'Projects', 'Atlas', 'Outputs', 'report.md')), false);
+});
 
 test('CLI exposes Risk, Project Registry, and the complete single-file Guarded flow', () => {
   const { caseRoot, vault, stateDir } = setup('cli-v1');
@@ -72,6 +120,35 @@ test('CLI exposes Risk, Project Registry, and the complete single-file Guarded f
   const rolledBack = cli(stateDir, ['guarded', 'rollback', runId]);
   assert.equal(rolledBack.status, 0, rolledBack.stderr);
   assert.equal(fs.readFileSync(target, 'utf8'), baseline);
+});
+
+test('CLI exposes the reviewed Evolution create and rollback flow', () => {
+  const { vault, stateDir } = setup('cli-evolution');
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas'), { recursive: true });
+  const preparedResult = cli(stateDir, [
+    'evolve', 'prepare', '--root', vault, '--operation', 'create_directory',
+    '--target', 'Projects/Atlas/Working', '--intent', 'Create one accepted work area.', '--json',
+  ]);
+  assert.equal(preparedResult.status, 0, preparedResult.stderr);
+  const prepared = JSON.parse(preparedResult.stdout).data;
+  assert.equal(prepared.status, 'prepared');
+  assert.equal(fs.existsSync(path.join(vault, prepared.target)), false);
+
+  const preview = cli(stateDir, ['evolve', 'preview', prepared.run_id, '--json']);
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.equal(JSON.parse(preview.stdout).data.plan.requires_approval, true);
+  assert.equal(cli(stateDir, [
+    'evolve', 'approve', prepared.run_id, '--reason', 'Create this directory.', '--json',
+  ]).status, 0);
+  const executed = cli(stateDir, ['evolve', 'execute', prepared.run_id, '--json']);
+  assert.equal(executed.status, 0, executed.stderr);
+  assert.equal(JSON.parse(executed.stdout).data.verified, true);
+  assert.equal(fs.statSync(path.join(vault, prepared.target)).isDirectory(), true);
+
+  const rolledBack = cli(stateDir, ['evolve', 'rollback', prepared.run_id, '--json']);
+  assert.equal(rolledBack.status, 0, rolledBack.stderr);
+  assert.equal(JSON.parse(rolledBack.stdout).data.status, 'rolled_back');
+  assert.equal(fs.existsSync(path.join(vault, prepared.target)), false);
 });
 
 test('CLI refuses to place Atlas runtime state outside the project', () => {

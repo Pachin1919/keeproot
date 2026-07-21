@@ -1,0 +1,607 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { Derived } from './derived.js';
+import { Guarded } from './guarded.js';
+import { Ledger } from './ledger.js';
+import { isPathInside, normalizeRoot, toPortablePath } from './paths.js';
+import { getArtifactRole } from './profiles.js';
+import { captureBlob, sha256File } from './snapshots.js';
+import { withStateLock } from './state-lock.js';
+
+const MAX_INPUTS = 50;
+const MAX_REQUEST_BYTES = 256 * 1024;
+const MAX_COMPARE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_FILES = 12;
+const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
+const ACTIONS = new Set(['auto', 'create', 'append', 'delta', 'new_version', 'supersede', 'delete', 'archive']);
+const DATA_CLASSES = new Set(['generated_output', 'temporal_snapshot', 'append_only_data', 'human_writing']);
+
+function timestamp() {
+  return new Date().toISOString();
+}
+
+function makeRunId() {
+  const date = timestamp().replace(/[-:.TZ]/g, '').slice(0, 14);
+  return `TSK-${date}-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function stateConflict(message) {
+  const error = new Error(message);
+  error.code = 'ATLAS_STATE_CONFLICT';
+  return error;
+}
+
+function sha256Json(value) {
+  return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function isValidDate(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(date.valueOf()) && date.toISOString().slice(0, 10) === value;
+}
+
+function assertRealPathChain(root, absolute, allowMissingLeaf = false) {
+  const relative = path.relative(root, absolute);
+  let cursor = root;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, segment);
+    if (!fs.existsSync(cursor)) {
+      if (allowMissingLeaf && cursor === absolute) return;
+      throw new Error(`Task path does not exist: ${cursor}`);
+    }
+    if (fs.lstatSync(cursor).isSymbolicLink()) {
+      throw new Error(`Task paths cannot pass through symbolic links or junctions: ${cursor}`);
+    }
+  }
+}
+
+function normalizeExistingFile(root, value, label) {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} path is required.`);
+  const lexical = path.isAbsolute(value) ? path.resolve(value) : path.resolve(root, value);
+  if (!isPathInside(root, lexical) || lexical === root) throw new Error(`${label} escapes or is outside the root: ${value}`);
+  assertRealPathChain(root, lexical);
+  const stat = fs.lstatSync(lexical);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${label} must be a regular file: ${lexical}`);
+  const real = fs.realpathSync.native(lexical);
+  if (!isPathInside(root, real)) throw new Error(`${label} resolves outside the root: ${value}`);
+  return { absolute: real, path: toPortablePath(path.relative(root, real)), stat: fs.statSync(real) };
+}
+
+function normalizeTarget(root, value) {
+  if (typeof value !== 'string' || !value.trim()) throw new Error('Task output target is required.');
+  const lexical = path.isAbsolute(value) ? path.resolve(value) : path.resolve(root, value);
+  if (!isPathInside(root, lexical) || lexical === root) throw new Error(`Task output target escapes or is outside the root: ${value}`);
+  if (fs.existsSync(lexical)) {
+    const existing = normalizeExistingFile(root, lexical, 'Task output target');
+    return { ...existing, exists: true };
+  }
+  const parent = path.dirname(lexical);
+  if (!fs.existsSync(parent)) throw new Error(`Task output parent directory does not exist: ${parent}`);
+  assertRealPathChain(root, parent);
+  const parentStat = fs.lstatSync(parent);
+  if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+    throw new Error(`Task output parent must be a real directory: ${parent}`);
+  }
+  const realParent = fs.realpathSync.native(parent);
+  if (!isPathInside(root, realParent)) throw new Error(`Task output resolves outside the root: ${value}`);
+  const absolute = path.join(realParent, path.basename(lexical));
+  return { absolute, path: toPortablePath(path.relative(root, absolute)), exists: false };
+}
+
+function normalizeCoverage(value) {
+  if (value == null) return null;
+  if (!value || !isValidDate(value.start) || !isValidDate(value.end) || value.start > value.end) {
+    throw new Error('Task input coverage requires valid start/end dates with start <= end.');
+  }
+  return { start: value.start, end: value.end };
+}
+
+function rangesOverlap(left, right) {
+  return left.start <= right.end && right.start <= left.end;
+}
+
+function containsRange(container, contained) {
+  return container.start <= contained.start && container.end >= contained.end;
+}
+
+function normalizedCandidate(candidateFile, root) {
+  if (typeof candidateFile !== 'string' || !candidateFile.trim()) throw new Error('Task fulfillment requires a candidate file.');
+  const absolute = path.resolve(candidateFile);
+  if (!fs.existsSync(absolute)) throw new Error(`Task candidate does not exist: ${absolute}`);
+  const stat = fs.lstatSync(absolute);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Task candidate must be a regular non-symbolic-link file.');
+  const real = fs.realpathSync.native(absolute);
+  if (isPathInside(root, real)) throw new Error('Task candidate must remain outside the governed root until Atlas executes it.');
+  return real;
+}
+
+function fileStartsWith(candidatePath, baselinePath, baselineSize, baselineHash) {
+  const candidateSize = fs.statSync(candidatePath).size;
+  if (candidateSize <= baselineSize) return false;
+  const hash = crypto.createHash('sha256');
+  const handle = fs.openSync(candidatePath, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, baselineSize)));
+    let offset = 0;
+    while (offset < baselineSize) {
+      const length = Math.min(buffer.length, baselineSize - offset);
+      const read = fs.readSync(handle, buffer, 0, length, offset);
+      if (read <= 0) return false;
+      hash.update(buffer.subarray(0, read));
+      offset += read;
+    }
+  } finally {
+    fs.closeSync(handle);
+  }
+  return hash.digest('hex') === baselineHash;
+}
+
+function relationForStrategy(strategy) {
+  if (strategy === 'supersede') return 'supersedes';
+  if (strategy === 'delta') return 'delta_of';
+  if (strategy === 'new_version') return 'transforms';
+  if (strategy === 'append') return 'appends_to';
+  return 'derived_from';
+}
+
+function publicContract(taskId, contract) {
+  return { task_id: taskId, ...contract };
+}
+
+function normalizedRequest(request) {
+  if (!request || typeof request !== 'object' || Array.isArray(request)) throw new Error('Task request must be an object.');
+  if (Buffer.byteLength(JSON.stringify(request), 'utf8') > MAX_REQUEST_BYTES) throw new Error('Task request is too large.');
+  if (typeof request.intent !== 'string' || !request.intent.trim()) throw new Error('Task intent is required.');
+  if (typeof request.project_id !== 'string' || !request.project_id.trim()) throw new Error('Task project_id is required.');
+  if (!Array.isArray(request.inputs) || request.inputs.length === 0 || request.inputs.length > MAX_INPUTS) {
+    throw new Error(`Task requires 1-${MAX_INPUTS} explicit inputs.`);
+  }
+  if (!request.output || typeof request.output !== 'object') throw new Error('Task output is required.');
+  const action = request.output.action ?? 'auto';
+  const dataClass = request.output.data_class ?? 'generated_output';
+  if (!ACTIONS.has(action)) throw new Error(`Unsupported Task output action: ${action}`);
+  if (!DATA_CLASSES.has(dataClass)) throw new Error(`Unsupported Task data class: ${dataClass}`);
+  const role = getArtifactRole(request.output.role).id;
+  const maxFiles = request.budget?.max_files ?? DEFAULT_MAX_FILES;
+  const maxBytes = request.budget?.max_bytes ?? DEFAULT_MAX_BYTES;
+  if (!Number.isSafeInteger(maxFiles) || maxFiles < 1 || maxFiles > MAX_INPUTS) throw new Error('Task budget max_files is invalid.');
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error('Task budget max_bytes is invalid.');
+  return {
+    intent: request.intent.trim(),
+    project_id: request.project_id.trim(),
+    inputs: request.inputs.map((input, ordinal) => {
+      if (!input || typeof input !== 'object') throw new Error('Each Task input must be an object.');
+      const temporalMode = input.temporal_mode ?? null;
+      if (temporalMode != null && !['snapshot', 'segment'].includes(temporalMode)) {
+        throw new Error(`Unsupported temporal_mode: ${temporalMode}`);
+      }
+      return {
+        ordinal,
+        path: input.path,
+        series: typeof input.series === 'string' && input.series.trim() ? input.series.trim() : null,
+        temporal_mode: temporalMode,
+        coverage: normalizeCoverage(input.coverage),
+        required: input.required !== false,
+        priority: Number.isSafeInteger(input.priority) && input.priority >= 0 ? input.priority : 100,
+      };
+    }),
+    budget: { max_files: maxFiles, max_bytes: maxBytes },
+    output: {
+      target: request.output.target,
+      role,
+      data_class: dataClass,
+      action,
+      base_input: request.output.base_input ?? null,
+    },
+  };
+}
+
+function buildTemporalRelations(inputs) {
+  const relations = [];
+  const excluded = new Map();
+  for (let leftIndex = 0; leftIndex < inputs.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < inputs.length; rightIndex += 1) {
+      const left = inputs[leftIndex];
+      const right = inputs[rightIndex];
+      if (!left.series || left.series !== right.series) continue;
+      if (left.content_hash === right.content_hash) {
+        excluded.set(right.ordinal, 'duplicate_material');
+        relations.push({
+          type: 'duplicate_of', from: right.path, to: left.path, confidence: 1,
+          evidence: { same_hash: true, content_inclusion: true },
+        });
+        continue;
+      }
+      if (!left.coverage || !right.coverage) continue;
+      let container = null;
+      let contained = null;
+      if (containsRange(left.coverage, right.coverage)) [container, contained] = [left, right];
+      else if (containsRange(right.coverage, left.coverage)) [container, contained] = [right, left];
+      if (container && contained) {
+        let inclusion = null;
+        if (container.byte_size <= MAX_COMPARE_BYTES && contained.byte_size <= MAX_COMPARE_BYTES) {
+          inclusion = fs.readFileSync(container.absolute).includes(fs.readFileSync(contained.absolute));
+        }
+        if (inclusion) {
+          excluded.set(contained.ordinal, 'superseded_by_verified_snapshot');
+          relations.push({
+            type: 'supersedes', from: container.path, to: contained.path, confidence: 1,
+            evidence: { same_series: true, coverage_contains: true, content_inclusion: true },
+          });
+        } else {
+          relations.push({
+            type: 'overlaps', from: container.path, to: contained.path, confidence: inclusion === false ? 0.9 : 0.7,
+            evidence: { same_series: true, coverage_contains: true, content_inclusion: inclusion },
+          });
+        }
+      } else if (rangesOverlap(left.coverage, right.coverage)) {
+        relations.push({
+          type: 'overlaps', from: right.path, to: left.path, confidence: 0.9,
+          evidence: { same_series: true, coverage_overlap: true, content_inclusion: false },
+        });
+      } else if (left.temporal_mode === 'segment' && right.temporal_mode === 'segment') {
+        const newer = left.coverage.start > right.coverage.start ? left : right;
+        const older = newer === left ? right : left;
+        relations.push({
+          type: 'delta_of', from: newer.path, to: older.path, confidence: 0.95,
+          evidence: { same_series: true, disjoint_segments: true },
+        });
+      }
+    }
+  }
+  return { relations, excluded };
+}
+
+function chooseReadSet(inputs, temporalExcluded, budget) {
+  const selected = [];
+  const excluded = [];
+  let bytes = 0;
+  const candidates = [...inputs].sort((left, right) => (
+    left.priority - right.priority
+      || (right.coverage?.end ?? '').localeCompare(left.coverage?.end ?? '')
+      || left.ordinal - right.ordinal
+  ));
+  for (const input of candidates) {
+    const temporalReason = temporalExcluded.get(input.ordinal);
+    if (temporalReason) {
+      excluded.push({ ...input, reason: temporalReason });
+    } else if (selected.length >= budget.max_files || bytes + input.byte_size > budget.max_bytes) {
+      excluded.push({ ...input, reason: 'read_budget' });
+    } else {
+      selected.push({ ...input, reason: 'selected' });
+      bytes += input.byte_size;
+    }
+  }
+  selected.sort((a, b) => a.ordinal - b.ordinal);
+  excluded.sort((a, b) => a.ordinal - b.ordinal);
+  return { selected, excluded, bytes };
+}
+
+function chooseWrite(target, output, inputs, relations) {
+  const base = { target: target.path, role: output.role, data_class: output.data_class, scope: 'exact_target_only' };
+  if (['delete', 'archive'].includes(output.action)) {
+    return { ...base, strategy: 'deny', executor: 'none', decision: 'deny', relation_type: null, reason: 'Task Contract V1 does not execute delete or archive actions.' };
+  }
+  if (target.exists) {
+    if (output.data_class === 'append_only_data' && ['auto', 'append'].includes(output.action)
+        && inputs.some((input) => input.path === target.path)) {
+      return { ...base, strategy: 'append', executor: 'guarded_update', decision: 'warn', relation_type: 'appends_to', reason: 'Existing append-only data requires exact Candidate review and Guarded execution.' };
+    }
+    return { ...base, strategy: 'deny', executor: 'none', decision: 'deny', relation_type: null, reason: 'Existing targets may only use the append-only Guarded strategy in Task Contract V1.' };
+  }
+  if (output.action === 'append') {
+    return { ...base, strategy: 'deny', executor: 'none', decision: 'deny', relation_type: null, reason: 'Append requires an existing target included in the read set.' };
+  }
+  let strategy = output.action;
+  if (strategy === 'auto') {
+    if (output.data_class === 'temporal_snapshot' && relations.some((relation) => relation.type === 'supersedes')) strategy = 'supersede';
+    else if (output.data_class === 'append_only_data') strategy = 'delta';
+    else if (output.data_class === 'human_writing' && output.base_input) strategy = 'new_version';
+    else strategy = 'create';
+  }
+  return { ...base, strategy, executor: 'derived_create', decision: 'allow', relation_type: relationForStrategy(strategy), reason: `Create one governed ${strategy} output at the exact target.` };
+}
+
+export class TaskContract {
+  constructor({ stateDir }) {
+    if (!stateDir) throw new Error('TaskContract requires a stateDir.');
+    this.stateDir = path.resolve(stateDir);
+    this._ledger = null;
+    this._derived = null;
+    this._guarded = null;
+  }
+
+  get ledger() {
+    if (!this._ledger) this._ledger = new Ledger(this.stateDir);
+    return this._ledger;
+  }
+
+  get derived() {
+    if (!this._derived) this._derived = new Derived({ stateDir: this.stateDir });
+    return this._derived;
+  }
+
+  get guarded() {
+    if (!this._guarded) this._guarded = new Guarded({ stateDir: this.stateDir });
+    return this._guarded;
+  }
+
+  prepare({ root: rootInput, request: rawRequest, caller = {} }) {
+    const root = normalizeRoot(rootInput);
+    if (isPathInside(root, this.stateDir)) throw new Error(`Atlas state directory must be outside the Task root: ${this.stateDir}`);
+    const request = normalizedRequest(rawRequest);
+    const active = this.ledger.getActiveEnvironmentPolicy(root);
+    if (!active) throw new Error('Task Contract requires an active reviewed Library Contract for this root.');
+    const project = this.ledger.getProject(request.project_id);
+    if (project.status !== 'active' || !project.current_path) throw new Error(`Task Project is not active: ${request.project_id}`);
+    const seen = new Set();
+    const inputs = request.inputs.map((input) => {
+      const normalized = normalizeExistingFile(root, input.path, 'Task input');
+      if (seen.has(normalized.path)) throw new Error(`Task input is duplicated: ${normalized.path}`);
+      seen.add(normalized.path);
+      return {
+        ...input,
+        ...normalized,
+        content_hash: sha256File(normalized.absolute),
+        byte_size: normalized.stat.size,
+      };
+    });
+    const target = normalizeTarget(root, request.output.target);
+    if (!(target.path === project.current_path || target.path.startsWith(`${project.current_path}/`))) {
+      throw new Error(`Task output must remain inside Project ${project.id} at ${project.current_path}.`);
+    }
+    request.inputs = inputs.map(({ ordinal, path: inputPath, series, temporal_mode: temporalMode, coverage, required, priority }) => ({
+      ordinal, path: inputPath, series, temporal_mode: temporalMode, coverage, required, priority,
+    }));
+    if (request.output.base_input != null) {
+      const base = normalizeExistingFile(root, request.output.base_input, 'Task output base_input');
+      if (!inputs.some((input) => input.path === base.path)) {
+        throw new Error('Task output base_input must also be one of the explicit inputs.');
+      }
+      request.output.base_input = base.path;
+    }
+    request.output.target = target.path;
+    const temporal = buildTemporalRelations(inputs);
+    const readSet = chooseReadSet(inputs, temporal.excluded, request.budget);
+    const write = chooseWrite(target, request.output, inputs, temporal.relations);
+    const missingRequired = readSet.excluded.filter((input) => input.required && input.reason === 'read_budget');
+    const appendInputMissing = write.strategy === 'append'
+      && !readSet.selected.some((input) => input.path === target.path);
+    const questions = [];
+    if (missingRequired.length) questions.push({ field: 'budget', question: 'Increase the explicit read budget or make the excluded input optional.', paths: missingRequired.map((input) => input.path) });
+    if (appendInputMissing) questions.push({ field: 'inputs', question: 'The append target must fit in the selected read set.', paths: [target.path] });
+    const status = write.decision === 'deny' ? 'blocked' : (missingRequired.length || appendInputMissing) ? 'needs_input' : 'ready';
+    const cleanItem = (item) => ({
+      ordinal: item.ordinal, path: item.path, content_hash: item.content_hash,
+      byte_size: item.byte_size, series: item.series, temporal_mode: item.temporal_mode,
+      coverage: item.coverage, required: item.required, priority: item.priority,
+      ...(item.reason ? { reason: item.reason } : {}),
+    });
+    const contract = {
+      schema: 'atlas-task-contract.v1',
+      status,
+      read: {
+        scope: 'selected_paths_only',
+        selected: readSet.selected.map(cleanItem),
+        excluded: readSet.excluded.map(cleanItem),
+        budget: request.budget,
+        selected_bytes: readSet.bytes,
+        estimated_tokens: Math.ceil(readSet.bytes / 4),
+      },
+      temporal_relations: temporal.relations,
+      write,
+      boundaries: { root, project_id: project.id, project_path: project.current_path, environment_rule_version_id: active.rule_version_id },
+      questions: questions.slice(0, 3),
+    };
+    const contractHash = sha256Json({ request, contract });
+    const contractId = `TASKC-${contractHash.slice(0, 16)}`;
+    const existing = this.ledger.findTaskContract(contractId);
+    if (existing) return publicContract(existing.run.id, existing.contract);
+    let result = null;
+    withStateLock(this.stateDir, () => {
+      const lockedExisting = this.ledger.findTaskContract(contractId);
+      if (lockedExisting) {
+        result = publicContract(lockedExisting.run.id, lockedExisting.contract);
+        return;
+      }
+      const runId = makeRunId();
+      const capturedInputs = inputs.map((input) => {
+        const selected = readSet.selected.some((candidate) => candidate.ordinal === input.ordinal);
+        return {
+          ...cleanItem(input),
+          selected,
+          selection_reason: selected ? 'selected' : readSet.excluded.find((candidate) => candidate.ordinal === input.ordinal)?.reason,
+          capture: selected ? captureBlob(input.absolute, this.stateDir) : null,
+        };
+      });
+      this.ledger.createTaskContract({
+        runId, contractId, root, request, contract, contractHash, project,
+        environmentRuleVersionId: active.rule_version_id, inputs: capturedInputs, caller,
+        startedAt: timestamp(),
+      });
+      result = publicContract(runId, contract);
+    });
+    return result;
+  }
+
+  show(taskId) {
+    return this.ledger.getTaskDetail(taskId);
+  }
+
+  #completionResult(detail) {
+    return { ...detail.completion_receipt, write_run: { run_id: detail.completion_receipt.write_run_id, mode: detail.completion_receipt.write_mode } };
+  }
+
+  #validateCurrent(detail, allowedInputHashes = {}, allowDerivedTarget = false) {
+    if (detail.run.status !== 'ready') throw new Error(`Task Contract is not ready; current status is ${detail.run.status}.`);
+    const active = this.ledger.getActiveEnvironmentPolicy(detail.run.root_path);
+    const project = this.ledger.getProject(detail.project_id);
+    let stale = null;
+    if (!active || active.rule_version_id !== detail.environment_rule_version_id) stale = { reason: 'environment_rule_changed' };
+    else if (project.status !== 'active' || project.current_path !== detail.project_path) stale = { reason: 'project_path_changed' };
+    else if (!allowDerivedTarget && detail.contract.write.executor === 'derived_create'
+        && fs.existsSync(path.resolve(detail.run.root_path, ...detail.contract.write.target.split('/')))) {
+      stale = { reason: 'target_claimed', path: detail.contract.write.target };
+    }
+    else {
+      for (const input of detail.inputs.filter((item) => item.selected)) {
+        const absolute = path.resolve(detail.run.root_path, ...input.path.split('/'));
+        let observed = null;
+        if (fs.existsSync(absolute)) {
+          const stat = fs.lstatSync(absolute);
+          if (stat.isFile() && !stat.isSymbolicLink()) {
+            try {
+              const real = fs.realpathSync.native(absolute);
+              observed = isPathInside(detail.run.root_path, real) ? sha256File(real) : null;
+            } catch {
+              observed = null;
+            }
+          }
+        }
+        if (observed !== input.content_hash && observed !== allowedInputHashes[input.path]) {
+          stale = { reason: 'selected_input_changed', path: input.path, expected_hash: input.content_hash, observed_hash: observed };
+          break;
+        }
+      }
+    }
+    if (stale) {
+      this.ledger.markTaskStale(detail.run.id, stale, timestamp());
+      throw stateConflict(`Task Contract is stale because ${stale.path ?? stale.reason} changed.`);
+    }
+  }
+
+  fulfill(taskId, { candidateFile, reason = null } = {}) {
+    let detail = this.show(taskId);
+    if (detail.completion_receipt) return this.#completionResult(detail);
+    this.#validateCurrent(detail);
+    const contract = detail.contract;
+    if (contract.status !== 'ready') throw new Error(`Task Contract is not ready; current status is ${contract.status}.`);
+    if (contract.write.executor === 'none') throw new Error('Task Contract write policy denies execution.');
+    const candidate = normalizedCandidate(candidateFile, detail.run.root_path);
+    if (contract.write.executor === 'derived_create') {
+      let writeRunId = detail.underlying_run_id;
+      if (!writeRunId) {
+        const prepared = this.derived.prepare({
+          root: detail.run.root_path,
+          inputs: detail.inputs.filter((input) => input.selected).map((input) => input.path),
+          target: contract.write.target,
+          candidateFile: candidate,
+          projectId: detail.project_id,
+          role: contract.write.role,
+          relationType: contract.write.relation_type,
+          intent: detail.request.intent,
+          caller: detail.run.caller,
+        });
+        writeRunId = prepared.run_id;
+        this.ledger.recordTaskUnderlyingRun(taskId, writeRunId, timestamp());
+      }
+      const write = this.derived.preview(writeRunId);
+      if (write.run.status === 'prepared') this.derived.approve(writeRunId, { reason: reason ?? 'Authorized by the exact Task Contract.' });
+      if (['prepared', 'approved'].includes(this.derived.preview(writeRunId).run.status)) this.derived.execute(writeRunId);
+      return this.complete(taskId, { runId: writeRunId });
+    }
+    if (contract.write.executor === 'guarded_update') {
+      const selectedTarget = detail.inputs.find((input) => input.selected && input.path === contract.write.target);
+      if (!selectedTarget || !fileStartsWith(candidate, path.resolve(detail.run.root_path, ...selectedTarget.path.split('/')), selectedTarget.byte_size, selectedTarget.content_hash)) {
+        throw new Error('Append candidate must preserve the exact baseline and add bytes after it.');
+      }
+      let writeRunId = detail.underlying_run_id;
+      if (!writeRunId) {
+        const prepared = this.guarded.prepare({
+          root: detail.run.root_path, target: contract.write.target, candidateFile: candidate,
+          intent: detail.request.intent, caller: detail.run.caller,
+        });
+        writeRunId = prepared.run_id;
+        this.ledger.recordTaskUnderlyingRun(taskId, writeRunId, timestamp());
+      }
+      const write = this.guarded.preview(writeRunId);
+      if (write.run.status === 'executed') return this.complete(taskId, { runId: writeRunId });
+      return { task_id: taskId, contract_id: detail.contract_id, status: 'needs_approval', write_run: { run_id: writeRunId, mode: 'guarded' }, target: contract.write.target, reason: reason ?? contract.write.reason };
+    }
+    throw new Error(`Unknown Task executor: ${contract.write.executor}`);
+  }
+
+  complete(taskId, { runId } = {}) {
+    const detail = this.show(taskId);
+    if (detail.completion_receipt) return this.#completionResult(detail);
+    if (!runId || runId !== detail.underlying_run_id) throw stateConflict('Task completion write run does not match the staged run.');
+    const contract = detail.contract;
+    const allowedInputHashes = {};
+    let allowDerivedTarget = false;
+    if (contract.write.executor === 'derived_create') {
+      const stagedWrite = this.derived.preview(runId);
+      allowDerivedTarget = stagedWrite.run.status === 'executed'
+        && stagedWrite.candidate.target_path === contract.write.target;
+    }
+    if (contract.write.executor === 'guarded_update') {
+      const stagedWrite = this.guarded.preview(runId);
+      if (stagedWrite.run.status === 'executed') {
+        allowedInputHashes[contract.write.target] = stagedWrite.candidate.content_hash;
+      }
+    }
+    this.#validateCurrent(detail, allowedInputHashes, allowDerivedTarget);
+    let output;
+    let mode;
+    if (contract.write.executor === 'derived_create') {
+      const write = this.derived.preview(runId);
+      if (write.run.status !== 'executed' || !write.output) throw new Error('Derived write must be executed before Task completion.');
+      if (write.candidate.target_path !== contract.write.target || write.placement.project_id !== detail.project_id
+          || write.placement.role !== contract.write.role || write.placement.relation_type !== contract.write.relation_type) {
+        throw stateConflict('Derived write no longer matches the exact Task Contract.');
+      }
+      const expected = detail.inputs.filter((input) => input.selected).map((input) => input.path).sort();
+      const observed = write.inputs.map((input) => input.path).sort();
+      if (JSON.stringify(expected) !== JSON.stringify(observed)) throw stateConflict('Derived inputs do not match the Task read scope.');
+      output = { artifactId: write.output.artifact_id, materialId: write.output.material_id };
+      mode = 'derived';
+    } else if (contract.write.executor === 'guarded_update') {
+      const write = this.guarded.preview(runId);
+      if (write.run.status !== 'executed' || !write.execution_receipt) throw new Error('Guarded append must be executed before Task completion.');
+      if (write.candidate.target_path !== contract.write.target) throw stateConflict('Guarded target does not match the exact Task Contract.');
+      const selectedTarget = detail.inputs.find((input) => input.selected && input.path === contract.write.target);
+      if (!selectedTarget || !fileStartsWith(write.candidate.blob_path, write.baseline.blob_path, selectedTarget.byte_size, selectedTarget.content_hash)) {
+        throw stateConflict('Executed Guarded output does not satisfy append-only semantics.');
+      }
+      output = { artifactId: write.candidate.artifact_id, materialId: write.candidate.material_id };
+      mode = 'guarded';
+    } else {
+      throw new Error('Task Contract has no executable write strategy.');
+    }
+    this.ledger.completeTaskContract(taskId, {
+      writeRunId: runId,
+      outputArtifactId: output.artifactId,
+      outputMaterialId: output.materialId,
+      targetPath: contract.write.target,
+      relationType: contract.write.relation_type,
+      writeMode: mode,
+      completedAt: timestamp(),
+    });
+    return this.#completionResult(this.show(taskId));
+  }
+
+  rollback(taskId) {
+    const detail = this.show(taskId);
+    if (detail.rollback_receipt) return detail.rollback_receipt;
+    if (!detail.completion_receipt) throw new Error(`Only a completed Task Contract can be rolled back; current status is ${detail.run.status}.`);
+    const writeRunId = detail.completion_receipt.write_run_id;
+    const mode = detail.completion_receipt.write_mode;
+    const underlying = mode === 'derived' ? this.derived.rollback(writeRunId) : this.guarded.rollback(writeRunId);
+    const receipt = {
+      task_id: taskId, contract_id: detail.contract_id, status: 'rolled_back',
+      write_run: { run_id: writeRunId, mode }, target: detail.completion_receipt.target,
+      underlying_rollback: underlying, rolled_back_at: underlying.rolled_back_at ?? timestamp(),
+    };
+    return this.ledger.finishTaskRollback(taskId, receipt, receipt.rolled_back_at);
+  }
+
+  dispose() {
+    if (this._derived) this._derived.dispose();
+    if (this._guarded) this._guarded.dispose();
+    if (this._ledger) this._ledger.close();
+    this._derived = null;
+    this._guarded = null;
+    this._ledger = null;
+  }
+}

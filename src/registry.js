@@ -81,6 +81,9 @@ export class Registry {
     reason = null,
   }) {
     const existing = this.ledger.getProject(projectIdValue);
+    if (status != null && !['active', 'paused', 'archived'].includes(status)) {
+      throw new Error(`Unsupported Project status: ${status}`);
+    }
     const updatedAt = timestamp();
     this.ledger.updateProject(projectIdValue, {
       name: name == null ? existing.name : normalizeName(name),
@@ -91,6 +94,33 @@ export class Registry {
       updatedAt,
     });
     return { project_id: projectIdValue, status: status ?? existing.status, updated_at: updatedAt };
+  }
+
+  evolve(projectIdValue, {
+    name = null,
+    aliases = [],
+    status = null,
+    reason = null,
+  } = {}) {
+    if (name == null && !aliases.length && status == null) {
+      throw new Error('Project evolve requires a name, alias, or status change.');
+    }
+    const existing = this.ledger.getProject(projectIdValue);
+    const normalizedName = name == null ? existing.name : normalizeName(name);
+    const preservedAliases = normalizedName === existing.name ? aliases : [existing.name, ...aliases];
+    const updated = this.update(projectIdValue, {
+      name: normalizedName,
+      currentPath: existing.current_path,
+      aliases: preservedAliases,
+      status,
+      reason,
+    });
+    return {
+      ...updated,
+      semantic_only: true,
+      current_path: existing.current_path,
+      source_changes: [],
+    };
   }
 
   merge(sourceProjectIds, targetProjectId) {

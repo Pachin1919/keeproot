@@ -6,6 +6,7 @@ import { Bootstrap } from '../src/bootstrap.js';
 import { Derived } from '../src/derived.js';
 import { Guarded } from '../src/guarded.js';
 import { Registry } from '../src/registry.js';
+import { TaskContract } from '../src/task-contract.js';
 import { Tracker } from '../src/tracker.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -99,7 +100,40 @@ try {
   derived.dispose();
 }
 
-console.log('\n=== 3. Tracked Direct: begin -> external edit -> close -> show -> rollback ===');
+console.log('\n=== 3. Task Contract: bounded read -> governed create -> lineage -> rollback ===');
+const taskCandidate = path.join(demoRoot, 'task-candidate.md');
+fs.writeFileSync(taskCandidate, '# Task Report\n\nCreated from the bounded selected input.\n', 'utf8');
+const task = new TaskContract({ stateDir });
+try {
+  const prepared = task.prepare({
+    root: bootstrapVault,
+    request: {
+      intent: 'Create one report from an explicitly bounded source.',
+      project_id: derivedProject.id,
+      inputs: [{ path: 'Projects/Atlas/Overview.md', required: true }],
+      budget: { max_files: 1, max_bytes: 65536 },
+      output: {
+        target: 'Projects/Atlas/Task Report.md', role: 'report',
+        data_class: 'generated_output', action: 'auto',
+      },
+    },
+    caller: { actor: 'agent', agent: 'Codex', tool: 'v1-demo', client_run_id: 'v1-demo-task' },
+  });
+  assert.equal(prepared.read.selected.length, 1);
+  const completed = task.fulfill(prepared.task_id, {
+    candidateFile: taskCandidate,
+    reason: 'The fixture task authorizes this exact output.',
+  });
+  const shown = task.show(prepared.task_id);
+  assert.equal(shown.output.lineage[0].relation_type, 'derived_from');
+  task.rollback(prepared.task_id);
+  assert.equal(fs.existsSync(path.join(bootstrapVault, prepared.write.target)), false);
+  console.log(`Completed ${completed.task_id}: selected=1, strategy=${prepared.write.strategy}, lineage=derived_from; rollback verified.`);
+} finally {
+  task.dispose();
+}
+
+console.log('\n=== 4. Tracked Direct: begin -> external edit -> close -> show -> rollback ===');
 const note = path.join(changeVault, 'note-a.md');
 const trackedBaseline = fs.readFileSync(note, 'utf8');
 const tracker = new Tracker({ stateDir });
@@ -116,7 +150,7 @@ try {
   tracker.dispose();
 }
 
-console.log('\n=== 4. Guarded: prepare -> preview -> approve -> execute -> verify -> rollback ===');
+console.log('\n=== 5. Guarded: prepare -> preview -> approve -> execute -> verify -> rollback ===');
 const guardedBaseline = fs.readFileSync(note, 'utf8');
 const guardedCandidate = `${guardedBaseline}guarded approved change\n`;
 const guarded = new Guarded({ stateDir });

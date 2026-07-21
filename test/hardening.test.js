@@ -236,10 +236,12 @@ test('a version 1 Ledger is migrated in place without losing its existing run', 
 
   const migrated = new DatabaseSync(databasePath, { readOnly: true });
   try {
-    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version, 10);
+    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version, 12);
     const runColumns = new Set(migrated.prepare('PRAGMA table_info(runs)').all().map((row) => row.name));
     const labelColumns = new Set(migrated.prepare('PRAGMA table_info(labels)').all().map((row) => row.name));
     const artifactColumns = new Set(migrated.prepare('PRAGMA table_info(artifacts)').all().map((row) => row.name));
+    const taskContractColumns = new Set(migrated.prepare('PRAGMA table_info(task_contracts)').all().map((row) => row.name));
+    const taskInputColumns = new Set(migrated.prepare('PRAGMA table_info(task_inputs)').all().map((row) => row.name));
     assert.ok(runColumns.has('aborted_at'));
     assert.ok(runColumns.has('abort_receipt_json'));
     assert.ok(runColumns.has('actor'));
@@ -248,13 +250,17 @@ test('a version 1 Ledger is migrated in place without losing its existing run', 
     assert.ok(runColumns.has('tool'));
     assert.ok(runColumns.has('client_run_id'));
     assert.ok(labelColumns.has('subject_prediction_id'));
+    assert.ok(taskContractColumns.has('contract_hash'));
+    assert.ok(taskContractColumns.has('environment_rule_version_id'));
+    assert.ok(taskInputColumns.has('prepared_hash'));
+    assert.ok(taskInputColumns.has('selection_reason'));
     assert.ok(labelColumns.has('details_json'));
     assert.ok(artifactColumns.has('root_path'));
     assert.ok(artifactColumns.has('role'));
     assert.ok(artifactColumns.has('status'));
     for (const table of [
       'bootstrap_proposals', 'bootstrap_proposal_predictions', 'derived_operations',
-      'derived_inputs', 'material_derivations',
+      'derived_inputs', 'material_derivations', 'evolution_operations',
     ]) {
       assert.equal(
         migrated.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?").get(table).count,

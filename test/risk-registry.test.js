@@ -82,6 +82,28 @@ test('Registry keeps a stable Project ID while name and path history evolve', (t
   assert.equal(detail.paths[1].valid_to, null);
 });
 
+test('Registry evolves a Category meaning without forcing a folder move and keeps the old name as an alias', (t) => {
+  const registry = new Registry({ stateDir: stateFor('registry-semantic-evolution') });
+  t.after(() => registry.dispose());
+  const created = registry.create({
+    name: '就业',
+    currentPath: '01 就业与生活',
+  });
+  const evolved = registry.evolve(created.project_id, {
+    name: '就业与生活',
+    aliases: ['生活'],
+    reason: '找到工作后，长期思考范围扩展到生活。',
+  });
+  assert.equal(evolved.project_id, created.project_id);
+  assert.equal(evolved.semantic_only, true);
+  assert.deepEqual(evolved.source_changes, []);
+  const detail = registry.show(created.project_id);
+  assert.equal(detail.project.name, '就业与生活');
+  assert.equal(detail.project.current_path, '01 就业与生活');
+  assert.deepEqual(detail.aliases.sort(), ['就业', '生活']);
+  assert.equal(detail.paths.length, 1);
+});
+
 test('Registry can express parent, split, and merge lineage without deleting old Projects', (t) => {
   const registry = new Registry({ stateDir: stateFor('registry-lineage') });
   t.after(() => registry.dispose());

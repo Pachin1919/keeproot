@@ -17,6 +17,10 @@ const RELATION_TYPES = new Set([
   'transforms',
   'merges',
   'extracts_from',
+  'supersedes',
+  'delta_of',
+  'overlaps',
+  'appends_to',
 ]);
 
 function timestamp() {
@@ -292,8 +296,8 @@ export class Derived {
     if (isPathInside(root, this.stateDir)) {
       throw new Error(`Atlas state directory must be outside the Derived root: ${this.stateDir}`);
     }
-    if (!Array.isArray(inputs) || inputs.length === 0) {
-      throw new Error('Derived recommendation requires at least one input path.');
+    if (!Array.isArray(inputs) || (inputs.length === 0 && !projectId)) {
+      throw new Error('Derived recommendation requires input paths or an explicit Project ID.');
     }
     const normalizedRole = normalizeRole(role);
     const normalizedFilename = normalizeFilename(filename);
@@ -328,6 +332,8 @@ export class Derived {
     linkImpact = 0,
     predictionConfidence = 1,
     revisedFromRunId = null,
+    allowNoInputs = false,
+    intakeContext = null,
     caller = {},
   }) {
     const root = normalizeRoot(rootInput);
@@ -348,6 +354,8 @@ export class Derived {
       linkImpact,
       predictionConfidence,
       revisedFromRunId,
+      allowNoInputs,
+      intakeContext,
       caller,
     }));
     if (candidateFile) {
@@ -371,9 +379,11 @@ export class Derived {
     linkImpact,
     predictionConfidence,
     revisedFromRunId,
+    allowNoInputs,
+    intakeContext,
     caller,
   }) {
-    if (!Array.isArray(inputs) || inputs.length === 0) {
+    if (!Array.isArray(inputs) || (inputs.length === 0 && !allowNoInputs)) {
       throw new Error('Derived prepare requires at least one input path.');
     }
     if (!projectId) throw new Error('Derived prepare requires a Project ID.');
@@ -430,14 +440,17 @@ export class Derived {
       path: input.relative,
       ...captureBlob(input.absolute, this.stateDir),
     }));
-    const recommendedPlacement = placementRecommendation(
-      this.ledger,
-      root,
-      normalizedInputs,
-      normalizedRole,
-      path.basename(normalizedTarget.relative),
-      project.id,
-    );
+    const recommendedPlacement = {
+      ...placementRecommendation(
+        this.ledger,
+        root,
+        normalizedInputs,
+        normalizedRole,
+        path.basename(normalizedTarget.relative),
+        project.id,
+      ),
+      ...(intakeContext ? { intake: intakeContext } : {}),
+    };
     const placementPolicy = recommendedPlacement.status === 'ready'
       && recommendedPlacement.target === normalizedTarget.relative
       ? recommendedPlacement
@@ -551,6 +564,8 @@ export class Derived {
       relationType: original.placement.relation_type,
       intent: original.run.intent,
       revisedFromRunId: runId,
+      allowNoInputs: original.inputs.length === 0,
+      intakeContext: original.placement.policy?.intake ?? null,
       caller: original.run.caller,
     });
     this.ledger.markDerivedRevised(runId, revised.run_id, reason, timestamp());

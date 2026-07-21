@@ -83,6 +83,131 @@ test('Bootstrap recommends a reviewable default profile and activates an immutab
   assert.equal(nextVersion.forced_new_scan, true);
 });
 
+test('Bootstrap compacts Profile evidence into one Library Contract approval without changing the source', (t) => {
+  const { vault, stateDir } = setup('bootstrap-library-contract');
+  const bootstrap = new Bootstrap({ stateDir });
+  t.after(() => bootstrap.dispose());
+  const before = listVaultPaths(vault);
+  const scan = bootstrap.scan({ root: vault, scanMode: 'structure' });
+
+  const contract = bootstrap.contract(scan.scan_id, { profileId: 'project-work' });
+  assert.equal(contract.schema, 'atlas-library-contract-candidate.v1');
+  assert.match(contract.contract_id, /^CONTRACT-[a-f0-9]{16}$/u);
+  assert.equal(contract.profile.id, 'project-work');
+  assert.equal(contract.status, 'ready');
+  assert.ok(contract.zones.some((zone) => zone.area_role === 'projects'));
+  assert.ok(contract.routes.some((route) => route.role === 'draft' && route.area === 'projects'));
+  assert.ok(contract.questions.length <= 3);
+  assert.deepEqual(contract.source_changes, []);
+  assert.ok(contract.approval.prediction_ids.length >= 2);
+  assert.ok(contract.approval.deferred_prediction_count > 0);
+
+  const initialized = bootstrap.adoptContract(scan.scan_id, {
+    contractId: contract.contract_id,
+    profileId: 'project-work',
+    reason: 'Use this Project layout as the first routing contract.',
+  });
+  assert.equal(initialized.status, 'initialized');
+  assert.equal(initialized.contract_id, contract.contract_id);
+  assert.equal(initialized.profile_id, 'project-work');
+  assert.match(initialized.active_rule_version_id, /^RULE-ENV-/u);
+  assert.deepEqual(listVaultPaths(vault), before);
+
+  const detail = bootstrap.show(scan.scan_id);
+  const contractPredictions = new Set(contract.approval.prediction_ids);
+  assert.ok(detail.predictions
+    .filter((prediction) => contractPredictions.has(prediction.id))
+    .every((prediction) => prediction.review?.decision === 'accepted'));
+  assert.ok(detail.predictions
+    .filter((prediction) => !contractPredictions.has(prediction.id))
+    .every((prediction) => prediction.review?.decision === 'deferred'));
+  assert.equal(detail.active_policy.library_contract.contract_id, contract.contract_id);
+  assert.equal(detail.active_policy.library_contract.profile_id, 'project-work');
+  assert.deepEqual(detail.active_policy.library_contract.source_changes, []);
+
+  const repeated = bootstrap.adoptContract(scan.scan_id, {
+    contractId: contract.contract_id,
+    profileId: 'project-work',
+    reason: 'Use this Project layout as the first routing contract.',
+  });
+  assert.deepEqual(repeated, initialized);
+});
+
+test('Bootstrap refuses a stale or invented Library Contract before recording review Labels', (t) => {
+  const { vault, stateDir } = setup('bootstrap-library-contract-stale');
+  const bootstrap = new Bootstrap({ stateDir });
+  t.after(() => bootstrap.dispose());
+  const scan = bootstrap.scan({ root: vault, scanMode: 'structure' });
+  bootstrap.contract(scan.scan_id, { profileId: 'project-work' });
+
+  assert.throws(() => bootstrap.adoptContract(scan.scan_id, {
+    contractId: 'CONTRACT-0000000000000000',
+    profileId: 'project-work',
+    reason: 'This must not be accepted.',
+  }), /contract.*changed|stale|does not match/i);
+  const detail = bootstrap.show(scan.scan_id);
+  assert.equal(detail.scan.status, 'scanned');
+  assert.ok(detail.predictions.every((prediction) => prediction.review == null));
+});
+
+test('Library Contract adoption resumes after a partial review and preserves accepted custom rules', (t) => {
+  const { vault, stateDir } = setup('bootstrap-library-contract-resume');
+  const bootstrap = new Bootstrap({ stateDir });
+  t.after(() => bootstrap.dispose());
+  const scan = bootstrap.scan({ root: vault, scanMode: 'structure' });
+  bootstrap.propose(scan.scan_id, {
+    caller: { actor: 'agent', agent: 'Codex', tool: 'test' },
+    predictions: [{
+      kind: 'routing_rule_candidate',
+      summary: 'Keep Atlas reports in the Atlas Project root.',
+      confidence: 0.9,
+      risk: 'low',
+      affected_paths: ['Projects/Atlas'],
+      evidence: { role: 'report', target_directory: 'Projects/Atlas' },
+      proposed_action: 'Use this route only after explicit review.',
+    }],
+  });
+  const contract = bootstrap.contract(scan.scan_id, { profileId: 'project-work' });
+  const detail = bootstrap.show(scan.scan_id);
+  const custom = detail.predictions.find((prediction) => prediction.source === 'agent');
+  bootstrap.review(custom.id, { decision: 'accepted', reason: 'Keep the reviewed custom route.' });
+  bootstrap.review(contract.approval.prediction_ids[0], {
+    decision: 'accepted',
+    reason: 'Simulate a partially completed Contract adoption.',
+  });
+
+  const rebuilt = bootstrap.contract(scan.scan_id, { profileId: 'project-work' });
+  assert.equal(rebuilt.contract_id, contract.contract_id);
+  const initialized = bootstrap.adoptContract(scan.scan_id, {
+    contractId: contract.contract_id,
+    profileId: 'project-work',
+    reason: 'Resume and adopt the same Contract.',
+  });
+  assert.equal(initialized.accepted_agent_predictions, 1);
+  const finalDetail = bootstrap.show(scan.scan_id);
+  assert.equal(finalDetail.predictions.find((prediction) => prediction.id === custom.id).review.decision, 'accepted');
+  assert.equal(finalDetail.active_policy.policy.custom_routing_rules.length, 1);
+});
+
+test('Library Contract asks instead of guessing when one semantic area has multiple directory candidates', (t) => {
+  const { vault, stateDir } = setup('bootstrap-library-contract-ambiguous');
+  fs.mkdirSync(path.join(vault, 'Projects'), { recursive: true });
+  fs.mkdirSync(path.join(vault, '项目'), { recursive: true });
+  const bootstrap = new Bootstrap({ stateDir });
+  t.after(() => bootstrap.dispose());
+  const scan = bootstrap.scan({ root: vault, scanMode: 'structure' });
+  const contract = bootstrap.contract(scan.scan_id, { profileId: 'project-work' });
+  assert.equal(contract.status, 'needs_input');
+  assert.ok(contract.questions.some((question) => question.area_role === 'projects'));
+  assert.ok(contract.questions.length <= 3);
+  assert.throws(() => bootstrap.adoptContract(scan.scan_id, {
+    contractId: contract.contract_id,
+    profileId: 'project-work',
+    reason: 'Atlas must not guess this mapping.',
+  }), /needs input/i);
+  assert.equal(bootstrap.show(scan.scan_id).scan.status, 'scanned');
+});
+
 test('Derived uses the active profile for placement recommendations and warns on a route mismatch', (t) => {
   const { vault, stateDir } = setup('derived-profile-routing');
   const registry = new Registry({ stateDir });
@@ -227,4 +352,10 @@ test('conflicting accepted custom routes stay unresolved instead of silently cho
 
 function bootstrapPolicyRuleId(derived, vault) {
   return derived.ledger.getActiveEnvironmentPolicy(path.resolve(vault)).rule_version_id;
+}
+
+function listVaultPaths(root) {
+  return fs.readdirSync(root, { recursive: true, withFileTypes: true })
+    .map((entry) => path.relative(root, path.join(entry.parentPath, entry.name)).replaceAll('\\', '/'))
+    .sort();
 }

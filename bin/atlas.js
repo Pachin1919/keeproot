@@ -4,11 +4,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Bootstrap } from '../src/bootstrap.js';
 import { Derived } from '../src/derived.js';
+import { Evolution } from '../src/evolution.js';
 import { Guarded } from '../src/guarded.js';
+import { Intake } from '../src/intake.js';
 import { Registry } from '../src/registry.js';
 import { evaluateRisk } from '../src/risk.js';
 import { normalizeStateDir } from '../src/paths.js';
 import { RuntimeStorage } from '../src/runtime-storage.js';
+import { TaskContract } from '../src/task-contract.js';
 import {
   ATLAS_VERSION,
   CAPABILITIES,
@@ -71,16 +74,35 @@ Usage:
   atlas bootstrap scan --root <path> [--ignore <relative_directory> ...]
                        [--scan-mode <structure|metadata>] [--new]
   atlas bootstrap recommend <scan_id> [--profile <profile_id>]
+  atlas bootstrap contract <scan_id> [--profile <profile_id>]
+  atlas bootstrap adopt <scan_id> --contract <contract_id> [--profile <profile_id>] --reason <text>
   atlas bootstrap context <scan_id> [--max-samples <1..20>]
   atlas bootstrap propose <scan_id> --proposal-file <json>
   atlas bootstrap status
   atlas bootstrap show <scan_id> [--json]
   atlas bootstrap review <prediction_id> (--accept | --reject | --correct) [--reason <text>]
   atlas bootstrap initialize <scan_id>
+  atlas intake prepare --root <path> --candidate-file <path> --origin <origin>
+                       [--kind <kind>] [--filename <name>] [--project <project_id>]
+                       [--input <related_path> ...] [--intent <text>]
+  atlas intake show <run_id>
+  atlas intake execute <run_id> --reason <task_authorization>
+  atlas intake rollback <run_id>
+  atlas task prepare --root <path> --request-file <json> [agent options]
+  atlas task show <task_id>
+  atlas task fulfill <task_id> --candidate-file <path> [--reason <task_authorization>]
+  atlas task complete <task_id> --run <derived_or_guarded_run_id>
+  atlas task rollback <task_id>
+  atlas evolve prepare --root <path> --operation <create_directory|move_file|migrate_project>
+                       [--source <path>] --target <path> [--project <project_id>] [--intent <text>]
+  atlas evolve preview <run_id>
+  atlas evolve approve | reject <run_id> [--reason <text>]
+  atlas evolve execute | rollback <run_id>
   atlas risk --operation <type> --path <path> [--count <number>] [--rules] [--no-recovery]
   atlas rule list | show <rule_version_id>
   atlas project create --name <name> --path <relative_path> [--alias <name> ...]
-  atlas project list | show <project_id> | move <project_id> --path <relative_path> [--name <name>]
+  atlas project list | show <project_id> | evolve <project_id> [--name <name>] [--alias <name>] [--status <status>]
+  atlas project move <project_id> --path <relative_path> [--name <name>]
   atlas guarded prepare --root <path> --target <path> --candidate-file <path> [--intent <text>]
   atlas guarded preview <run_id> [--json]
   atlas guarded approve | reject <run_id> [--reason <text>]
@@ -318,6 +340,24 @@ function parseBootstrapRecommend(args) {
   return { scanId, profileId };
 }
 
+function parseBootstrapAdopt(args) {
+  const scanId = args[0];
+  if (!scanId || scanId.startsWith('--')) throw new Error('bootstrap adopt requires a scan_id');
+  let contractId = null;
+  let profileId = null;
+  let reason = null;
+  for (let index = 1; index < args.length; index += 1) {
+    if (args[index] === '--contract' && args[index + 1] !== undefined) contractId = args[++index];
+    else if (args[index] === '--profile' && args[index + 1] !== undefined) profileId = args[++index];
+    else if (args[index] === '--reason' && args[index + 1] !== undefined) reason = args[++index];
+    else throw new Error(`Unknown bootstrap adopt argument: ${args[index]}`);
+  }
+  if (!contractId || !reason) {
+    throw new Error('bootstrap adopt requires --contract <contract_id> and --reason <text>');
+  }
+  return { scanId, contractId, profileId, reason };
+}
+
 function printBootstrapShow(detail) {
   console.log(`Scan: ${detail.scan.id}`);
   console.log(`Status: ${detail.scan.status}`);
@@ -376,6 +416,19 @@ function handleBootstrap(bootstrap, storage, args) {
     const receipt = bootstrap.recommend(scanId, { profileId });
     emit('bootstrap.recommend', receipt, () => {
       console.log(`Recommended ${receipt.profile_id} (${receipt.selection}); ${receipt.prediction_ids.length} review(s) required.`);
+    });
+  } else if (action === 'contract') {
+    const { scanId, profileId } = parseBootstrapRecommend(rest);
+    const contract = bootstrap.contract(scanId, { profileId });
+    emit('bootstrap.contract', contract, () => {
+      console.log(`${contract.contract_id}: ${contract.profile.name} (${contract.status}).`);
+      console.log(`${contract.zones.length} zone(s), ${contract.questions.length} question(s), no source changes.`);
+    });
+  } else if (action === 'adopt') {
+    const options = parseBootstrapAdopt(rest);
+    const receipt = bootstrap.adoptContract(options.scanId, options);
+    emit('bootstrap.adopt', receipt, () => {
+      console.log(`Adopted ${receipt.contract_id}; initialized ${receipt.scan_id}.`);
     });
   } else if (action === 'review') {
     const { predictionId, decision, reason } = parseBootstrapReview(rest);
@@ -462,6 +515,22 @@ function handleProject(registry, args) {
     if (!options.currentPath) throw new Error('project move requires --path');
     const receipt = registry.update(projectId, options);
     emit('project.move', receipt, () => console.log(`Updated Project ${projectId}.`));
+    return;
+  }
+  if (action === 'evolve') {
+    const projectId = rest[0];
+    if (!projectId || projectId.startsWith('--')) throw new Error('project evolve requires a project_id');
+    const options = { aliases: [] };
+    for (let index = 1; index < rest.length; index += 1) {
+      const token = rest[index];
+      if (token === '--name') options.name = rest[++index];
+      else if (token === '--alias') options.aliases.push(rest[++index]);
+      else if (token === '--status') options.status = rest[++index];
+      else if (token === '--reason') options.reason = rest[++index];
+      else throw new Error(`Unknown project evolve argument: ${token}`);
+    }
+    const receipt = registry.evolve(projectId, options);
+    emit('project.evolve', receipt, () => console.log(`Evolved Project ${projectId} without source changes.`));
     return;
   }
   if (action === 'merge') {
@@ -703,6 +772,105 @@ function handleDerived(derived, args) {
   throw new Error(`Unknown derive action: ${action ?? '(missing)'}`);
 }
 
+function handleIntake(intake, args) {
+  const [action, ...rest] = args;
+  if (action === 'prepare') {
+    const options = { inputs: [] };
+    for (let index = 0; index < rest.length; index += 1) {
+      const token = rest[index];
+      if (token === '--root') options.root = rest[++index];
+      else if (token === '--candidate-file') options.candidateFile = rest[++index];
+      else if (token === '--origin') options.origin = rest[++index];
+      else if (token === '--kind') options.kind = rest[++index];
+      else if (token === '--filename') options.filename = rest[++index];
+      else if (token === '--project') options.projectId = rest[++index];
+      else if (token === '--input') options.inputs.push(rest[++index]);
+      else if (token === '--relation') options.relationType = rest[++index];
+      else if (token === '--intent') options.intent = rest[++index];
+      else {
+        const consumed = parseCallerFlag(options, rest, index);
+        if (consumed == null) throw new Error(`Unknown intake prepare argument: ${token}`);
+        index = consumed;
+      }
+    }
+    options.caller = callerFromOptions(options);
+    const receipt = intake.prepare(options);
+    emit('intake.prepare', receipt, (data) => {
+      if (data.run_id) console.log(`Prepared ${data.run_id}: ${data.classification.kind} → ${data.target}.`);
+      else console.log(`${data.status}: ${data.reason}`);
+    });
+    return;
+  }
+  if (action === 'show') {
+    if (rest.length !== 1) throw new Error('intake show requires one run_id');
+    emit('intake.show', intake.show(rest[0]), printDerivedPreview);
+    return;
+  }
+  if (action === 'execute') {
+    const runId = rest[0];
+    if (!runId || runId.startsWith('--')) throw new Error('intake execute requires a run_id');
+    const receipt = intake.execute(runId, { reason: parseReason(rest) });
+    emit('intake.execute', receipt, (data) => console.log(`Intake created and verified ${data.target}.`));
+    return;
+  }
+  if (action === 'rollback') {
+    if (rest.length !== 1) throw new Error('intake rollback requires one run_id');
+    const receipt = intake.rollback(rest[0]);
+    emit('intake.rollback', receipt, (data) => console.log(`Rolled back Intake ${data.run_id}.`));
+    return;
+  }
+  throw new Error(`Unknown intake action: ${action ?? '(missing)'}`);
+}
+
+function handleEvolution(evolution, args) {
+  const [action, ...rest] = args;
+  if (action === 'prepare') {
+    const options = {};
+    for (let index = 0; index < rest.length; index += 1) {
+      const token = rest[index];
+      if (token === '--root') options.root = rest[++index];
+      else if (token === '--operation') options.operation = rest[++index];
+      else if (token === '--source') options.source = rest[++index];
+      else if (token === '--target') options.target = rest[++index];
+      else if (token === '--project') options.projectId = rest[++index];
+      else if (token === '--intent') options.intent = rest[++index];
+      else {
+        const consumed = parseCallerFlag(options, rest, index);
+        if (consumed == null) throw new Error(`Unknown evolve prepare argument: ${token}`);
+        index = consumed;
+      }
+    }
+    options.caller = callerFromOptions(options);
+    const receipt = evolution.prepare(options);
+    emit('evolve.prepare', receipt, (data) => {
+      console.log(`Prepared ${data.run_id}: ${data.operation} → ${data.target}.`);
+    });
+    return;
+  }
+  if (action === 'preview') {
+    if (rest.length !== 1) throw new Error('evolve preview requires one run_id');
+    const detail = evolution.preview(rest[0]);
+    emit('evolve.preview', detail, (data) => console.log(JSON.stringify(data, null, 2)));
+    return;
+  }
+  if (action === 'approve' || action === 'reject') {
+    const runId = rest[0];
+    if (!runId || runId.startsWith('--')) throw new Error(`evolve ${action} requires a run_id`);
+    const receipt = evolution[action](runId, { reason: parseReason(rest) });
+    emit(`evolve.${action}`, receipt, (data) => console.log(`${action === 'approve' ? 'Approved' : 'Rejected'} ${data.run_id}.`));
+    return;
+  }
+  if (action === 'execute' || action === 'rollback') {
+    if (rest.length !== 1) throw new Error(`evolve ${action} requires one run_id`);
+    const receipt = evolution[action](rest[0]);
+    emit(`evolve.${action}`, receipt, (data) => {
+      console.log(`${action === 'execute' ? 'Executed and verified' : 'Rolled back'} ${data.run_id}.`);
+    });
+    return;
+  }
+  throw new Error(`Unknown evolve action: ${action ?? '(missing)'}`);
+}
+
 function handleWork(storage, args) {
   const [action, ...rest] = args;
   if (action === 'stage') {
@@ -750,6 +918,66 @@ function handleStorage(storage, args) {
   throw new Error(`Unknown storage action: ${action ?? '(missing)'}`);
 }
 
+function handleTask(task, args) {
+  const [action, ...rest] = args;
+  if (action === 'prepare') {
+    const options = {};
+    for (let index = 0; index < rest.length; index += 1) {
+      const token = rest[index];
+      if (token === '--root') options.root = rest[++index];
+      else if (token === '--request-file') options.requestFile = rest[++index];
+      else {
+        const consumed = parseCallerFlag(options, rest, index);
+        if (consumed == null) throw new Error(`Unknown task prepare argument: ${token}`);
+        index = consumed;
+      }
+    }
+    if (!options.root || !options.requestFile) throw new Error('task prepare requires --root and --request-file');
+    const request = readJsonFile(options.requestFile, 'task request');
+    const receipt = task.prepare({ root: options.root, request, caller: callerFromOptions(options) });
+    emit('task.prepare', receipt, (data) => console.log(JSON.stringify(data, null, 2)));
+    return;
+  }
+  if (action === 'show') {
+    if (rest.length !== 1) throw new Error('task show requires one task_id');
+    emit('task.show', task.show(rest[0]), (data) => console.log(JSON.stringify(data, null, 2)));
+    return;
+  }
+  if (action === 'fulfill') {
+    const taskId = rest[0];
+    if (!taskId || taskId.startsWith('--')) throw new Error('task fulfill requires a task_id');
+    let candidateFile = null;
+    let reason = null;
+    for (let index = 1; index < rest.length; index += 1) {
+      if (rest[index] === '--candidate-file') candidateFile = rest[++index];
+      else if (rest[index] === '--reason') reason = rest[++index];
+      else throw new Error(`Unknown task fulfill argument: ${rest[index]}`);
+    }
+    if (!candidateFile) throw new Error('task fulfill requires --candidate-file');
+    const receipt = task.fulfill(taskId, { candidateFile, reason });
+    emit('task.fulfill', receipt, (data) => console.log(JSON.stringify(data, null, 2)));
+    return;
+  }
+  if (action === 'complete') {
+    const taskId = rest[0];
+    if (!taskId || taskId.startsWith('--')) throw new Error('task complete requires a task_id');
+    let runId = null;
+    for (let index = 1; index < rest.length; index += 1) {
+      if (rest[index] === '--run') runId = rest[++index];
+      else throw new Error(`Unknown task complete argument: ${rest[index]}`);
+    }
+    if (!runId) throw new Error('task complete requires --run');
+    emit('task.complete', task.complete(taskId, { runId }), (data) => console.log(JSON.stringify(data, null, 2)));
+    return;
+  }
+  if (action === 'rollback') {
+    if (rest.length !== 1) throw new Error('task rollback requires one task_id');
+    emit('task.rollback', task.rollback(rest[0]), (data) => console.log(JSON.stringify(data, null, 2)));
+    return;
+  }
+  throw new Error(`Unknown task action: ${action ?? '(missing)'}`);
+}
+
 async function main() {
   const rawArgs = process.argv.slice(2);
   outputJson = rawArgs.includes('--json');
@@ -775,8 +1003,11 @@ async function main() {
   const bootstrap = new Bootstrap({ stateDir });
   const guarded = new Guarded({ stateDir });
   const derived = new Derived({ stateDir });
+  const evolution = new Evolution({ stateDir });
+  const intake = new Intake({ stateDir });
   const registry = new Registry({ stateDir });
   const storage = new RuntimeStorage({ stateDir, ledger: tracker.ledger });
+  const task = new TaskContract({ stateDir });
   try {
     if (command === 'doctor') {
       if (args.length) throw new Error('doctor does not accept arguments');
@@ -804,6 +1035,12 @@ async function main() {
       handleGuarded(guarded, args);
     } else if (command === 'derive') {
       handleDerived(derived, args);
+    } else if (command === 'intake') {
+      handleIntake(intake, args);
+    } else if (command === 'evolve') {
+      handleEvolution(evolution, args);
+    } else if (command === 'task') {
+      handleTask(task, args);
     } else if (command === 'work') {
       handleWork(storage, args);
     } else if (command === 'storage') {
@@ -851,7 +1088,10 @@ async function main() {
     bootstrap.dispose();
     guarded.dispose();
     derived.dispose();
+    evolution.dispose();
+    intake.dispose();
     registry.dispose();
+    task.dispose();
   }
 }
 

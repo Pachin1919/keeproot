@@ -6,7 +6,9 @@ import { RISK_RULE_VERSION_ID } from './risk.js';
 
 const RULE_VERSION_ID = 'RULE-TRACKED-DIRECT-1';
 const BOOTSTRAP_RULE_VERSION_ID = 'RULE-BOOTSTRAP-2';
-export const LATEST_SCHEMA_VERSION = 10;
+const EVOLUTION_RULE_VERSION_ID = 'RULE-EVOLUTION-1';
+const TASK_RULE_VERSION_ID = 'RULE-TASK-CONTRACT-1';
+export const LATEST_SCHEMA_VERSION = 12;
 
 function json(value) {
   return JSON.stringify(value);
@@ -334,6 +336,56 @@ export class Ledger {
         executed_at TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS evolution_operations (
+        run_id TEXT PRIMARY KEY REFERENCES runs(id),
+        operation_type TEXT NOT NULL,
+        source_path TEXT,
+        target_path TEXT NOT NULL,
+        project_id TEXT REFERENCES projects(id),
+        prediction_id TEXT NOT NULL REFERENCES predictions(id),
+        plan_hash TEXT NOT NULL,
+        baseline_json TEXT NOT NULL,
+        approved_plan_hash TEXT,
+        approval_receipt_json TEXT,
+        rejection_receipt_json TEXT,
+        execution_receipt_json TEXT,
+        executed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS task_contracts (
+        run_id TEXT PRIMARY KEY REFERENCES runs(id),
+        contract_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        project_path TEXT NOT NULL,
+        environment_rule_version_id TEXT NOT NULL REFERENCES rule_versions(id),
+        contract_hash TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        contract_json TEXT NOT NULL,
+        underlying_run_id TEXT REFERENCES runs(id),
+        completion_receipt_json TEXT,
+        completed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS task_inputs (
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        ordinal INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        artifact_id TEXT REFERENCES artifacts(id),
+        material_id TEXT REFERENCES materials(id),
+        prepared_hash TEXT NOT NULL,
+        byte_size INTEGER NOT NULL,
+        selected INTEGER NOT NULL,
+        selection_reason TEXT,
+        series_id TEXT,
+        temporal_mode TEXT,
+        coverage_start TEXT,
+        coverage_end TEXT,
+        required INTEGER NOT NULL,
+        priority INTEGER NOT NULL,
+        PRIMARY KEY(run_id, ordinal),
+        UNIQUE(run_id, path)
+      );
+
       CREATE TABLE IF NOT EXISTS rollback_progress (
         run_id TEXT NOT NULL REFERENCES runs(id),
         path TEXT NOT NULL,
@@ -421,6 +473,8 @@ export class Ledger {
       insertMigration.run(8, 'agent_environment_inference_and_derived_material_lineage', appliedAt);
       insertMigration.run(9, 'versioned_environment_profiles_and_active_routing_policy', appliedAt);
       insertMigration.run(10, 'derived_revision_and_artifact_role_evolution', appliedAt);
+      insertMigration.run(11, 'guarded_filesystem_evolution_changesets', appliedAt);
+      insertMigration.run(12, 'bounded_task_contracts_and_temporal_read_policy', appliedAt);
       this.db.exec(`PRAGMA user_version = ${LATEST_SCHEMA_VERSION};`);
     });
   }
@@ -708,7 +762,7 @@ export class Ledger {
       SELECT g.*, bm.content_hash AS before_hash, bm.byte_size AS before_byte_size,
              bm.blob_path AS before_blob_path,
              cm.content_hash AS candidate_hash, cm.byte_size AS candidate_byte_size,
-             cm.blob_path AS candidate_blob_path
+             cm.blob_path AS candidate_blob_path, cm.artifact_id AS artifact_id
       FROM guarded_operations g
       JOIN materials bm ON bm.id = g.before_material_id
       JOIN materials cm ON cm.id = g.candidate_material_id
@@ -777,8 +831,11 @@ export class Ledger {
         diff_hash: candidate.diff_hash,
         summary: parseJson(candidate.summary_json, {}),
         created_at: candidate.created_at,
+        artifact_id: operation.artifact_id,
+        material_id: operation.candidate_material_id,
       },
       baseline: {
+        material_id: operation.before_material_id,
         content_hash: operation.before_hash,
         byte_size: operation.before_byte_size,
         blob_path: this.#resolveBlobPath(operation.before_blob_path, operation.before_hash),
@@ -961,6 +1018,776 @@ export class Ledger {
       `).run(rolledBackAt, json(receipt), runId);
       this.db.prepare("UPDATE change_sets SET status = 'rolled_back' WHERE run_id = ?").run(runId);
       this.#insertEvent(runId, 'guarded_rollback_completed', receipt, rolledBackAt);
+      return receipt;
+    });
+  }
+
+  createEvolutionRun({
+    runId,
+    root,
+    operation,
+    sourcePath,
+    targetPath,
+    projectId,
+    intent,
+    baseline,
+    plan,
+    planHash,
+    diffText,
+    diffHash,
+    caller = {},
+    startedAt,
+  }) {
+    const candidateChangeSetId = `CAN-${crypto.randomUUID()}`;
+    const actualChangeSetId = `CHG-${crypto.randomUUID()}`;
+    const predictionId = `PRD-${crypto.randomUUID()}`;
+    this.transaction(() => {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
+        VALUES (?, 'Guarded filesystem evolution', '1.0.0', ?, ?)
+      `).run(EVOLUTION_RULE_VERSION_ID, json({
+        operations: ['create_directory', 'move_file', 'migrate_project'],
+        review_required: true,
+        stale_plan_denied: true,
+        rollback_conflict_denied: true,
+      }), startedAt);
+      this.db.prepare(`
+        INSERT INTO runs(
+          id, mode, status, root_path, intent, actor, agent, model, tool, client_run_id,
+          rule_version_id, started_at
+        ) VALUES (?, 'evolution', 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        runId, root, intent ?? null, caller.actor ?? 'unknown', caller.agent ?? null,
+        caller.model ?? null, caller.tool ?? 'atlas-cli', caller.client_run_id ?? null,
+        EVOLUTION_RULE_VERSION_ID, startedAt,
+      );
+      this.db.prepare(`
+        INSERT INTO change_sets(id, run_id, status, created_at)
+        VALUES (?, ?, 'awaiting_execution', ?)
+      `).run(actualChangeSetId, runId, startedAt);
+      this.db.prepare(`
+        INSERT INTO candidate_change_sets(
+          id, run_id, version, operation, target_path, status, content_hash,
+          diff_text, diff_hash, summary_json, created_at
+        ) VALUES (?, ?, 1, ?, ?, 'prepared', ?, ?, ?, ?, ?)
+      `).run(
+        candidateChangeSetId, runId, operation, targetPath, planHash,
+        diffText, diffHash, json(plan), startedAt,
+      );
+      const prediction = {
+        kind: 'evolution_changeset_candidate',
+        summary: plan.summary,
+        confidence: 1,
+        risk: 'high',
+        affected_paths: plan.source_changes.map((change) => change.path),
+        evidence: { plan, plan_hash: planHash },
+        proposed_action: 'Execute only after explicit review of this exact filesystem ChangeSet.',
+        requires_review: true,
+        source: 'atlas-deterministic',
+      };
+      this.db.prepare(`
+        INSERT INTO predictions(id, run_id, kind, payload_json, created_at)
+        VALUES (?, ?, 'evolution_changeset_candidate', ?, ?)
+      `).run(predictionId, runId, json(prediction), startedAt);
+      this.db.prepare(`
+        INSERT INTO evolution_operations(
+          run_id, operation_type, source_path, target_path, project_id,
+          prediction_id, plan_hash, baseline_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        runId, operation, sourcePath ?? null, targetPath, projectId ?? null,
+        predictionId, planHash, json(baseline),
+      );
+      this.db.prepare(`
+        INSERT INTO observations(id, run_id, kind, payload_json, created_at)
+        VALUES (?, ?, 'evolution_baseline_captured', ?, ?)
+      `).run(`OBS-${crypto.randomUUID()}`, runId, json({
+        operation, source_path: sourcePath ?? null, target_path: targetPath,
+        source_manifest_hash: baseline.source_manifest_hash ?? null,
+        source_entries: baseline.source_entries?.length ?? 0,
+        target_state: baseline.target_state,
+      }), startedAt);
+      this.db.prepare(`
+        INSERT INTO policy_decisions(id, run_id, rule_version_id, decision, reason, details_json, created_at)
+        VALUES (?, ?, ?, 'guarded', ?, ?, ?)
+      `).run(
+        `DEC-${crypto.randomUUID()}`,
+        runId,
+        EVOLUTION_RULE_VERSION_ID,
+        'Filesystem structure changes require explicit approval and exact-state verification.',
+        json({ operation, paths: prediction.affected_paths, recovery_available: true }),
+        startedAt,
+      );
+      this.#insertEvent(runId, 'evolution_prepared', {
+        candidate_change_set_id: candidateChangeSetId,
+        prediction_id: predictionId,
+        operation,
+        plan_hash: planHash,
+      }, startedAt);
+    });
+    return { candidateChangeSetId, actualChangeSetId, predictionId };
+  }
+
+  getEvolutionOperation(runId) {
+    const run = this.getRun(runId);
+    if (run.mode !== 'evolution') throw new Error(`Run is not Evolution: ${runId}`);
+    const row = this.db.prepare(`SELECT * FROM evolution_operations WHERE run_id = ?`).get(runId);
+    if (!row) throw new Error(`Evolution run is incomplete: ${runId}`);
+    return {
+      ...row,
+      baseline: parseJson(row.baseline_json, {}),
+      approval_receipt: parseJson(row.approval_receipt_json),
+      rejection_receipt: parseJson(row.rejection_receipt_json),
+      execution_receipt: parseJson(row.execution_receipt_json),
+      baseline_json: undefined,
+      approval_receipt_json: undefined,
+      rejection_receipt_json: undefined,
+      execution_receipt_json: undefined,
+    };
+  }
+
+  getEvolutionDetail(runId) {
+    const run = this.getRun(runId);
+    const operation = this.getEvolutionOperation(runId);
+    const candidate = this.db.prepare(`SELECT * FROM candidate_change_sets WHERE run_id = ?`).get(runId);
+    const predictionRow = this.db.prepare(`
+      SELECT id, kind, payload_json, created_at FROM predictions WHERE id = ?
+    `).get(operation.prediction_id);
+    const labelRow = this.db.prepare(`
+      SELECT id, value, source, details_json, created_at
+      FROM labels WHERE subject_prediction_id = ? ORDER BY rowid DESC LIMIT 1
+    `).get(operation.prediction_id);
+    const events = this.db.prepare(`
+      SELECT event_type, payload_json, occurred_at
+      FROM operation_events WHERE run_id = ? ORDER BY occurred_at, rowid
+    `).all(runId).map((row) => ({
+      type: row.event_type,
+      payload: parseJson(row.payload_json, {}),
+      occurred_at: row.occurred_at,
+    }));
+    return {
+      run: {
+        id: run.id,
+        mode: run.mode,
+        status: run.status,
+        root_path: run.root_path,
+        intent: run.intent,
+        caller: {
+          actor: run.actor, agent: run.agent, model: run.model,
+          tool: run.tool, client_run_id: run.client_run_id,
+        },
+        rule_version_id: run.rule_version_id,
+        started_at: run.started_at,
+        rolled_back_at: run.rolled_back_at,
+      },
+      operation: {
+        type: operation.operation_type,
+        source: operation.source_path,
+        target: operation.target_path,
+        project_id: operation.project_id,
+        plan_hash: operation.plan_hash,
+      },
+      plan: parseJson(candidate.summary_json, {}),
+      candidate_change_set: {
+        id: candidate.id,
+        status: candidate.status,
+        diff_text: candidate.diff_text,
+        diff_hash: candidate.diff_hash,
+        created_at: candidate.created_at,
+      },
+      prediction: {
+        id: predictionRow.id,
+        kind: predictionRow.kind,
+        ...parseJson(predictionRow.payload_json, {}),
+        created_at: predictionRow.created_at,
+        review: labelRow ? {
+          id: labelRow.id,
+          decision: labelRow.value,
+          source: labelRow.source,
+          reason: parseJson(labelRow.details_json, {}).reason ?? null,
+          reviewed_at: labelRow.created_at,
+        } : null,
+      },
+      approved_plan_hash: operation.approved_plan_hash,
+      events,
+      approval_receipt: operation.approval_receipt,
+      rejection_receipt: operation.rejection_receipt,
+      execution_receipt: operation.execution_receipt,
+      rollback_receipt: parseJson(run.rollback_receipt_json),
+    };
+  }
+
+  reviewEvolution(runId, { decision, reason, reviewedAt }) {
+    return this.transaction(() => {
+      const run = this.getRun(runId);
+      if (run.mode !== 'evolution') throw new Error(`Run is not Evolution: ${runId}`);
+      const operation = this.db.prepare(`SELECT * FROM evolution_operations WHERE run_id = ?`).get(runId);
+      const existing = decision === 'accepted'
+        ? parseJson(operation.approval_receipt_json)
+        : parseJson(operation.rejection_receipt_json);
+      if (existing) return existing;
+      if (run.status !== 'prepared') {
+        throw new Error(`Evolution review requires prepared status; current status is ${run.status}.`);
+      }
+      const status = decision === 'accepted' ? 'approved' : 'rejected';
+      const receipt = {
+        run_id: runId,
+        prediction_id: operation.prediction_id,
+        plan_hash: operation.plan_hash,
+        decision,
+        reason,
+        status,
+        reviewed_at: reviewedAt,
+      };
+      this.db.prepare(`
+        INSERT INTO labels(id, run_id, subject_prediction_id, name, value, source, details_json, created_at)
+        VALUES (?, ?, ?, 'evolution_review', ?, 'user', ?, ?)
+      `).run(
+        `LBL-${crypto.randomUUID()}`, runId, operation.prediction_id,
+        decision, json({ reason }), reviewedAt,
+      );
+      this.db.prepare(`UPDATE runs SET status = ? WHERE id = ?`).run(status, runId);
+      this.db.prepare(`UPDATE candidate_change_sets SET status = ? WHERE run_id = ?`).run(status, runId);
+      if (decision === 'accepted') {
+        this.db.prepare(`
+          UPDATE evolution_operations
+          SET approved_plan_hash = ?, approval_receipt_json = ? WHERE run_id = ?
+        `).run(operation.plan_hash, json(receipt), runId);
+      } else {
+        this.db.prepare(`
+          UPDATE evolution_operations SET rejection_receipt_json = ? WHERE run_id = ?
+        `).run(json(receipt), runId);
+      }
+      this.#insertEvent(runId, `evolution_${status}`, receipt, reviewedAt);
+      return receipt;
+    });
+  }
+
+  markEvolutionStale(runId, payload, occurredAt) {
+    this.transaction(() => {
+      const run = this.getRun(runId);
+      if (run.status === 'stale') return;
+      if (run.status !== 'approved') {
+        throw new Error(`Only an approved Evolution run can become stale; current status is ${run.status}.`);
+      }
+      this.db.prepare(`UPDATE runs SET status = 'stale' WHERE id = ?`).run(runId);
+      this.db.prepare(`UPDATE candidate_change_sets SET status = 'stale' WHERE run_id = ?`).run(runId);
+      this.#insertEvent(runId, 'evolution_approval_invalidated', payload, occurredAt);
+    });
+  }
+
+  startEvolutionExecution(runId, occurredAt) {
+    const detail = this.getEvolutionDetail(runId);
+    if (detail.events.some((event) => event.type === 'evolution_execution_started')) return;
+    if (detail.run.status !== 'approved') {
+      throw new Error(`Evolution execution requires approval; current status is ${detail.run.status}.`);
+    }
+    this.recordEvent(runId, 'evolution_execution_started', {
+      plan_hash: detail.operation.plan_hash,
+    }, occurredAt);
+  }
+
+  finishEvolutionExecution(runId, { receipt, executedAt }) {
+    return this.transaction(() => {
+      const run = this.getRun(runId);
+      const operation = this.db.prepare(`SELECT * FROM evolution_operations WHERE run_id = ?`).get(runId);
+      const existing = parseJson(operation.execution_receipt_json);
+      if (existing) return existing;
+      if (run.status !== 'approved' || operation.approved_plan_hash !== operation.plan_hash) {
+        throw new Error('Evolution execution no longer matches its approved ChangeSet.');
+      }
+      const changeSet = this.db.prepare(`SELECT id FROM change_sets WHERE run_id = ?`).get(runId);
+      const insert = this.db.prepare(`
+        INSERT INTO changes(
+          id, change_set_id, path, change_type, allowed,
+          before_kind, before_hash, after_kind, after_hash
+        ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+      `);
+      if (operation.operation_type === 'create_directory') {
+        insert.run(
+          `DIF-${crypto.randomUUID()}`, changeSet.id, operation.target_path, 'added',
+          null, null, 'directory', receipt.after_manifest_hash,
+        );
+      } else {
+        const kind = operation.operation_type === 'move_file' ? 'file' : 'directory';
+        insert.run(
+          `DIF-${crypto.randomUUID()}`, changeSet.id, operation.source_path, 'deleted',
+          kind, receipt.after_manifest_hash, null, null,
+        );
+        insert.run(
+          `DIF-${crypto.randomUUID()}`, changeSet.id, operation.target_path, 'added',
+          null, null, kind, receipt.after_manifest_hash,
+        );
+      }
+      const candidate = this.db.prepare(`SELECT * FROM candidate_change_sets WHERE run_id = ?`).get(runId);
+      this.db.prepare(`
+        UPDATE change_sets SET status = 'executed', diff_text = ?, diff_hash = ?,
+          summary_json = ?, closed_at = ? WHERE run_id = ?
+      `).run(candidate.diff_text, candidate.diff_hash, candidate.summary_json, executedAt, runId);
+      this.db.prepare(`UPDATE candidate_change_sets SET status = 'executed' WHERE run_id = ?`).run(runId);
+      this.db.prepare(`
+        UPDATE evolution_operations SET execution_receipt_json = ?, executed_at = ? WHERE run_id = ?
+      `).run(json(receipt), executedAt, runId);
+      this.db.prepare(`
+        UPDATE runs SET status = 'executed', closed_at = ?, receipt_json = ? WHERE id = ?
+      `).run(executedAt, json(receipt), runId);
+      this.#insertEvent(runId, 'evolution_executed_and_verified', receipt, executedAt);
+      return receipt;
+    });
+  }
+
+  finishEvolutionRollback(runId, receipt, rolledBackAt) {
+    return this.transaction(() => {
+      const run = this.getRun(runId);
+      if (run.rollback_receipt_json) return parseJson(run.rollback_receipt_json);
+      if (run.status !== 'executed') {
+        throw new Error(`Only an executed Evolution run can be rolled back; current status is ${run.status}.`);
+      }
+      this.db.prepare(`
+        UPDATE runs SET status = 'rolled_back', rolled_back_at = ?, rollback_receipt_json = ? WHERE id = ?
+      `).run(rolledBackAt, json(receipt), runId);
+      this.db.prepare(`UPDATE change_sets SET status = 'rolled_back' WHERE run_id = ?`).run(runId);
+      this.#insertEvent(runId, 'evolution_rollback_completed', receipt, rolledBackAt);
+      return receipt;
+    });
+  }
+
+  findTaskContract(contractId) {
+    const row = this.db.prepare(`
+      SELECT run_id FROM task_contracts WHERE contract_id = ?
+    `).get(contractId);
+    return row ? this.getTaskDetail(row.run_id) : null;
+  }
+
+  createTaskContract({
+    runId,
+    contractId,
+    root,
+    request,
+    contract,
+    contractHash,
+    project,
+    environmentRuleVersionId,
+    inputs,
+    caller = {},
+    startedAt,
+  }) {
+    this.transaction(() => {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
+        VALUES (?, 'Bounded Task Contract policy', '1.0.0', ?, ?)
+      `).run(TASK_RULE_VERSION_ID, json({
+        input_scope: 'selected_paths_only',
+        output_scope: 'exact_target_only',
+        strategies: ['create', 'append', 'delta', 'new_version', 'supersede', 'deny'],
+        stale_input_denied: true,
+        delete_and_archive_execution: 'deny',
+      }), startedAt);
+      this.db.prepare(`
+        INSERT INTO runs(
+          id, mode, status, root_path, intent, actor, agent, model, tool, client_run_id,
+          rule_version_id, started_at
+        ) VALUES (?, 'task', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        runId,
+        contract.status,
+        root,
+        request.intent,
+        caller.actor ?? 'unknown',
+        caller.agent ?? null,
+        caller.model ?? null,
+        caller.tool ?? 'atlas-cli',
+        caller.client_run_id ?? null,
+        TASK_RULE_VERSION_ID,
+        startedAt,
+      );
+      this.db.prepare(`
+        INSERT INTO task_contracts(
+          run_id, contract_id, project_id, project_path, environment_rule_version_id,
+          contract_hash, request_json, contract_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        runId,
+        contractId,
+        project.id,
+        project.current_path,
+        environmentRuleVersionId,
+        contractHash,
+        json(request),
+        json(contract),
+      );
+
+      const findArtifact = this.db.prepare(`
+        SELECT id FROM artifacts
+        WHERE root_path = ? AND current_path = ? AND status = 'active'
+        ORDER BY updated_at DESC, rowid DESC LIMIT 1
+      `);
+      const insertArtifact = this.db.prepare(`
+        INSERT INTO artifacts(
+          id, origin_run_id, project_id, kind, current_path, root_path, role, status,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, 'file', ?, ?, 'source', 'active', ?, ?)
+      `);
+      const findMaterial = this.db.prepare(`
+        SELECT id FROM materials WHERE artifact_id = ? AND content_hash = ?
+        ORDER BY rowid DESC LIMIT 1
+      `);
+      const insertMaterial = this.db.prepare(`
+        INSERT INTO materials(id, artifact_id, stage, content_hash, byte_size, blob_path, created_at)
+        VALUES (?, ?, 'task_input', ?, ?, ?, ?)
+      `);
+      const insertInput = this.db.prepare(`
+        INSERT INTO task_inputs(
+          run_id, ordinal, path, artifact_id, material_id, prepared_hash, byte_size,
+          selected, selection_reason, series_id, temporal_mode, coverage_start,
+          coverage_end, required, priority
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const insertObservation = this.db.prepare(`
+        INSERT INTO observations(id, run_id, kind, subject_artifact_id, payload_json, created_at)
+        VALUES (?, ?, 'task_input_observed', ?, ?, ?)
+      `);
+      for (const input of inputs) {
+        let artifactId = null;
+        let materialId = null;
+        if (input.selected) {
+          let artifact = findArtifact.get(root, input.path);
+          if (!artifact) {
+            artifact = { id: `ART-${crypto.randomUUID()}` };
+            insertArtifact.run(
+              artifact.id,
+              runId,
+              null,
+              input.path,
+              root,
+              startedAt,
+              startedAt,
+            );
+          }
+          artifactId = artifact.id;
+          let material = findMaterial.get(artifactId, input.content_hash);
+          if (!material) {
+            material = { id: `MAT-${crypto.randomUUID()}` };
+            insertMaterial.run(
+              material.id,
+              artifactId,
+              input.content_hash,
+              input.byte_size,
+              this.#storeBlobPath(input.capture.blobPath),
+              startedAt,
+            );
+          }
+          materialId = material.id;
+        }
+        insertInput.run(
+          runId,
+          input.ordinal,
+          input.path,
+          artifactId,
+          materialId,
+          input.content_hash,
+          input.byte_size,
+          input.selected ? 1 : 0,
+          input.selection_reason ?? null,
+          input.series ?? null,
+          input.temporal_mode ?? null,
+          input.coverage?.start ?? null,
+          input.coverage?.end ?? null,
+          input.required ? 1 : 0,
+          input.priority,
+        );
+        insertObservation.run(
+          `OBS-${crypto.randomUUID()}`,
+          runId,
+          artifactId,
+          json({
+            path: input.path,
+            content_hash: input.content_hash,
+            byte_size: input.byte_size,
+            selected: input.selected,
+            selection_reason: input.selection_reason ?? null,
+            series: input.series ?? null,
+            temporal_mode: input.temporal_mode ?? null,
+            coverage: input.coverage ?? null,
+          }),
+          startedAt,
+        );
+      }
+
+      const temporalPredictionId = `PRD-${crypto.randomUUID()}`;
+      const writePredictionId = `PRD-${crypto.randomUUID()}`;
+      this.db.prepare(`
+        INSERT INTO predictions(id, run_id, kind, payload_json, created_at)
+        VALUES (?, ?, 'task_temporal_relations', ?, ?)
+      `).run(temporalPredictionId, runId, json({
+        kind: 'task_temporal_relations',
+        summary: `${contract.temporal_relations.length} temporal or duplicate relation(s) evaluated.`,
+        confidence: contract.temporal_relations.length
+          ? Math.min(...contract.temporal_relations.map((relation) => relation.confidence))
+          : 1,
+        risk: 'low',
+        affected_paths: inputs.map((input) => input.path),
+        evidence: { relations: contract.temporal_relations },
+        proposed_action: 'Read only the selected bounded input set.',
+        requires_review: contract.status === 'needs_input',
+        source: 'atlas-deterministic',
+      }), startedAt);
+      this.db.prepare(`
+        INSERT INTO predictions(id, run_id, kind, payload_json, created_at)
+        VALUES (?, ?, 'task_write_strategy', ?, ?)
+      `).run(writePredictionId, runId, json({
+        kind: 'task_write_strategy',
+        summary: `${contract.write.strategy} ${contract.write.target}.`,
+        confidence: contract.write.decision === 'deny' ? 1 : 0.95,
+        risk: contract.write.executor === 'guarded_update' ? 'medium' : 'low',
+        affected_paths: [contract.write.target],
+        evidence: { write: contract.write, read_budget: contract.read.budget },
+        proposed_action: contract.write.executor === 'none'
+          ? 'Do not execute this unsupported or destructive write.'
+          : `Use ${contract.write.executor} under this exact Task Contract.`,
+        requires_review: contract.write.executor === 'guarded_update',
+        source: 'atlas-deterministic',
+      }), startedAt);
+      const policyDecision = contract.status === 'blocked'
+        ? 'deny'
+        : contract.status === 'needs_input' || contract.write.executor === 'guarded_update'
+          ? 'warn'
+          : 'allow';
+      this.db.prepare(`
+        INSERT INTO policy_decisions(id, run_id, rule_version_id, decision, reason, details_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        `DEC-${crypto.randomUUID()}`,
+        runId,
+        TASK_RULE_VERSION_ID,
+        policyDecision,
+        contract.write.reason,
+        json({
+          status: contract.status,
+          read_scope: contract.read.scope,
+          write_scope: contract.write.scope,
+          environment_rule_version_id: environmentRuleVersionId,
+          questions: contract.questions,
+        }),
+        startedAt,
+      );
+      this.#insertEvent(runId, 'task_contract_prepared', {
+        contract_id: contractId,
+        contract_hash: contractHash,
+        selected_inputs: contract.read.selected.length,
+        excluded_inputs: contract.read.excluded.length,
+        write_strategy: contract.write.strategy,
+        executor: contract.write.executor,
+      }, startedAt);
+    });
+    return this.getTaskDetail(runId);
+  }
+
+  getTaskDetail(runId) {
+    const run = this.getRun(runId);
+    if (run.mode !== 'task') throw new Error(`Run is not a Task Contract: ${runId}`);
+    const row = this.db.prepare(`SELECT * FROM task_contracts WHERE run_id = ?`).get(runId);
+    if (!row) throw new Error(`Task Contract run is incomplete: ${runId}`);
+    const inputs = this.db.prepare(`
+      SELECT ordinal, path, artifact_id, material_id, prepared_hash AS content_hash,
+             byte_size, selected, selection_reason, series_id AS series,
+             temporal_mode, coverage_start, coverage_end, required, priority
+      FROM task_inputs WHERE run_id = ? ORDER BY ordinal
+    `).all(runId).map((input) => ({
+      ...input,
+      selected: Boolean(input.selected),
+      required: Boolean(input.required),
+      coverage: input.coverage_start || input.coverage_end
+        ? { start: input.coverage_start, end: input.coverage_end }
+        : null,
+      coverage_start: undefined,
+      coverage_end: undefined,
+    }));
+    const predictions = this.db.prepare(`
+      SELECT id, kind, payload_json, created_at FROM predictions
+      WHERE run_id = ? ORDER BY rowid
+    `).all(runId).map((prediction) => ({
+      id: prediction.id,
+      kind: prediction.kind,
+      ...parseJson(prediction.payload_json, {}),
+      created_at: prediction.created_at,
+    }));
+    const decisions = this.db.prepare(`
+      SELECT id, rule_version_id, decision, reason, details_json, created_at
+      FROM policy_decisions WHERE run_id = ? ORDER BY rowid
+    `).all(runId).map((decision) => ({
+      id: decision.id,
+      rule_version_id: decision.rule_version_id,
+      decision: decision.decision,
+      reason: decision.reason,
+      details: parseJson(decision.details_json, {}),
+      created_at: decision.created_at,
+    }));
+    const events = this.db.prepare(`
+      SELECT event_type, payload_json, occurred_at FROM operation_events
+      WHERE run_id = ? ORDER BY occurred_at, rowid
+    `).all(runId).map((event) => ({
+      type: event.event_type,
+      payload: parseJson(event.payload_json, {}),
+      occurred_at: event.occurred_at,
+    }));
+    const completionReceipt = parseJson(row.completion_receipt_json);
+    const lineage = completionReceipt?.output_material_id ? this.db.prepare(`
+      SELECT md.output_material_id, md.input_material_id, md.run_id,
+             md.relation_type, md.ordinal, ti.path AS input_path, md.created_at
+      FROM material_derivations md
+      JOIN task_inputs ti ON ti.run_id = ? AND ti.material_id = md.input_material_id
+      WHERE md.output_material_id = ? ORDER BY md.ordinal
+    `).all(runId, completionReceipt.output_material_id) : [];
+    return {
+      run: {
+        id: run.id,
+        mode: run.mode,
+        status: run.status,
+        root_path: run.root_path,
+        intent: run.intent,
+        caller: {
+          actor: run.actor,
+          agent: run.agent,
+          model: run.model,
+          tool: run.tool,
+          client_run_id: run.client_run_id,
+        },
+        rule_version_id: run.rule_version_id,
+        started_at: run.started_at,
+        closed_at: run.closed_at,
+        rolled_back_at: run.rolled_back_at,
+      },
+      contract_id: row.contract_id,
+      contract_hash: row.contract_hash,
+      project_id: row.project_id,
+      project_path: row.project_path,
+      environment_rule_version_id: row.environment_rule_version_id,
+      request: parseJson(row.request_json, {}),
+      contract: parseJson(row.contract_json, {}),
+      inputs,
+      predictions,
+      policy_decisions: decisions,
+      underlying_run_id: row.underlying_run_id,
+      completion_receipt: completionReceipt,
+      rollback_receipt: parseJson(run.rollback_receipt_json),
+      output: completionReceipt ? { receipt: completionReceipt, lineage } : null,
+      events,
+    };
+  }
+
+  recordTaskUnderlyingRun(runId, writeRunId, occurredAt) {
+    return this.transaction(() => {
+      const task = this.db.prepare(`SELECT underlying_run_id FROM task_contracts WHERE run_id = ?`).get(runId);
+      if (!task) throw new Error(`Task Contract not found: ${runId}`);
+      if (task.underlying_run_id && task.underlying_run_id !== writeRunId) {
+        const error = new Error(`Task Contract already staged another write run: ${task.underlying_run_id}`);
+        error.code = 'ATLAS_STATE_CONFLICT';
+        throw error;
+      }
+      if (!task.underlying_run_id) {
+        this.db.prepare(`UPDATE task_contracts SET underlying_run_id = ? WHERE run_id = ?`)
+          .run(writeRunId, runId);
+        this.#insertEvent(runId, 'task_write_staged', { write_run_id: writeRunId }, occurredAt);
+      }
+      return this.getTaskDetail(runId);
+    });
+  }
+
+  markTaskStale(runId, payload, occurredAt) {
+    return this.transaction(() => {
+      const run = this.getRun(runId);
+      if (run.status === 'stale') return this.getTaskDetail(runId);
+      if (run.status !== 'ready') {
+        throw new Error(`Only a ready Task Contract can become stale; current status is ${run.status}.`);
+      }
+      this.db.prepare(`UPDATE runs SET status = 'stale' WHERE id = ?`).run(runId);
+      this.#insertEvent(runId, 'task_contract_invalidated', payload, occurredAt);
+      return this.getTaskDetail(runId);
+    });
+  }
+
+  completeTaskContract(runId, {
+    writeRunId,
+    outputArtifactId,
+    outputMaterialId,
+    targetPath,
+    relationType,
+    writeMode,
+    completedAt,
+  }) {
+    return this.transaction(() => {
+      const run = this.getRun(runId);
+      const task = this.db.prepare(`SELECT * FROM task_contracts WHERE run_id = ?`).get(runId);
+      const existing = parseJson(task.completion_receipt_json);
+      if (existing) return existing;
+      if (run.status !== 'ready') {
+        throw new Error(`Task completion requires ready status; current status is ${run.status}.`);
+      }
+      if (task.underlying_run_id && task.underlying_run_id !== writeRunId) {
+        const error = new Error(`Task Contract write run mismatch: ${task.underlying_run_id}`);
+        error.code = 'ATLAS_STATE_CONFLICT';
+        throw error;
+      }
+      const inputs = this.db.prepare(`
+        SELECT material_id, ordinal FROM task_inputs
+        WHERE run_id = ? AND selected = 1 ORDER BY ordinal
+      `).all(runId);
+      const insertDerivation = this.db.prepare(`
+        INSERT OR IGNORE INTO material_derivations(
+          output_material_id, input_material_id, run_id, relation_type, ordinal, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      for (const input of inputs) {
+        insertDerivation.run(
+          outputMaterialId,
+          input.material_id,
+          writeRunId,
+          relationType,
+          input.ordinal,
+          completedAt,
+        );
+      }
+      const receipt = {
+        task_id: runId,
+        contract_id: task.contract_id,
+        status: 'completed',
+        write_run_id: writeRunId,
+        write_mode: writeMode,
+        target: targetPath,
+        output_artifact_id: outputArtifactId,
+        output_material_id: outputMaterialId,
+        relation_type: relationType,
+        selected_inputs: inputs.length,
+        verified: true,
+        rollback_ready: true,
+        completed_at: completedAt,
+      };
+      this.db.prepare(`
+        UPDATE task_contracts
+        SET underlying_run_id = ?, completion_receipt_json = ?, completed_at = ?
+        WHERE run_id = ?
+      `).run(writeRunId, json(receipt), completedAt, runId);
+      this.db.prepare(`
+        UPDATE runs SET status = 'completed', closed_at = ?, receipt_json = ? WHERE id = ?
+      `).run(completedAt, json(receipt), runId);
+      this.#insertEvent(runId, 'task_completed_and_verified', receipt, completedAt);
+      return receipt;
+    });
+  }
+
+  finishTaskRollback(runId, receipt, rolledBackAt) {
+    return this.transaction(() => {
+      const run = this.getRun(runId);
+      if (run.rollback_receipt_json) return parseJson(run.rollback_receipt_json);
+      if (run.status !== 'completed') {
+        throw new Error(`Only a completed Task Contract can be rolled back; current status is ${run.status}.`);
+      }
+      this.db.prepare(`
+        UPDATE runs SET status = 'rolled_back', rolled_back_at = ?, rollback_receipt_json = ?
+        WHERE id = ?
+      `).run(rolledBackAt, json(receipt), runId);
+      this.#insertEvent(runId, 'task_rollback_completed', receipt, rolledBackAt);
       return receipt;
     });
   }
@@ -2176,6 +3003,7 @@ export class Ledger {
       ...row,
       profile_id: policy.profile_id ?? null,
       profile_version: policy.profile_version ?? null,
+      library_contract: policy.library_contract ?? null,
       policy,
       policy_json: undefined,
     };
@@ -2192,6 +3020,7 @@ export class Ledger {
       ...row,
       profile_id: policy.profile_id ?? null,
       profile_version: policy.profile_version ?? null,
+      library_contract: policy.library_contract ?? null,
       policy,
       policy_json: undefined,
     };
