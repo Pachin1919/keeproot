@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Ledger } from './ledger.js';
@@ -7,8 +8,52 @@ import { sha256File } from './snapshots.js';
 import { withStateLock } from './state-lock.js';
 import { RollbackConflictError } from './tracker.js';
 
-const OPERATIONS = new Set(['create_directory', 'move_file', 'migrate_project']);
+const OPERATIONS = new Set([
+  'create_directory',
+  'move_file',
+  'migrate_project',
+  'migrate_directory',
+  'remove_empty_directory',
+]);
 const MAX_MANIFEST_ENTRIES = 100_000;
+const MAX_PORTABLE_WINDOWS_PATH = 240;
+const MAX_CONTROL_FILE_BYTES = 256 * 1024;
+const MAX_REFERENCE_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_INSPECTION_REFERENCES = 200;
+const CONTROL_FILE_NAMES = new Set([
+  'agents.md', 'readme.md', 'package.json', 'pyproject.toml', 'cargo.toml', 'go.mod',
+  'requirements.txt', 'pnpm-workspace.yaml', 'workspace.json',
+]);
+const REFERENCE_EXTENSIONS = new Set([
+  '.md', '.txt', '.json', '.jsonc', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.config',
+  '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.ps1', '.cmd', '.bat', '.sh', '.py',
+  '.cs', '.csproj', '.xml', '.html', '.css',
+]);
+const FUNCTIONAL_REFERENCE_EXTENSIONS = new Set([
+  '.json', '.jsonc', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.config',
+  '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.ps1', '.cmd', '.bat', '.sh', '.py',
+  '.cs', '.csproj',
+]);
+const GENERATED_INSPECTION_SEGMENTS = new Set([
+  'obj', 'bin', 'node_modules', '.next', 'coverage', 'dist', 'build', 'builds', 'out',
+]);
+const GENERATED_CACHE_DIRECTORY_NAMES = new Map([
+  ['.pnpm-store', 'pnpm_store'],
+  ['node_modules', 'node_modules'],
+  ['.next', 'next_build'],
+  ['coverage', 'test_coverage'],
+]);
+const DIRECTORY_CLASSIFICATIONS = new Map([
+  ['toolchains', 'tool_runtime'],
+  ['cache', 'generated_cache'],
+  ['.cache', 'generated_cache'],
+  ['.pnpm-store', 'generated_cache'],
+  ['scratch', 'temporary_work'],
+  ['tmp', 'temporary_work'],
+  ['temp', 'temporary_work'],
+  ['tools', 'tool_source_collection'],
+  ['ffmpeg', 'tool_runtime'],
+]);
 
 function timestamp() {
   return new Date().toISOString();
@@ -19,12 +64,23 @@ function makeRunId() {
   return `EVO-${date}-${crypto.randomUUID().slice(0, 8)}`;
 }
 
+function makePlanRunId() {
+  const date = timestamp().replace(/[-:.TZ]/g, '').slice(0, 14);
+  return `ORG-${date}-${crypto.randomUUID().slice(0, 8)}`;
+}
+
 function hashJson(value) {
   return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
 function assertPortableWindowsPath(root, absolute) {
   const relative = path.relative(root, absolute);
+  if (relative !== relative.normalize('NFC')) {
+    throw new Error(`Evolution path must use NFC Unicode normalization: ${relative}`);
+  }
+  if (absolute.length > MAX_PORTABLE_WINDOWS_PATH) {
+    throw new Error(`Evolution path exceeds the V1 portable Windows path limit (${MAX_PORTABLE_WINDOWS_PATH} characters): ${relative}`);
+  }
   for (const segment of relative.split(path.sep)) {
     if (!segment || /[<>:"|?*\u0000-\u001f]/u.test(segment)) {
       throw new Error(`Evolution path is not a portable Windows path: ${relative}`);
@@ -70,6 +126,30 @@ function normalizeTarget(root, input) {
   if (!isPathInside(root, realParent)) throw new Error(`Evolution target resolves outside the root: ${input}`);
   const absolute = path.join(realParent, path.basename(lexical));
   return { absolute, relative: toPortablePath(path.relative(root, absolute)) };
+}
+
+function normalizePlannedTarget(root, input, plannedDirectories) {
+  if (typeof input !== 'string' || !input.trim()) throw new Error('Organization plan target is required.');
+  const lexical = path.isAbsolute(input) ? path.resolve(input) : path.resolve(root, input);
+  if (!isPathInside(root, lexical) || lexical === root) {
+    throw new Error(`Organization plan target escapes the root: ${input}`);
+  }
+  assertPortableWindowsPath(root, lexical);
+  if (fs.existsSync(lexical)) throw new Error(`Organization plan target is already claimed: ${lexical}`);
+  const parent = path.dirname(lexical);
+  const parentRelative = toPortablePath(path.relative(root, parent));
+  if (fs.existsSync(parent)) {
+    assertNoLinkTraversal(root, parent);
+    const stat = fs.lstatSync(parent);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`Organization plan target parent must be a real directory: ${parent}`);
+    }
+    const realParent = fs.realpathSync.native(parent);
+    if (!isPathInside(root, realParent)) throw new Error(`Organization plan target resolves outside the root: ${input}`);
+  } else if (!plannedDirectories.has(parentRelative)) {
+    throw new Error(`Organization plan target parent is neither existing nor created earlier: ${parentRelative}`);
+  }
+  return { absolute: lexical, relative: toPortablePath(path.relative(root, lexical)) };
 }
 
 function normalizeSource(root, input, expectedKind) {
@@ -126,6 +206,278 @@ function directoryManifest(directory) {
   return { kind: 'directory', entries, hash: hashJson(entries) };
 }
 
+function migratableDirectoryManifest(directory) {
+  const entries = [{ path: '', kind: 'directory' }];
+  function walk(current, relativeBase) {
+    const children = fs.readdirSync(current, { withFileTypes: true })
+      .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    for (const child of children) {
+      if (entries.length >= MAX_MANIFEST_ENTRIES) {
+        throw new Error(`Evolution directory manifest exceeds ${MAX_MANIFEST_ENTRIES} entries.`);
+      }
+      const absolute = path.join(current, child.name);
+      const relative = relativeBase ? `${relativeBase}/${child.name}` : child.name;
+      const stat = fs.lstatSync(absolute);
+      if (child.isSymbolicLink() || stat.isSymbolicLink()) {
+        const rawTarget = fs.readlinkSync(absolute);
+        const resolvedTarget = path.resolve(path.dirname(absolute), rawTarget);
+        const internal = isPathInside(directory, resolvedTarget);
+        const targetExists = fs.existsSync(resolvedTarget);
+        let linkType = 'file';
+        try {
+          if (fs.statSync(absolute).isDirectory()) linkType = 'directory';
+        } catch {
+          linkType = 'unknown';
+        }
+        entries.push({
+          path: relative,
+          kind: 'reparse_point',
+          link_type: linkType,
+          target_scope: internal ? 'internal' : 'external',
+          target_relative: internal ? toPortablePath(path.relative(directory, resolvedTarget)) : null,
+          target_exists: targetExists,
+          raw_target: rawTarget,
+        });
+      } else if (child.isDirectory()) {
+        entries.push({ path: relative, kind: 'directory' });
+        walk(absolute, relative);
+      } else if (child.isFile()) {
+        entries.push({
+          path: relative,
+          kind: 'file',
+          byte_size: stat.size,
+          content_hash: sha256File(absolute),
+        });
+      } else {
+        throw new Error(`Evolution does not support special filesystem entries: ${absolute}`);
+      }
+    }
+  }
+  walk(directory, '');
+  const canonical = entries.map(({ raw_target: _rawTarget, ...entry }) => entry);
+  return { kind: 'directory', entries, hash: hashJson(canonical) };
+}
+
+function detectPnpmStorePath() {
+  const result = process.platform === 'win32'
+    ? spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'pnpm.cmd store path'], {
+      encoding: 'utf8',
+      timeout: 5_000,
+      windowsHide: true,
+    })
+    : spawnSync('pnpm', ['store', 'path'], {
+      encoding: 'utf8',
+      timeout: 5_000,
+      windowsHide: true,
+    });
+  if (result.status !== 0) return null;
+  const candidate = result.stdout.trim().split(/\r?\n/u).at(-1)?.trim();
+  return candidate && path.isAbsolute(candidate) ? path.resolve(candidate) : null;
+}
+
+function inspectMigratableDirectory(root, directory, manifest) {
+  const contentRead = new Map();
+  const controlFiles = [];
+  const references = [];
+  const sourceName = path.basename(directory).toLowerCase();
+  const parentName = path.basename(path.dirname(directory)).toLowerCase();
+  const sourceClassification = DIRECTORY_CLASSIFICATIONS.get(sourceName)
+    ?? (parentName === 'tools' ? 'tool_source_collection' : null);
+  const inspectTextContent = !['tool_runtime', 'generated_cache', 'temporary_work'].includes(sourceClassification);
+  const fileEntries = manifest.entries.filter((entry) => entry.kind === 'file');
+  const readText = (entry, limit) => {
+    const absolute = path.resolve(directory, ...entry.path.split('/'));
+    const bytes = fs.readFileSync(absolute).subarray(0, limit);
+    contentRead.set(entry.path, Math.max(contentRead.get(entry.path) ?? 0, bytes.length));
+    return bytes.toString('utf8');
+  };
+  for (const entry of fileEntries) {
+    if (!inspectTextContent) break;
+    if (entry.path.split('/').some((segment) => GENERATED_INSPECTION_SEGMENTS.has(segment.toLowerCase()))) {
+      continue;
+    }
+    const basename = path.posix.basename(entry.path).toLowerCase();
+    if (CONTROL_FILE_NAMES.has(basename) && controlFiles.length < 30) {
+      const text = readText(entry, Math.min(entry.byte_size, MAX_CONTROL_FILE_BYTES));
+      controlFiles.push({ path: entry.path, byte_size: entry.byte_size, excerpt: text.slice(0, 1200) });
+    }
+    const extension = path.posix.extname(entry.path).toLowerCase();
+    if (!REFERENCE_EXTENSIONS.has(extension) || entry.byte_size > MAX_REFERENCE_FILE_BYTES) continue;
+    const text = readText(entry, entry.byte_size);
+    const functional = FUNCTIONAL_REFERENCE_EXTENSIONS.has(extension)
+      || entry.path.toLowerCase().startsWith('.obsidian/');
+    for (const match of text.matchAll(/[A-Z]:\\[^\r\n"'`<>|]*/gu)) {
+      if (references.length >= MAX_INSPECTION_REFERENCES) break;
+      const raw = match[0].replace(/[\])},;]+$/gu, '').trimEnd();
+      const reference = raw.replace(/\\\\/gu, '\\');
+      const firstSegment = reference.slice(3);
+      if (/^[nrtvswd][*+?${[(^]/u.test(firstSegment)) continue;
+      const resolved = path.resolve(reference);
+      references.push({
+        path: entry.path,
+        functional,
+        reference,
+        exists: fs.existsSync(resolved),
+        points_to_source: resolved.toLowerCase() === directory.toLowerCase()
+          || isPathInside(directory, resolved),
+      });
+    }
+  }
+  const directPaths = new Set(manifest.entries.map((entry) => entry.path));
+  const controlFilePaths = new Set(controlFiles.map((item) => item.path));
+  const type = sourceClassification ?? (directPaths.has('.obsidian') ? 'managed_library'
+    : directPaths.has('.git') ? 'source_repository'
+      : controlFiles.some((item) => path.posix.basename(item.path).toLowerCase() === 'package.json')
+        ? 'project_workspace'
+        : 'directory_workspace');
+  const reparsePoints = manifest.entries.filter((entry) => entry.kind === 'reparse_point');
+  const functionalReferences = references.filter((item) => item.functional && item.points_to_source);
+  const sourceCacheKind = GENERATED_CACHE_DIRECTORY_NAMES.get(path.basename(directory).toLowerCase()) ?? null;
+  const generatedCaches = [];
+  const seenCaches = new Set();
+  for (const entry of manifest.entries) {
+    if (entry.kind !== 'directory' || !entry.path) continue;
+    const kind = GENERATED_CACHE_DIRECTORY_NAMES.get(path.posix.basename(entry.path).toLowerCase());
+    if (!kind) continue;
+    const cacheRoot = entry.path.split('/').slice(0, entry.path.split('/').findIndex((part) => (
+      GENERATED_CACHE_DIRECTORY_NAMES.has(part.toLowerCase())
+    )) + 1).join('/');
+    if (seenCaches.has(cacheRoot)) continue;
+    seenCaches.add(cacheRoot);
+    const rootAlternativePath = kind === 'pnpm_store' ? path.join(root, '.pnpm-store') : null;
+    const cacheAbsolute = path.resolve(directory, ...cacheRoot.split('/'));
+    generatedCaches.push({
+      path: cacheRoot,
+      kind,
+      root_level_alternative: rootAlternativePath
+        && path.resolve(rootAlternativePath).toLowerCase() !== cacheAbsolute.toLowerCase()
+        && fs.existsSync(rootAlternativePath)
+        ? toPortablePath(path.relative(root, rootAlternativePath))
+        : null,
+    });
+  }
+  const activePnpmStore = sourceCacheKind === 'pnpm_store'
+    || generatedCaches.some((item) => item.kind === 'pnpm_store')
+    ? detectPnpmStorePath()
+    : null;
+  const staleInternalReparsePoints = reparsePoints.filter((entry) => (
+    entry.target_scope === 'internal' && !entry.target_exists
+  ));
+  const blockers = [
+    ...(functionalReferences.length ? ['functional_absolute_path_references_require_review'] : []),
+    ...(!sourceCacheKind && generatedCaches.length ? ['nested_generated_cache_requires_disposition'] : []),
+    ...(staleInternalReparsePoints.length ? ['stale_internal_reparse_target'] : []),
+  ];
+  const reviewableDocumentationReferences = references.filter(
+    (item) => !item.functional && controlFilePaths.has(item.path),
+  );
+  const staleActionableReferences = references.filter(
+    (item) => !item.exists && (item.functional || controlFilePaths.has(item.path)),
+  );
+  const warnings = [
+    ...(reviewableDocumentationReferences.length ? ['documentation_contains_old_absolute_path'] : []),
+    ...(staleActionableReferences.length ? ['stale_absolute_path_reference'] : []),
+    ...(generatedCaches.some((item) => item.root_level_alternative) ? ['root_level_cache_alternative_exists'] : []),
+  ];
+  return {
+    classification: {
+      type: sourceCacheKind ? 'generated_cache' : type,
+      evidence: [
+        ...(sourceCacheKind ? [path.basename(directory)] : []),
+        ...(directPaths.has('.obsidian') ? ['.obsidian'] : []),
+        ...(directPaths.has('.git') ? ['.git'] : []),
+        ...controlFiles.map((item) => item.path),
+      ],
+    },
+    control_files: controlFiles,
+    content_files_read: contentRead.size,
+    content_bytes_read: [...contentRead.values()].reduce((sum, value) => sum + value, 0),
+    path_references: references,
+    generated_caches: generatedCaches,
+    package_manager_environment: {
+      pnpm_store_path: activePnpmStore,
+      active_store_inside_source: activePnpmStore ? isPathInside(directory, activePnpmStore) : null,
+    },
+    reparse_points: {
+      total: reparsePoints.length,
+      internal: reparsePoints.filter((entry) => entry.target_scope === 'internal').length,
+      external: reparsePoints.filter((entry) => entry.target_scope === 'external').length,
+      items: reparsePoints.map((entry) => ({
+        path: entry.path,
+        link_type: entry.link_type,
+        target_scope: entry.target_scope,
+        target_relative: entry.target_relative,
+        target_exists: entry.target_exists,
+        raw_target: entry.raw_target,
+      })),
+    },
+    blockers,
+    warnings,
+    recommendation: !sourceCacheKind && generatedCaches.length
+      ? 'quarantine_generated_cache_before_library_migration'
+      : 'review_and_migrate',
+  };
+}
+
+function migratableManifestAt(absolute) {
+  if (!fs.existsSync(absolute)) return { kind: 'absent', entries: [], hash: null };
+  const stat = fs.lstatSync(absolute);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) return { kind: 'unsupported', entries: [], hash: null };
+  try {
+    return migratableDirectoryManifest(absolute);
+  } catch {
+    return { kind: 'unsupported', entries: [], hash: null };
+  }
+}
+
+function manifestForOperation(absolute, operation, expectedKind) {
+  return operation === 'migrate_directory'
+    ? migratableManifestAt(absolute)
+    : manifestAt(absolute, expectedKind);
+}
+
+function internalReparseEntries(entries) {
+  return (entries ?? []).filter((entry) => entry.kind === 'reparse_point' && entry.target_scope === 'internal');
+}
+
+function removeInternalReparsePoints(base, entries) {
+  for (const entry of internalReparseEntries(entries)) {
+    fs.rmSync(path.resolve(base, ...entry.path.split('/')), { force: true });
+  }
+}
+
+function createInternalReparsePoints(base, entries) {
+  for (const entry of internalReparseEntries(entries)) {
+    const linkPath = path.resolve(base, ...entry.path.split('/'));
+    const targetPath = path.resolve(base, ...entry.target_relative.split('/'));
+    if (!fs.existsSync(targetPath)) {
+      throw new Error(`Evolution cannot rebase internal reparse target because it is absent: ${entry.target_relative}`);
+    }
+    fs.symlinkSync(targetPath, linkPath, entry.link_type === 'directory' ? 'junction' : 'file');
+  }
+}
+
+function renameMigratableDirectory(source, target, entries) {
+  removeInternalReparsePoints(source, entries);
+  let renamed = false;
+  try {
+    fs.renameSync(source, target);
+    renamed = true;
+    createInternalReparsePoints(target, entries);
+  } catch (error) {
+    try {
+      if (renamed && fs.existsSync(target) && !fs.existsSync(source)) {
+        removeInternalReparsePoints(target, entries);
+        fs.renameSync(target, source);
+      }
+      if (fs.existsSync(source)) createInternalReparsePoints(source, entries);
+    } catch (recoveryError) {
+      error.recovery_error = recoveryError.message;
+    }
+    throw error;
+  }
+}
+
 function manifestAt(absolute, expectedKind = null) {
   if (!fs.existsSync(absolute)) return { kind: 'absent', entries: [], hash: null };
   const stat = fs.lstatSync(absolute);
@@ -163,7 +515,11 @@ function publicManifest(manifest) {
 
 function diffFor(operation, source, target) {
   if (operation === 'create_directory') return `create directory ${target}\n`;
-  return `move ${operation === 'move_file' ? 'file' : 'project'} ${source} -> ${target}\n`;
+  if (operation === 'remove_empty_directory') return `remove empty directory ${source}\n`;
+  const subject = operation === 'move_file' ? 'file'
+    : operation === 'migrate_directory' ? 'directory'
+      : 'project';
+  return `move ${subject} ${source} -> ${target}\n`;
 }
 
 function stateConflict(message) {
@@ -184,6 +540,260 @@ export class Evolution {
     return this._ledger;
   }
 
+  preparePlan({ root: rootInput, operations, intent = null, caller = {}, runId: requestedRunId = null }) {
+    const root = normalizeRoot(rootInput);
+    if (isPathInside(root, this.stateDir)) {
+      throw new Error(`Atlas state directory must be outside the organization plan root: ${this.stateDir}`);
+    }
+    if (!Array.isArray(operations) || operations.length < 1 || operations.length > 100) {
+      throw new Error('Organization plan requires between 1 and 100 operations.');
+    }
+    return withStateLock(this.stateDir, () => {
+      const plannedDirectories = new Set();
+      const targets = new Set();
+      const normalized = operations.map((item, ordinal) => {
+        if (!['create_directory', 'move_file', 'migrate_project', 'migrate_directory'].includes(item.operation)) {
+          throw new Error(`Organization plan operation ${ordinal} is unsupported: ${item.operation}`);
+        }
+        const target = normalizePlannedTarget(root, item.target, plannedDirectories);
+        if (targets.has(target.relative)) throw new Error(`Organization plan repeats target: ${target.relative}`);
+        targets.add(target.relative);
+        let source = null;
+        let project = null;
+        if (item.operation === 'move_file') {
+          source = normalizeSource(root, item.source, 'file');
+        } else if (item.operation === 'migrate_directory') {
+          source = normalizeSource(root, item.source, 'directory');
+        } else if (item.operation === 'migrate_project') {
+          if (!item.projectId) throw new Error('Organization plan Project migration requires projectId.');
+          project = this.ledger.getProject(item.projectId);
+          if (project.status !== 'active') throw new Error(`Organization plan Project is not active: ${item.projectId}`);
+          source = normalizeSource(root, project.current_path, 'directory');
+        }
+        if (source && source.absolute.toLowerCase() === target.absolute.toLowerCase()) {
+          throw new Error('Organization plan does not support identical or case-only moves.');
+        }
+        if (source && ['migrate_project', 'migrate_directory'].includes(item.operation)
+          && isPathInside(source.absolute, target.absolute)) {
+          throw new Error('Organization plan migration target cannot be nested inside its source.');
+        }
+        const sourceManifest = source
+          ? manifestForOperation(
+              source.absolute,
+              item.operation,
+              item.operation === 'move_file' ? 'file' : 'directory',
+            )
+          : null;
+        if (sourceManifest?.kind === 'unsupported') {
+          throw new Error(`Organization plan source contains unsupported entries: ${source.relative}`);
+        }
+        const inspection = item.operation === 'migrate_directory'
+          ? inspectMigratableDirectory(root, source.absolute, sourceManifest)
+          : null;
+        const operation = {
+          ordinal,
+          operation: item.operation,
+          source: source?.relative ?? null,
+          target: target.relative,
+          project_id: item.projectId ?? null,
+          baseline: {
+            source_kind: sourceManifest?.kind ?? null,
+            source_manifest_hash: sourceManifest?.hash ?? null,
+            project_path: project?.current_path ?? null,
+            target_state: 'absent',
+          },
+          recovery: item.operation === 'create_directory'
+            ? 'Remove only if still empty.'
+            : 'Move back only if the target still matches the prepared source manifest.',
+          ...(inspection ? {
+            inspection,
+            blockers: inspection.blockers,
+            warnings: inspection.warnings,
+          } : {}),
+        };
+        if (item.operation === 'create_directory') plannedDirectories.add(target.relative);
+        return operation;
+      });
+      const planHash = hashJson({ root, operations: normalized });
+      const runId = requestedRunId ?? makePlanRunId();
+      return this.ledger.createOrganizationPlan({
+        runId,
+        root,
+        intent,
+        operations: normalized,
+        planHash,
+        caller,
+        createdAt: timestamp(),
+      });
+    });
+  }
+
+  previewPlan(runId) {
+    return this.ledger.getOrganizationPlan(runId);
+  }
+
+  approvePlan(runId, { reason = null } = {}) {
+    if (!reason?.trim()) throw new Error('Organization plan approval requires a reason.');
+    const detail = this.previewPlan(runId);
+    const blockers = detail.operations.flatMap((operation) => operation.blockers ?? []);
+    if (blockers.length) {
+      throw new Error(`Organization plan has unresolved blockers: ${[...new Set(blockers)].join(', ')}.`);
+    }
+    return this.ledger.reviewOrganizationPlan(runId, { reason: reason.trim(), reviewedAt: timestamp() });
+  }
+
+  rejectPlan(runId, { reason = null } = {}) {
+    if (!reason?.trim()) throw new Error('Organization plan rejection requires a reason.');
+    return this.ledger.rejectOrganizationPlan(runId, { reason: reason.trim(), reviewedAt: timestamp() });
+  }
+
+  #preflightPlan(detail) {
+    const conflicts = [];
+    const availablePlannedDirectories = new Set();
+    for (const operation of detail.operations) {
+      const item = detail.items.find((candidate) => candidate.ordinal === operation.ordinal);
+      if (item?.status === 'executed' || item?.status === 'rolled_back') {
+        if (operation.operation === 'create_directory' && item.status === 'executed') {
+          availablePlannedDirectories.add(operation.target);
+        }
+        continue;
+      }
+      const root = detail.run.root_path;
+      const targetPath = path.resolve(root, ...operation.target.split('/'));
+      const targetState = manifestForOperation(
+        targetPath,
+        operation.operation,
+        operation.operation === 'move_file' ? 'file' : 'directory',
+      );
+      if (targetState.kind !== 'absent') {
+        conflicts.push({ ordinal: operation.ordinal, path: operation.target, reason: 'target_claimed' });
+      }
+      if (operation.source) {
+        const sourcePath = path.resolve(root, ...operation.source.split('/'));
+        const sourceState = manifestForOperation(
+          sourcePath,
+          operation.operation,
+          operation.baseline.source_kind,
+        );
+        if (!sameManifest(sourceState, operation.baseline.source_kind, operation.baseline.source_manifest_hash)) {
+          conflicts.push({ ordinal: operation.ordinal, path: operation.source, reason: 'source_changed' });
+        }
+      }
+      const parentRelative = toPortablePath(path.posix.dirname(operation.target));
+      const parentPath = path.resolve(root, ...parentRelative.split('/'));
+      if (!fs.existsSync(parentPath) && !availablePlannedDirectories.has(parentRelative)) {
+        conflicts.push({ ordinal: operation.ordinal, path: parentRelative, reason: 'target_parent_missing' });
+      }
+      if (operation.project_id) {
+        const project = this.ledger.getProject(operation.project_id);
+        if (project.status !== 'active' || project.current_path !== operation.baseline.project_path) {
+          conflicts.push({ ordinal: operation.ordinal, path: operation.source, reason: 'project_registry_changed' });
+        }
+      }
+      if (operation.operation === 'create_directory') availablePlannedDirectories.add(operation.target);
+    }
+    return conflicts;
+  }
+
+  executePlan(runId) {
+    let detail = this.previewPlan(runId);
+    if (detail.execution_receipt) return detail.execution_receipt;
+    if (!['approved', 'partially_executed'].includes(detail.run.status)) {
+      throw new Error(`Organization plan execution requires approval; current status is ${detail.run.status}.`);
+    }
+    if (detail.approved_plan_hash !== detail.plan_hash) {
+      throw stateConflict('Organization plan approval does not match the immutable plan hash.');
+    }
+    const conflicts = this.#preflightPlan(detail);
+    if (conflicts.length) {
+      this.ledger.markOrganizationPlanStale(runId, conflicts, timestamp());
+      throw stateConflict(`Organization plan source changed or target was claimed; plan is stale: ${conflicts[0].path}`);
+    }
+    for (const operation of detail.operations) {
+      detail = this.previewPlan(runId);
+      let item = detail.items.find((candidate) => candidate.ordinal === operation.ordinal);
+      if (item.status === 'executed') continue;
+      let childRunId = item.child_run_id;
+      if (!childRunId) {
+        const prepared = this.prepare({
+          root: detail.run.root_path,
+          operation: operation.operation,
+          source: operation.source,
+          target: operation.target,
+          projectId: operation.project_id,
+          intent: `Organization plan ${runId} item ${operation.ordinal + 1}`,
+          caller: {
+            actor: detail.run.actor,
+            agent: detail.run.agent,
+            model: detail.run.model,
+            tool: detail.run.tool,
+            client_run_id: detail.run.client_run_id,
+          },
+        });
+        childRunId = prepared.run_id;
+        this.ledger.recordOrganizationPlanItem(runId, operation.ordinal, {
+          childRunId,
+          status: 'prepared',
+          occurredAt: timestamp(),
+        });
+      }
+      const child = this.preview(childRunId);
+      if (child.run.status === 'prepared') {
+        this.approve(childRunId, { reason: `Approved once by immutable organization plan ${runId}.` });
+      }
+      this.execute(childRunId);
+      this.ledger.recordOrganizationPlanItem(runId, operation.ordinal, {
+        childRunId,
+        status: 'executed',
+        occurredAt: timestamp(),
+      });
+    }
+    const executedAt = timestamp();
+    const receipt = {
+      run_id: runId,
+      status: 'executed',
+      plan_hash: detail.plan_hash,
+      completed_operations: detail.operations.length,
+      user_decisions: 1,
+      verified: true,
+      rollback_ready: true,
+      executed_at: executedAt,
+    };
+    return this.ledger.finishOrganizationPlanExecution(runId, receipt, executedAt);
+  }
+
+  rollbackPlan(runId) {
+    let detail = this.previewPlan(runId);
+    if (detail.rollback_receipt) return detail.rollback_receipt;
+    if (!['executed', 'partially_executed', 'stale'].includes(detail.run.status)) {
+      throw new Error(`Organization plan has no executed source changes to roll back from ${detail.run.status}.`);
+    }
+    for (const item of [...detail.items].sort((left, right) => right.ordinal - left.ordinal)) {
+      if (!item.child_run_id || item.status === 'rolled_back') continue;
+      const child = this.preview(item.child_run_id);
+      if (child.run.status === 'executed') this.rollback(item.child_run_id);
+      if (['executed', 'rolled_back'].includes(child.run.status) || child.rollback_receipt) {
+        this.ledger.recordOrganizationPlanItem(runId, item.ordinal, {
+          childRunId: item.child_run_id,
+          status: 'rolled_back',
+          occurredAt: timestamp(),
+        });
+      }
+    }
+    detail = this.previewPlan(runId);
+    const remaining = detail.items.filter((item) => item.status === 'executed').length;
+    if (remaining) throw new Error(`Organization plan rollback left ${remaining} executed operation(s).`);
+    const rolledBackAt = timestamp();
+    const receipt = {
+      run_id: runId,
+      status: 'rolled_back',
+      rolled_back_operations: detail.items.filter((item) => item.child_run_id).length,
+      verified: true,
+      rolled_back_at: rolledBackAt,
+    };
+    return this.ledger.finishOrganizationPlanRollback(runId, receipt, rolledBackAt);
+  }
+
   prepare({
     root: rootInput,
     operation,
@@ -201,11 +811,22 @@ export class Evolution {
       throw new Error(`Evolution operation must be one of: ${[...OPERATIONS].join(', ')}.`);
     }
     return withStateLock(this.stateDir, () => {
-      const normalizedTarget = normalizeTarget(root, target);
       let normalizedSource = null;
+      let normalizedTarget = null;
       let project = null;
+      if (operation === 'remove_empty_directory') {
+        normalizedSource = normalizeSource(root, source, 'directory');
+        normalizedTarget = {
+          absolute: normalizedSource.absolute,
+          relative: normalizedSource.relative,
+        };
+      } else {
+        normalizedTarget = normalizeTarget(root, target);
+      }
       if (operation === 'move_file') {
         normalizedSource = normalizeSource(root, source, 'file');
+      } else if (operation === 'migrate_directory') {
+        normalizedSource = normalizeSource(root, source, 'directory');
       } else if (operation === 'migrate_project') {
         if (!projectId) throw new Error('Project migration requires a Project ID.');
         project = this.ledger.getProject(projectId);
@@ -216,24 +837,37 @@ export class Evolution {
         }
       }
       if (normalizedSource) {
-        if (normalizedSource.absolute.toLowerCase() === normalizedTarget.absolute.toLowerCase()) {
+        if (operation !== 'remove_empty_directory'
+          && normalizedSource.absolute.toLowerCase() === normalizedTarget.absolute.toLowerCase()) {
           throw new Error('Evolution does not support an identical or case-only source/target rename.');
         }
-        if (operation === 'migrate_project' && isPathInside(normalizedSource.absolute, normalizedTarget.absolute)) {
-          throw new Error('Project migration target cannot be nested inside itself.');
+        if (['migrate_project', 'migrate_directory'].includes(operation)
+          && isPathInside(normalizedSource.absolute, normalizedTarget.absolute)) {
+          throw new Error('Directory migration target cannot be nested inside itself.');
         }
       }
       const sourceManifest = normalizedSource
-        ? manifestAt(normalizedSource.absolute, operation === 'move_file' ? 'file' : 'directory')
+        ? manifestForOperation(
+            normalizedSource.absolute,
+            operation,
+            operation === 'move_file' ? 'file' : 'directory',
+          )
         : null;
       if (normalizedSource && sourceManifest.kind === 'unsupported') {
         throw new Error('Evolution source contains an unsupported or symbolic-link entry.');
       }
+      if (operation === 'remove_empty_directory'
+        && (sourceManifest.kind !== 'directory' || sourceManifest.entries.length !== 1)) {
+        throw new Error('Evolution remove_empty_directory source must be empty.');
+      }
+      const inspection = operation === 'migrate_directory'
+        ? inspectMigratableDirectory(root, normalizedSource.absolute, sourceManifest)
+        : null;
       const baseline = {
         source_manifest_hash: sourceManifest?.hash ?? null,
         source_kind: sourceManifest?.kind ?? null,
         source_entries: sourceManifest?.entries ?? [],
-        target_state: 'absent',
+        target_state: operation === 'remove_empty_directory' ? 'not_applicable' : 'absent',
         project: project ? {
           id: project.id,
           name: project.name,
@@ -243,7 +877,9 @@ export class Evolution {
       };
       const sourceChanges = operation === 'create_directory'
         ? [{ path: normalizedTarget.relative, change: 'create_directory' }]
-        : [
+        : operation === 'remove_empty_directory'
+          ? [{ path: normalizedSource.relative, change: 'remove_empty_directory' }]
+          : [
             { path: normalizedSource.relative, change: 'remove_original_path' },
             { path: normalizedTarget.relative, change: 'create_moved_path' },
           ];
@@ -252,16 +888,25 @@ export class Evolution {
         operation,
         summary: operation === 'create_directory'
           ? `Create directory ${normalizedTarget.relative}.`
-          : `Move ${normalizedSource.relative} to ${normalizedTarget.relative}.`,
+          : operation === 'remove_empty_directory'
+            ? `Remove empty directory ${normalizedSource.relative}.`
+            : `Move ${normalizedSource.relative} to ${normalizedTarget.relative}.`,
         source: normalizedSource?.relative ?? null,
-        target: normalizedTarget.relative,
+        target: operation === 'remove_empty_directory' ? null : normalizedTarget.relative,
         project_id: projectId,
         source_manifest: sourceManifest ? publicManifest(sourceManifest) : null,
+        ...(inspection ? {
+          inspection,
+          blockers: inspection.blockers,
+          warnings: inspection.warnings,
+        } : {}),
         source_changes: sourceChanges,
         requires_approval: true,
         recovery: operation === 'create_directory'
           ? 'Remove only if the created directory is still empty.'
-          : 'Move back only if source remains absent and target still matches the prepared manifest.',
+          : operation === 'remove_empty_directory'
+            ? 'Recreate only if the removed path is still absent and its parent still exists.'
+            : 'Move back only if source remains absent and target still matches the prepared manifest.',
       };
       const planHash = hashJson(plan);
       const diffText = diffFor(operation, normalizedSource?.relative, normalizedTarget.relative);
@@ -291,7 +936,7 @@ export class Evolution {
         status: 'prepared',
         operation,
         source: normalizedSource?.relative ?? null,
-        target: normalizedTarget.relative,
+        target: operation === 'remove_empty_directory' ? null : normalizedTarget.relative,
         project_id: projectId,
         plan_hash: planHash,
         requires_approval: true,
@@ -306,6 +951,10 @@ export class Evolution {
 
   approve(runId, { reason = null } = {}) {
     if (!reason?.trim()) throw new Error('Evolution approval requires a reason.');
+    const detail = this.preview(runId);
+    if (detail.plan.blockers?.length) {
+      throw new Error(`Evolution plan has unresolved blockers: ${detail.plan.blockers.join(', ')}.`);
+    }
     return this.ledger.reviewEvolution(runId, {
       decision: 'accepted', reason: reason.trim(), reviewedAt: timestamp(),
     });
@@ -337,17 +986,24 @@ export class Evolution {
       : null;
     const targetPath = path.resolve(root, ...record.target_path.split('/'));
     const expectedKind = record.operation_type === 'move_file' ? 'file' : 'directory';
-    const sourceState = sourcePath ? manifestAt(sourcePath, expectedKind) : null;
-    const targetState = manifestAt(targetPath, expectedKind);
+    const sourceState = sourcePath
+      ? manifestForOperation(sourcePath, record.operation_type, expectedKind)
+      : null;
+    const targetState = manifestForOperation(targetPath, record.operation_type, expectedKind);
     const started = detail.events.some((event) => event.type === 'evolution_execution_started');
     const beforeMatches = record.operation_type === 'create_directory'
       ? targetState.kind === 'absent'
-      : sameManifest(sourceState, expectedKind, record.baseline.source_manifest_hash)
-        && targetState.kind === 'absent';
+      : record.operation_type === 'remove_empty_directory'
+        ? sameManifest(sourceState, 'directory', record.baseline.source_manifest_hash)
+          && sourceState.entries.length === 1
+        : sameManifest(sourceState, expectedKind, record.baseline.source_manifest_hash)
+          && targetState.kind === 'absent';
     const afterMatches = record.operation_type === 'create_directory'
       ? sameManifest(targetState, 'directory', hashJson([{ path: '', kind: 'directory' }]))
-      : sourceState.kind === 'absent'
-        && sameManifest(targetState, expectedKind, record.baseline.source_manifest_hash);
+      : record.operation_type === 'remove_empty_directory'
+        ? sourceState.kind === 'absent'
+        : sourceState.kind === 'absent'
+          && sameManifest(targetState, expectedKind, record.baseline.source_manifest_hash);
     if (record.operation_type === 'migrate_project') {
       const project = this.ledger.getProject(record.project_id);
       const allowedRegistryPaths = started && afterMatches
@@ -368,14 +1024,22 @@ export class Evolution {
     if (beforeMatches) {
       this.ledger.startEvolutionExecution(runId, timestamp());
       if (record.operation_type === 'create_directory') fs.mkdirSync(targetPath);
+      else if (record.operation_type === 'remove_empty_directory') fs.rmdirSync(sourcePath);
+      else if (record.operation_type === 'migrate_directory') {
+        renameMigratableDirectory(sourcePath, targetPath, record.baseline.source_entries);
+      }
       else fs.renameSync(sourcePath, targetPath);
     }
-    const verifiedSource = sourcePath ? manifestAt(sourcePath, expectedKind) : null;
-    const verifiedTarget = manifestAt(targetPath, expectedKind);
+    const verifiedSource = sourcePath
+      ? manifestForOperation(sourcePath, record.operation_type, expectedKind)
+      : null;
+    const verifiedTarget = manifestForOperation(targetPath, record.operation_type, expectedKind);
     const verified = record.operation_type === 'create_directory'
       ? sameManifest(verifiedTarget, 'directory', hashJson([{ path: '', kind: 'directory' }]))
-      : verifiedSource.kind === 'absent'
-        && sameManifest(verifiedTarget, expectedKind, record.baseline.source_manifest_hash);
+      : record.operation_type === 'remove_empty_directory'
+        ? verifiedSource.kind === 'absent'
+        : verifiedSource.kind === 'absent'
+          && sameManifest(verifiedTarget, expectedKind, record.baseline.source_manifest_hash);
     if (!verified) throw new Error('Evolution verification failed after filesystem operation.');
     if (record.operation_type === 'migrate_project') {
       const project = this.ledger.getProject(record.project_id);
@@ -399,10 +1063,11 @@ export class Evolution {
         status: 'executed',
         operation: record.operation_type,
         source: record.source_path,
-        target: record.target_path,
+        target: record.operation_type === 'remove_empty_directory' ? null : record.target_path,
         project_id: record.project_id,
-        changed_paths: record.operation_type === 'create_directory' ? 1 : 2,
-        after_manifest_hash: verifiedTarget.hash,
+        changed_paths: ['create_directory', 'remove_empty_directory'].includes(record.operation_type) ? 1 : 2,
+        before_manifest_hash: record.baseline.source_manifest_hash,
+        after_manifest_hash: record.operation_type === 'remove_empty_directory' ? null : verifiedTarget.hash,
         verified: true,
         rollback_ready: true,
         executed_at: executedAt,
@@ -428,17 +1093,24 @@ export class Evolution {
       : null;
     const targetPath = path.resolve(root, ...record.target_path.split('/'));
     const expectedKind = record.operation_type === 'move_file' ? 'file' : 'directory';
-    const sourceState = sourcePath ? manifestAt(sourcePath, expectedKind) : null;
-    const targetState = manifestAt(targetPath, expectedKind);
+    const sourceState = sourcePath
+      ? manifestForOperation(sourcePath, record.operation_type, expectedKind)
+      : null;
+    const targetState = manifestForOperation(targetPath, record.operation_type, expectedKind);
     const started = detail.events.some((event) => event.type === 'evolution_rollback_started');
     const endMatches = record.operation_type === 'create_directory'
       ? sameManifest(targetState, 'directory', record.execution_receipt.after_manifest_hash)
-      : sourceState.kind === 'absent'
-        && sameManifest(targetState, expectedKind, record.baseline.source_manifest_hash);
+      : record.operation_type === 'remove_empty_directory'
+        ? sourceState.kind === 'absent'
+        : sourceState.kind === 'absent'
+          && sameManifest(targetState, expectedKind, record.baseline.source_manifest_hash);
     const baselineMatches = record.operation_type === 'create_directory'
       ? targetState.kind === 'absent'
-      : sameManifest(sourceState, expectedKind, record.baseline.source_manifest_hash)
-        && targetState.kind === 'absent';
+      : record.operation_type === 'remove_empty_directory'
+        ? sameManifest(sourceState, 'directory', record.baseline.source_manifest_hash)
+          && sourceState.entries.length === 1
+        : sameManifest(sourceState, expectedKind, record.baseline.source_manifest_hash)
+          && targetState.kind === 'absent';
     if (record.operation_type === 'migrate_project') {
       const project = this.ledger.getProject(record.project_id);
       const allowedRegistryPaths = started && baselineMatches
@@ -450,10 +1122,10 @@ export class Evolution {
     }
     if (!endMatches && !(started && baselineMatches)) {
       throw new RollbackConflictError([{
-        path: record.target_path,
+        path: record.operation_type === 'remove_empty_directory' ? record.source_path : record.target_path,
         expected_end_hash: record.execution_receipt.after_manifest_hash,
-        current_hash: targetState.hash,
-        current_kind: targetState.kind,
+        current_hash: record.operation_type === 'remove_empty_directory' ? sourceState.hash : targetState.hash,
+        current_kind: record.operation_type === 'remove_empty_directory' ? sourceState.kind : targetState.kind,
       }]);
     }
     if (endMatches) {
@@ -461,14 +1133,22 @@ export class Evolution {
         source: record.source_path, target: record.target_path,
       });
       if (record.operation_type === 'create_directory') fs.rmdirSync(targetPath);
+      else if (record.operation_type === 'remove_empty_directory') fs.mkdirSync(sourcePath);
+      else if (record.operation_type === 'migrate_directory') {
+        renameMigratableDirectory(targetPath, sourcePath, record.baseline.source_entries);
+      }
       else fs.renameSync(targetPath, sourcePath);
     }
-    const verifiedTarget = manifestAt(targetPath, expectedKind);
-    const verifiedSource = sourcePath ? manifestAt(sourcePath, expectedKind) : null;
+    const verifiedTarget = manifestForOperation(targetPath, record.operation_type, expectedKind);
+    const verifiedSource = sourcePath
+      ? manifestForOperation(sourcePath, record.operation_type, expectedKind)
+      : null;
     const verified = record.operation_type === 'create_directory'
       ? verifiedTarget.kind === 'absent'
-      : verifiedTarget.kind === 'absent'
-        && sameManifest(verifiedSource, expectedKind, record.baseline.source_manifest_hash);
+      : record.operation_type === 'remove_empty_directory'
+        ? sameManifest(verifiedSource, 'directory', record.baseline.source_manifest_hash)
+        : verifiedTarget.kind === 'absent'
+          && sameManifest(verifiedSource, expectedKind, record.baseline.source_manifest_hash);
     if (!verified) throw new Error('Evolution rollback verification failed.');
     if (record.operation_type === 'migrate_project') {
       const project = this.ledger.getProject(record.project_id);
@@ -491,7 +1171,7 @@ export class Evolution {
       status: 'rolled_back',
       operation: record.operation_type,
       restored_source: record.source_path,
-      removed_target: record.target_path,
+      removed_target: record.operation_type === 'remove_empty_directory' ? null : record.target_path,
       project_id: record.project_id,
       verified: true,
       rolled_back_at: rolledBackAt,

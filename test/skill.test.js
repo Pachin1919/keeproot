@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { installRuntime } from '../src/runtime-install.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cliPath = path.join(projectRoot, 'bin', 'atlas.js');
@@ -48,7 +49,7 @@ const expectedCaller = {
   client_run_id: 'skill-e2e-001',
 };
 
-test('repository Agent Skill is complete, project-local, and references the implemented protocol', () => {
+test('repository Agent Skill is a complete user-installable source and references the implemented protocol', () => {
   const skill = fs.readFileSync(path.join(skillRoot, 'SKILL.md'), 'utf8');
   const metadata = fs.readFileSync(path.join(skillRoot, 'agents', 'openai.yaml'), 'utf8');
   const protocol = fs.readFileSync(path.join(skillRoot, 'references', 'cli-protocol.md'), 'utf8');
@@ -57,9 +58,13 @@ test('repository Agent Skill is complete, project-local, and references the impl
   assert.match(skill, /^---\r?\nname: atlas-file-governance\r?\ndescription: .+\r?\n---/);
   assert.doesNotMatch(`${skill}\n${metadata}\n${protocol}\n${workflows}`, /\bTODO\b|\[TODO/);
   assert.match(metadata, /\$atlas-file-governance/);
-  assert.match(metadata, /Atlas 0\.1/);
+  assert.match(metadata, /Atlas File Governance/);
   assert.match(skill, /runtime_required/);
-  assert.match(skill, /does not yet provide an automatic installer/);
+  assert.match(skill, /install-atlas\.ps1 install/);
+  assert.match(skill, /15-second timeout/);
+  assert.ok(fs.existsSync(path.join(skillRoot, 'scripts', 'locate-atlas.ps1')));
+  assert.ok(fs.existsSync(path.join(skillRoot, 'scripts', 'capture-browser-page.mjs')));
+  assert.ok(fs.existsSync(path.join(skillRoot, 'scripts', 'intake-attached-file.ps1')));
   assert.match(protocol, /atlas-cli\.v1/);
   assert.match(protocol, /ATLAS_ROLLBACK_CONFLICT/);
   assert.match(skill, /--scan-mode structure/);
@@ -68,7 +73,7 @@ test('repository Agent Skill is complete, project-local, and references the impl
     'bootstrap scan', 'bootstrap profiles', 'bootstrap recommend', 'bootstrap contract',
     'bootstrap adopt', 'bootstrap context',
     'bootstrap propose', 'intake prepare', 'intake execute', 'task prepare', 'task fulfill', 'task show', 'task complete', 'task rollback',
-    'begin', 'close', 'show', 'abort', 'rollback', 'guarded prepare',
+    'begin', 'close', 'show', 'abort', 'rollback', 'guarded prepare', 'guarded apply-approved',
     'derive recommend', 'derive prepare', 'derive preview', 'derive revise', 'derive promote',
     'project evolve', 'evolve prepare', 'evolve preview', 'evolve approve', 'evolve execute',
     'work stage', 'storage plan',
@@ -79,27 +84,97 @@ test('repository Agent Skill is complete, project-local, and references the impl
   assert.equal(path.dirname(skillRoot), path.join(projectRoot, '.agents', 'skills'));
 });
 
+test('Skill attachment Intake script preserves spaced Chinese paths and returns one compact receipt', {
+  skip: process.platform !== 'win32',
+}, () => {
+  const { caseRoot, vault } = setup('skill-attachment-intake-script');
+  const projectPath = path.join(vault, 'Projects', 'PPTgen');
+  const targetDirectory = path.join(projectPath, 'input', 'prior-reports');
+  fs.mkdirSync(targetDirectory, { recursive: true });
+
+  const candidate = path.join(caseRoot, 'JMC 海外社交媒体 – 2026年第二季度报告V2.pptx');
+  fs.writeFileSync(candidate, 'fixture-pptx-bytes', 'utf8');
+  const installRoot = path.join(caseRoot, 'installed-atlas');
+  const installedSkillRoot = path.join(caseRoot, 'installed-skill', 'atlas-file-governance');
+  const installation = installRuntime({
+    sourceRoot: projectRoot,
+    installRoot,
+    skillRoot: installedSkillRoot,
+    nodePath: process.execPath,
+  });
+
+  const powershell = path.join(
+    process.env.ProgramFiles || 'C:\\Program Files',
+    'PowerShell', '7', 'pwsh.exe',
+  );
+  assert.ok(fs.existsSync(powershell), `PowerShell 7 is required for this Windows Skill test: ${powershell}`);
+  const script = path.join(installedSkillRoot, 'scripts', 'intake-attached-file.ps1');
+  const result = spawnSync(powershell, [
+    '-NoProfile', '-File', script,
+    '-InstallRoot', installRoot,
+    '-CandidateFile', candidate,
+    '-Root', vault,
+    '-Target', 'Projects/PPTgen/input/prior-reports/JMC 海外社交媒体 – 2026年第二季度报告V2.pptx',
+    '-Origin', 'human_submitted',
+    '-Kind', 'source',
+    '-ProjectName', 'PPTgen',
+    '-ProjectPath', 'Projects/PPTgen',
+    '-CreateProjectIfMissing',
+    '-Intent', 'Keep the coworker revision as a source.',
+    '-Reason', 'The current user task authorizes this exact placement.',
+    '-Agent', 'Codex',
+    '-Model', 'gpt-5.6',
+    '-Tool', 'skill-script-test',
+    '-ClientRunId', 'attachment-intake-script-001',
+  ], {
+    cwd: projectRoot,
+    windowsHide: true,
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(result.stderr, '');
+  const receipt = JSON.parse(result.stdout);
+  assert.equal(receipt.ok, true);
+  assert.equal(receipt.status, 'executed');
+  assert.equal(receipt.project.created, true);
+  assert.equal(receipt.hash_match, true);
+  assert.equal(receipt.verified, true);
+  assert.equal(receipt.rollback_ready, true);
+  assert.equal(receipt.ppt_body_reads, 0);
+  assert.equal(
+    fs.readFileSync(path.join(vault, receipt.target), 'utf8'),
+    'fixture-pptx-bytes',
+  );
+
+  agentCli(installation.state_dir, ['intake', 'rollback', receipt.run_id]);
+  assert.equal(fs.existsSync(path.join(vault, receipt.target)), false);
+});
+
 test('Skill command sequence completes Agent Bootstrap, Derived, Tracked Direct, and Guarded with JSON-only reconciliation', () => {
   const { caseRoot, vault, stateDir } = setup('skill-agent-e2e');
   fs.mkdirSync(path.join(vault, 'Projects', 'Atlas'), { recursive: true });
   const baselineA = fs.readFileSync(path.join(vault, 'allowed-a.md'), 'utf8');
   const baselineB = fs.readFileSync(path.join(vault, 'allowed-b.md'), 'utf8');
 
-  assert.equal(agentCli(stateDir, ['version']).version, '0.1.0');
+  assert.equal(agentCli(stateDir, ['version']).version, '1.0.0');
   assert.equal(agentCli(stateDir, ['doctor']).status, 'ok');
   const capabilities = agentCli(stateDir, ['capabilities']);
   assert.ok(capabilities.workflows.bootstrap.includes('scan'));
   assert.deepEqual(capabilities.bootstrap_scan_modes, ['structure', 'metadata']);
   assert.ok(capabilities.workflows.tracked_direct.includes('rollback'));
   assert.ok(capabilities.workflows.guarded.includes('execute'));
+  assert.ok(capabilities.workflows.guarded.includes('apply-approved'));
   assert.ok(capabilities.workflows.bootstrap.includes('propose'));
   assert.ok(capabilities.workflows.bootstrap.includes('recommend'));
   assert.ok(capabilities.workflows.bootstrap.includes('contract'));
   assert.ok(capabilities.workflows.bootstrap.includes('adopt'));
   assert.ok(capabilities.workflows.intake.includes('execute'));
+  assert.deepEqual(capabilities.workflows.capture, ['localize', 'sample']);
+  assert.equal(capabilities.browser_capture.maximum_sample_characters, 4000);
   assert.ok(capabilities.workflows.evolution.includes('execute'));
   assert.deepEqual(capabilities.evolution_operations, [
-    'create_directory', 'move_file', 'migrate_project',
+    'create_directory', 'move_file', 'migrate_project', 'migrate_directory',
+    'remove_empty_directory',
   ]);
   assert.ok(capabilities.workflows.registry.includes('evolve'));
   assert.deepEqual(capabilities.intake_origins, [
@@ -330,4 +405,53 @@ test('Skill routes and executes a high-confidence Agent Intake without another u
   assert.equal(shown.inputs.length, 0);
   agentCli(stateDir, ['intake', 'rollback', prepared.run_id]);
   assert.equal(fs.existsSync(path.join(vault, prepared.target)), false);
+});
+
+test('Skill completes a bounded Task handoff through JSON-only CLI reconciliation', () => {
+  const { caseRoot, vault, stateDir } = setup('skill-task-contract');
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Outputs'), { recursive: true });
+  const scan = agentCli(stateDir, [
+    'bootstrap', 'scan', '--root', vault, '--scan-mode', 'structure', ...callerArgs,
+  ]);
+  const contract = agentCli(stateDir, [
+    'bootstrap', 'contract', scan.scan_id, '--profile', 'project-work',
+  ]);
+  agentCli(stateDir, [
+    'bootstrap', 'adopt', scan.scan_id, '--contract', contract.contract_id,
+    '--profile', 'project-work', '--reason', 'Use the bounded Task Contract fixture.',
+  ]);
+  const project = agentCli(stateDir, [
+    'project', 'create', '--name', 'Atlas', '--path', 'Projects/Atlas',
+  ]);
+  const requestFile = path.join(stateDir, 'task-request.json');
+  fs.writeFileSync(requestFile, JSON.stringify({
+    intent: 'Create one bounded report.',
+    project_id: project.project_id,
+    inputs: [{ path: 'allowed-a.md', required: true }],
+    budget: { max_files: 1, max_bytes: 4096 },
+    output: {
+      target: 'Projects/Atlas/Outputs/task-report.md',
+      role: 'report', data_class: 'generated_output', action: 'create',
+    },
+  }), 'utf8');
+  const prepared = agentCli(stateDir, [
+    'task', 'prepare', '--root', vault, '--request-file', requestFile, ...callerArgs,
+  ]);
+  assert.equal(prepared.status, 'ready');
+  assert.deepEqual(prepared.boundaries.allowed_read_paths, ['allowed-a.md']);
+  assert.deepEqual(prepared.boundaries.allowed_write_paths, ['Projects/Atlas/Outputs/task-report.md']);
+  assert.equal(prepared.registration.required, true);
+  const candidateFile = path.join(caseRoot, 'task-report.md');
+  fs.writeFileSync(candidateFile, '# Task report\n', 'utf8');
+  const completed = agentCli(stateDir, [
+    'task', 'fulfill', prepared.task_id, '--candidate-file', candidateFile,
+    '--reason', 'The current content task authorizes this exact output.',
+  ]);
+  assert.equal(completed.status, 'completed');
+  const detail = agentCli(stateDir, ['task', 'show', prepared.task_id]);
+  assert.deepEqual(detail.run.caller, expectedCaller);
+  assert.equal(detail.output.lineage.length, 1);
+  assert.equal(detail.output.receipt.target, 'Projects/Atlas/Outputs/task-report.md');
+  assert.equal(agentCli(stateDir, ['task', 'rollback', prepared.task_id]).status, 'rolled_back');
+  assert.equal(fs.existsSync(path.join(vault, 'Projects', 'Atlas', 'Outputs', 'task-report.md')), false);
 });

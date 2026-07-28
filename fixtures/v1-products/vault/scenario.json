@@ -1,0 +1,8 @@
+{
+  "name": "personal-vault-temporal-chat",
+  "user_request": "帮我整理这个个人 Vault，并用最新聊天记录生成一份当前总结；旧记录不要误删，完成后要能恢复。",
+  "workflow": "Task Contract",
+  "profile": "project-work",
+  "required_commands": ["bootstrap contract", "task prepare", "task fulfill", "task rollback"],
+  "decision_budget": 1
+}

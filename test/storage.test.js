@@ -38,6 +38,23 @@ test('managed work keeps uncaptured Agent files and only plans captured work for
   assert.equal(fs.existsSync(path.dirname(staged.payload_path)), false);
 });
 
+test('managed work explains how to stage a candidate placed in an unregistered work directory', () => {
+  const { stateDir } = setup('managed-work-unstaged-path-guidance');
+  const storage = new RuntimeStorage({ stateDir });
+  const unmanagedDir = path.join(stateDir, 'work', 'r4-candidates');
+  const candidate = path.join(unmanagedDir, 'candidate.md');
+  fs.mkdirSync(unmanagedDir, { recursive: true });
+  fs.writeFileSync(candidate, '# Candidate\n', 'utf8');
+
+  assert.throws(
+    () => storage.markCaptured(candidate, 'GRD-test'),
+    (error) => (
+      error.message.includes('atlas work stage')
+      && error.message.includes('payload_path')
+    ),
+  );
+});
+
 test('storage status classifies temp, work, blobs and protected backups without deleting on status or plan', () => {
   const { stateDir } = setup('storage-classification');
   const storage = new RuntimeStorage({ stateDir });

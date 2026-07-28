@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { LATEST_SCHEMA_VERSION } from '../src/ledger.js';
 import { RollbackConflictError, Tracker } from '../src/tracker.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -236,7 +237,7 @@ test('a version 1 Ledger is migrated in place without losing its existing run', 
 
   const migrated = new DatabaseSync(databasePath, { readOnly: true });
   try {
-    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version, 12);
+    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version, LATEST_SCHEMA_VERSION);
     const runColumns = new Set(migrated.prepare('PRAGMA table_info(runs)').all().map((row) => row.name));
     const labelColumns = new Set(migrated.prepare('PRAGMA table_info(labels)').all().map((row) => row.name));
     const artifactColumns = new Set(migrated.prepare('PRAGMA table_info(artifacts)').all().map((row) => row.name));

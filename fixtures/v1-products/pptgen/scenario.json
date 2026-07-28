@@ -1,0 +1,8 @@
+{
+  "name": "pptgen-material-and-output-routing",
+  "user_request": "把我提供的模板、下载素材和 AI 工作稿分开放好，再根据限定素材生成一份演示文稿提纲。",
+  "workflow": "Intake",
+  "profile": "project-work",
+  "required_commands": ["intake prepare", "intake execute", "task prepare", "task fulfill"],
+  "decision_budget": 1
+}

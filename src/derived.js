@@ -128,9 +128,9 @@ function selectProject(ledger, inputs, explicitProjectId = null) {
   return { status: 'selected', project: finalists[0], basis: 'all_inputs_within_project' };
 }
 
-function placementRecommendation(ledger, root, inputs, role, filename, explicitProjectId = null) {
+function placementRecommendation(ledger, root, inputs, role, filename, explicitProjectId = null, routeOverride = null) {
   const active = ledger.getActiveEnvironmentPolicy(root);
-  if (!active) {
+  if (!active && !routeOverride) {
     return {
       status: 'unresolved',
       decision: 'warn',
@@ -146,15 +146,15 @@ function placementRecommendation(ledger, root, inputs, role, filename, explicitP
       status: 'unresolved',
       decision: 'warn',
       reason: projectSelection.reason,
-      configured: true,
-      rule_version_id: active.rule_version_id,
-      profile_id: active.policy.profile_id,
+      configured: Boolean(active || routeOverride),
+      rule_version_id: active?.rule_version_id ?? null,
+      profile_id: active?.policy.profile_id ?? null,
       project_candidates: projectSelection.candidates.map((project) => ({
         project_id: project.id, name: project.name, path: project.current_path,
       })),
     };
   }
-  const customRules = active.policy.custom_routing_rules?.filter((rule) => (
+  const customRules = routeOverride ? [] : active?.policy.custom_routing_rules?.filter((rule) => (
     rule.evidence?.role === role && typeof rule.evidence?.target_directory === 'string'
   )) ?? [];
   const distinctCustomTargets = [...new Set(customRules.map((rule) => rule.evidence.target_directory))];
@@ -164,8 +164,8 @@ function placementRecommendation(ledger, root, inputs, role, filename, explicitP
       decision: 'warn',
       reason: `Multiple accepted routing rules conflict for role ${role}; select or correct one in a new Bootstrap version.`,
       configured: true,
-      rule_version_id: active.rule_version_id,
-      profile_id: active.policy.profile_id,
+      rule_version_id: active?.rule_version_id ?? null,
+      profile_id: active?.policy.profile_id ?? null,
       project_id: projectSelection.project.id,
       project_candidates: [],
       route_candidates: customRules.map((rule) => ({
@@ -176,7 +176,16 @@ function placementRecommendation(ledger, root, inputs, role, filename, explicitP
     };
   }
   const customRule = customRules[0] ?? null;
-  const route = customRule
+  const route = routeOverride
+    ? {
+        area: null,
+        project_subdirectory: routeOverride.target_subdirectory,
+        source: routeOverride.source ?? 'reviewed_routing_correction',
+        correction_id: routeOverride.correction_id,
+        preference_rule_id: routeOverride.preference_rule_id,
+        rule_version_id: routeOverride.rule_version_id,
+      }
+    : customRule
     ? {
         area: null,
         project_subdirectory: null,
@@ -184,15 +193,15 @@ function placementRecommendation(ledger, root, inputs, role, filename, explicitP
         source: 'reviewed_custom_routing_prediction',
         prediction_id: customRule.prediction_id,
       }
-    : active.policy.derived_routes?.[role];
+    : active?.policy.derived_routes?.[role];
   if (!route) {
     return {
       status: 'unresolved',
       decision: 'warn',
       reason: `The active Profile has no Derived route for role ${role}.`,
       configured: true,
-      rule_version_id: active.rule_version_id,
-      profile_id: active.policy.profile_id,
+      rule_version_id: active?.rule_version_id ?? null,
+      profile_id: active?.policy.profile_id ?? null,
       project_id: projectSelection.project.id,
       project_candidates: [],
     };
@@ -205,7 +214,9 @@ function placementRecommendation(ledger, root, inputs, role, filename, explicitP
   const absoluteTarget = path.resolve(root, ...target.split('/'));
   let status = 'ready';
   let decision = 'allow';
-  let reason = 'The accepted Profile route and selected Project resolve to an existing directory.';
+  let reason = routeOverride
+    ? 'The reviewed scoped preference resolves to an existing Project directory.'
+    : 'The accepted Profile route and selected Project resolve to an existing directory.';
   if (!pathWithin(directory, projectSelection.project.current_path)) {
     status = 'blocked';
     decision = 'deny';
@@ -235,10 +246,11 @@ function placementRecommendation(ledger, root, inputs, role, filename, explicitP
     decision,
     reason,
     configured: true,
-    rule_version_id: active.rule_version_id,
-    environment_policy_id: active.id,
-    profile_id: active.policy.profile_id,
-    profile_version: active.policy.profile_version,
+    rule_version_id: active?.rule_version_id ?? null,
+    routing_rule_version_id: routeOverride?.rule_version_id ?? null,
+    environment_policy_id: active?.id ?? null,
+    profile_id: active?.policy.profile_id ?? null,
+    profile_version: active?.policy.profile_version ?? null,
     project_id: projectSelection.project.id,
     project_name: projectSelection.project.name,
     project_path: projectSelection.project.current_path,
@@ -247,7 +259,7 @@ function placementRecommendation(ledger, root, inputs, role, filename, explicitP
     route,
     directory,
     target,
-    area_mapping: active.policy.area_mappings?.find((mapping) => mapping.area_role === route.area) ?? null,
+    area_mapping: active?.policy.area_mappings?.find((mapping) => mapping.area_role === route.area) ?? null,
     project_candidates: [],
   };
 }
@@ -291,7 +303,7 @@ export class Derived {
     return this._ledger;
   }
 
-  recommend({ root: rootInput, inputs, role, filename, projectId = null }) {
+  recommend({ root: rootInput, inputs, role, filename, projectId = null, routeOverride = null }) {
     const root = normalizeRoot(rootInput);
     if (isPathInside(root, this.stateDir)) {
       throw new Error(`Atlas state directory must be outside the Derived root: ${this.stateDir}`);
@@ -315,6 +327,7 @@ export class Derived {
       normalizedRole,
       normalizedFilename,
       projectId,
+      routeOverride,
     );
   }
 
@@ -335,6 +348,7 @@ export class Derived {
     allowNoInputs = false,
     intakeContext = null,
     caller = {},
+    runId: requestedRunId = null,
   }) {
     const root = normalizeRoot(rootInput);
     if (isPathInside(root, this.stateDir)) {
@@ -357,6 +371,7 @@ export class Derived {
       allowNoInputs,
       intakeContext,
       caller,
+      requestedRunId,
     }));
     if (candidateFile) {
       new RuntimeStorage({ stateDir: this.stateDir, ledger: this.ledger })
@@ -382,6 +397,7 @@ export class Derived {
     allowNoInputs,
     intakeContext,
     caller,
+    requestedRunId,
   }) {
     if (!Array.isArray(inputs) || (inputs.length === 0 && !allowNoInputs)) {
       throw new Error('Derived prepare requires at least one input path.');
@@ -440,15 +456,40 @@ export class Derived {
       path: input.relative,
       ...captureBlob(input.absolute, this.stateDir),
     }));
+    const explicitIntakePlacement = intakeContext?.route_source === 'agent_explicit_target'
+      && intakeContext.explicit_target === normalizedTarget.relative
+      && intakeContext.project?.id === project.id
+      ? {
+          status: 'ready',
+          decision: 'allow',
+          reason: 'The Agent proposed one absent target inside the selected Project and the user task authorized its placement.',
+          configured: false,
+          rule_version_id: null,
+          environment_policy_id: null,
+          profile_id: null,
+          profile_version: null,
+          project_id: project.id,
+          project_name: project.name,
+          project_path: project.current_path,
+          project_basis: 'explicit_project',
+          role: normalizedRole,
+          route: { source: 'agent_explicit_target' },
+          directory: toPortablePath(path.dirname(normalizedTarget.relative)),
+          target: normalizedTarget.relative,
+          area_mapping: null,
+          project_candidates: [],
+        }
+      : null;
     const recommendedPlacement = {
-      ...placementRecommendation(
+      ...(explicitIntakePlacement ?? placementRecommendation(
         this.ledger,
         root,
         normalizedInputs,
         normalizedRole,
         path.basename(normalizedTarget.relative),
         project.id,
-      ),
+        intakeContext?.route_override ?? null,
+      )),
       ...(intakeContext ? { intake: intakeContext } : {}),
     };
     const placementPolicy = recommendedPlacement.status === 'ready'
@@ -481,7 +522,7 @@ export class Derived {
     };
     const { diffText, diffHash } = buildCompleteDiff([change]);
     const startedAt = timestamp();
-    const runId = makeRunId();
+    const runId = requestedRunId ?? makeRunId();
     const ids = this.ledger.createDerivedRun({
       runId,
       root,

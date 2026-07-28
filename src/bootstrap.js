@@ -13,7 +13,9 @@ import {
 import { sha256Buffer, sha256File } from './snapshots.js';
 
 const MAX_MARKDOWN_BYTES = 2 * 1024 * 1024;
-const IGNORED_DIRECTORIES = new Set(['.git', '.atlas', '.obsidian', '.trash', 'node_modules']);
+const IGNORED_DIRECTORIES = new Set([
+  '.git', '.atlas', '.obsidian', '.trash', '.venv', '.pnpm-store', 'node_modules',
+]);
 const SCAN_MODES = new Set(['metadata', 'structure']);
 const AGENT_CONTEXT_AREA_LIMIT = 100;
 const AGENT_PREDICTION_KINDS = new Set([
@@ -384,24 +386,27 @@ function buildDefaultProfilePredictions(recommendation) {
     proposed_action: 'Review this Profile as a routing baseline; do not move or create source directories.',
     ...common,
   }];
-  for (const mapping of mappings.filter((item) => item.status === 'mapped')) {
-    predictions.push({
-      kind: 'folder_role',
-      summary: `Map ${mapping.existing_path} to the ${mapping.area_role} semantic area.`,
-      confidence: recommendation.selection === 'user_selected_candidate' ? 0.95 : recommendation.confidence,
-      risk: 'low',
-      affected_paths: [mapping.existing_path],
-      evidence: {
-        profile_id: profile.id,
-        profile_version: profile.version,
-        path: mapping.existing_path,
-        area_role: mapping.area_role,
-        purpose: mapping.purpose,
-        accepts: mapping.accepts,
-      },
-      proposed_action: 'Use this accepted mapping for later routing recommendations; do not move the directory.',
-      ...common,
-    });
+  for (const mapping of mappings.filter((item) => item.status.startsWith('mapped'))) {
+    const paths = mapping.existing_path ? [mapping.existing_path] : mapping.candidates;
+    for (const mappedPath of paths) {
+      predictions.push({
+        kind: 'folder_role',
+        summary: `Map ${mappedPath} to the ${mapping.area_role} semantic area.`,
+        confidence: recommendation.selection === 'user_selected_candidate' ? 0.95 : recommendation.confidence,
+        risk: 'low',
+        affected_paths: [mappedPath],
+        evidence: {
+          profile_id: profile.id,
+          profile_version: profile.version,
+          path: mappedPath,
+          area_role: mapping.area_role,
+          purpose: mapping.purpose,
+          accepts: mapping.accepts,
+        },
+        proposed_action: 'Use this accepted mapping for later routing recommendations; do not move the directory.',
+        ...common,
+      });
+    }
   }
   predictions.push({
     kind: 'structure_plan_candidate',
@@ -471,17 +476,211 @@ function buildLibraryContract(detail, recommendation, predictionIds) {
     },
   };
   const hashMaterial = {
-    ...candidate,
-    approval: {
-      action: candidate.approval.action,
-      prediction_ids: candidate.approval.prediction_ids,
-    },
+    source_fingerprint: candidate.source_fingerprint,
+    root: candidate.root,
+    scan_mode: candidate.scan_mode,
+    status: candidate.status,
+    profile: candidate.profile,
+    zones: candidate.zones,
+    routes: candidate.routes,
+    questions: candidate.questions,
+    suggestions: candidate.suggestions,
+    source_changes: candidate.source_changes,
+    approval_action: candidate.approval.action,
   };
   const hash = sha256Buffer(Buffer.from(JSON.stringify(hashMaterial), 'utf8'));
+  const contractId = `CONTRACT-${hash.slice(0, 16)}`;
   return {
     schema: candidate.schema,
-    contract_id: `CONTRACT-${hash.slice(0, 16)}`,
+    contract_id: contractId,
     ...Object.fromEntries(Object.entries(candidate).filter(([key]) => key !== 'schema')),
+    review_card: buildLibraryContractReviewCard(candidate, contractId, detail),
+  };
+}
+
+const DIRECTORY_KIND_NOTES = Object.freeze({
+  projects: 'Governed Project or Project collection.',
+  inbox: 'Durable intake awaiting classification.',
+  areas: 'Ongoing responsibility or knowledge area.',
+  resources: 'Reusable source and reference material.',
+  journal: 'Time-oriented personal records.',
+  templates: 'Reusable templates.',
+  outputs: 'Reviewed deliverables and durable results.',
+  archive: 'Inactive retained material.',
+  library: 'Reusable notes, sources, and references.',
+  sources: 'Original inputs and project materials.',
+  working: 'Drafts and intermediate work.',
+  planning: 'Plans, briefs, and decision records.',
+  experiments: 'Demos and experiments kept apart from production code.',
+  implementation: 'Application or automation source code.',
+  reusable_assets: 'Reusable media or design assets.',
+  local_agent_skills: 'Project-local Agent Skills, not global user Skills.',
+  agent_config: 'Local Agent configuration and hooks.',
+  local_tooling: 'Project-local tools and binaries; not user content.',
+  unclassified: 'Observed directory whose role is not yet supported by evidence.',
+});
+
+function classifyObservedDirectory(directoryPath, skillCollections) {
+  const normalized = directoryPath.normalize('NFC');
+  const basename = path.posix.basename(normalized).toLowerCase();
+  const isSkillSupport = skillCollections.some((collectionPath) => (
+    collectionPath === normalized
+    || collectionPath.startsWith(`${normalized}/`)
+    || normalized.startsWith(`${collectionPath}/`)
+  ));
+  if (isSkillSupport || /^(?:skills?|agent-skills?)$/iu.test(basename)) return 'local_agent_skills';
+  if (/^\.agents?$|^\.codex$/iu.test(basename)) return 'agent_config';
+  if (/^\.tools?$|^tools?$/iu.test(basename)) return 'local_tooling';
+  if (/^(?:asset[-_ ]?library|assets?|素材(?:库|示意)?)$/iu.test(basename)) return 'reusable_assets';
+  if (/^(?:template[-_ ]?library|templates?|模板(?:库)?)$/iu.test(basename)) return 'templates';
+  if (/^(?:reports?|outputs?|成果|输出)$/iu.test(basename)) return 'outputs';
+  if (/^(?:src|source|app|lib|code)$/iu.test(basename) || /(?:网站|项目)?代码$/u.test(basename)) return 'implementation';
+  if (/^(?:docs?|planning)$/iu.test(basename) || /规划|文档/u.test(basename)) return 'planning';
+  if (/^(?:sources?|inputs?|materials?)$/iu.test(basename) || /素材|原始|输入/u.test(basename)) return 'sources';
+  if (/^(?:working|work)$/iu.test(basename) || /草稿|中间/u.test(basename)) return 'working';
+  if (/^(?:demos?|experiments?)$/iu.test(basename) || /演示|实验/u.test(basename)) return 'experiments';
+  if (/^(?:archive|archives|归档)$/iu.test(basename)) return 'archive';
+  return 'unclassified';
+}
+
+function directDirectoryChildren(entries, parentPath) {
+  const prefix = parentPath === '.' ? '' : `${parentPath}/`;
+  return entries
+    .filter((entry) => entry.kind === 'directory' && entry.path.startsWith(prefix))
+    .map((entry) => entry.path)
+    .filter((entryPath) => {
+      const remainder = prefix ? entryPath.slice(prefix.length) : entryPath;
+      return remainder && !remainder.includes('/');
+    });
+}
+
+function buildReviewDirectoryMap(detail, currentMap) {
+  const rows = new Map(currentMap.map((item) => [item.path, {
+    path: item.path,
+    kind: item.role,
+    note: item.note,
+    scope: 'content',
+    action: 'keep',
+  }]));
+  const skillCollections = detail.predictions
+    .filter((prediction) => prediction.kind === 'agent_skill_collection')
+    .map((prediction) => prediction.evidence?.collection_path)
+    .filter(Boolean);
+  const projectPaths = currentMap.filter((item) => item.role === 'projects').map((item) => item.path);
+  const observedPaths = new Set(directDirectoryChildren(detail.entries, '.'));
+  for (const projectPath of projectPaths) {
+    for (const childPath of directDirectoryChildren(detail.entries, projectPath)) observedPaths.add(childPath);
+  }
+  for (const observedPath of observedPaths) {
+    if (rows.has(observedPath)) continue;
+    const kind = classifyObservedDirectory(observedPath, skillCollections);
+    const scope = ['local_agent_skills', 'agent_config', 'local_tooling'].includes(kind)
+      ? 'support'
+      : kind === 'unclassified' ? 'unknown' : 'content';
+    rows.set(observedPath, {
+      path: observedPath,
+      kind,
+      note: DIRECTORY_KIND_NOTES[kind],
+      scope,
+      action: kind === 'unclassified' ? 'review' : 'keep',
+    });
+  }
+  return [...rows.values()].sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function buildLibraryContractReviewCard(candidate, contractId, detail) {
+  const currentMap = candidate.zones.flatMap((zone) => {
+    const paths = zone.current_path
+      ? [zone.current_path]
+      : zone.status === 'mapped_multiple'
+        ? zone.candidates
+        : [];
+    return paths.map((mappedPath) => ({
+      path: mappedPath,
+      role: zone.area_role,
+      note: zone.purpose,
+      action: 'keep',
+    }));
+  }).sort((left, right) => left.path.localeCompare(right.path));
+
+  const suggestions = candidate.zones
+    .filter((zone) => ['missing', 'ambiguous'].includes(zone.status))
+    .map((zone) => ({
+      role: zone.area_role,
+      current: zone.candidates,
+      proposed: zone.proposed_path,
+      note: zone.purpose,
+      action: zone.status === 'ambiguous'
+        ? 'choose_existing'
+        : zone.required
+          ? 'consider_create'
+          : 'optional_unmapped',
+    }));
+
+  const routeGroups = new Map();
+  for (const route of candidate.routes) {
+    const zone = candidate.zones.find((item) => item.area_role === route.area);
+    const destination = zone?.current_path
+      ?? (zone?.status === 'mapped_multiple' ? zone.candidates.join(' / ') : null)
+      ?? zone?.proposed_path
+      ?? '(unmapped)';
+    const key = `${route.area}\u0000${destination}\u0000${route.project_subdirectory ?? ''}`;
+    const existing = routeGroups.get(key) ?? {
+      area: route.area,
+      destination,
+      project_subdirectory: route.project_subdirectory,
+      roles: [],
+    };
+    existing.roles.push(route.role);
+    routeGroups.set(key, existing);
+  }
+
+  const directoryMap = buildReviewDirectoryMap(detail, currentMap);
+  const unclassifiedDirectories = directoryMap
+    .filter((item) => item.kind === 'unclassified')
+    .map((item) => item.path);
+  const knownRootControlFiles = /^(?:agents\.md|readme(?:\.md)?|license(?:\.md)?|package\.json|pnpm-lock\.yaml|package-lock\.json|yarn\.lock|\.gitignore)$/iu;
+  const looseRootFiles = detail.entries
+    .filter((entry) => entry.kind === 'file' && !entry.path.includes('/')
+      && !knownRootControlFiles.test(entry.path))
+    .map((entry) => entry.path);
+  const qualityStatus = unclassifiedDirectories.length || looseRootFiles.length
+    ? 'needs_refinement'
+    : 'reviewable';
+
+  return {
+    schema: 'atlas-library-contract-review-card.v1',
+    status: candidate.status,
+    root: candidate.root,
+    profile: candidate.profile.name,
+    summary: `${currentMap.length} mapped ${currentMap.length === 1 ? 'directory' : 'directories'}, ${suggestions.length} suggestion(s), ${candidate.questions.length} question(s).`,
+    current_map: currentMap,
+    directory_map: directoryMap,
+    technical_exclusions: detail.summary.ignored_paths.map((ignoredPath) => ({
+      path: ignoredPath,
+      note: 'Excluded from the content model; retained in place.',
+    })),
+    suggestions,
+    route_summary: [...routeGroups.values()],
+    questions: candidate.questions,
+    quality: {
+      status: qualityStatus,
+      unclassified_directories: unclassifiedDirectories,
+      loose_root_files: looseRootFiles,
+    },
+    decision: candidate.status === 'needs_input'
+      ? 'answer_questions'
+      : qualityStatus === 'needs_refinement'
+        ? 'refine_before_adopt'
+        : 'accept_or_correct',
+    technical: {
+      scan_id: candidate.scan_id,
+      contract_id: contractId,
+      source_fingerprint: candidate.source_fingerprint,
+      profile_id: candidate.profile.id,
+      profile_version: candidate.profile.version,
+      source_changes: candidate.source_changes.length,
+    },
   };
 }
 
@@ -546,6 +745,8 @@ function scanEnvironment(root, ignoreRules = [], scanMode = 'metadata') {
   let contentFilesRead = 0;
   let contentBytesRead = 0;
 
+  const rootBefore = fs.lstatSync(root);
+
   function walk(directory) {
     const children = fs.readdirSync(directory, { withFileTypes: true })
       .sort((left, right) => left.name.localeCompare(right.name));
@@ -557,7 +758,15 @@ function scanEnvironment(root, ignoreRules = [], scanMode = 'metadata') {
         continue;
       }
 
-      const stat = fs.lstatSync(absolute);
+      let stat;
+      try {
+        stat = fs.lstatSync(absolute);
+      } catch (error) {
+        if (error.code === 'ENOENT') {
+          throw new Error(`Path changed while Bootstrap was scanning it; retry: ${absolute}`);
+        }
+        throw error;
+      }
       if (child.isSymbolicLink()) {
         entries.push({
           path: relative,
@@ -603,22 +812,23 @@ function scanEnvironment(root, ignoreRules = [], scanMode = 'metadata') {
         contentFilesRead += 1;
         contentBytesRead += before.size;
       }
-      const after = fs.statSync(absolute);
-      if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
-        throw new Error(`File changed while Bootstrap was scanning it; retry: ${absolute}`);
-      }
       let metadata;
       if (scanMode === 'structure') {
         metadata = { scanned_content: false, scan_mode: 'structure' };
       } else if (extension === '.md') {
         metadata = {
-          ...parseMarkdownMetadata(absolute, after.size),
+          ...parseMarkdownMetadata(absolute, before.size),
           scanned_content: true,
           scan_mode: 'metadata',
         };
-        contentBytesRead += Math.min(after.size, MAX_MARKDOWN_BYTES);
+        contentBytesRead += Math.min(before.size, MAX_MARKDOWN_BYTES);
       } else {
         metadata = { scanned_content: false, scan_mode: 'metadata' };
+      }
+      const after = fs.statSync(absolute);
+      if (before.size !== after.size || before.mtimeMs !== after.mtimeMs
+          || (scanMode === 'metadata' && sha256File(absolute) !== contentHash)) {
+        throw new Error(`File changed while Bootstrap was scanning it; retry: ${absolute}`);
       }
       entries.push({
         path: relative,
@@ -633,6 +843,59 @@ function scanEnvironment(root, ignoreRules = [], scanMode = 'metadata') {
   }
 
   walk(root);
+  for (const entry of entries) {
+    const absolute = path.join(root, ...entry.path.split('/'));
+    let stat;
+    try {
+      stat = fs.lstatSync(absolute);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        throw new Error(`Path changed while Bootstrap was scanning it; retry: ${absolute}`);
+      }
+      throw error;
+    }
+    const currentKind = stat.isSymbolicLink()
+      ? 'symlink'
+      : stat.isDirectory()
+        ? 'directory'
+        : stat.isFile()
+          ? 'file'
+          : 'unsupported';
+    if (currentKind !== entry.kind
+        || (entry.kind !== 'directory' && stat.size !== entry.byteSize)
+        || stat.mtime.toISOString() !== entry.modifiedAt) {
+      throw new Error(`Path changed while Bootstrap was scanning it; retry: ${absolute}`);
+    }
+  }
+  const verifiedPaths = [];
+  const verifiedIgnored = [];
+  function verifyEnumeration(directory) {
+    const children = fs.readdirSync(directory, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const child of children) {
+      const absolute = path.join(directory, child.name);
+      const relative = toPortablePath(path.relative(root, absolute));
+      if (child.isDirectory() && (IGNORED_DIRECTORIES.has(child.name) || customIgnores.has(relative))) {
+        verifiedIgnored.push(relative);
+        continue;
+      }
+      verifiedPaths.push(relative);
+      if (child.isDirectory() && !child.isSymbolicLink()) verifyEnumeration(absolute);
+    }
+  }
+  verifyEnumeration(root);
+  const capturedPaths = entries.map((entry) => entry.path).sort((left, right) => left.localeCompare(right));
+  verifiedPaths.sort((left, right) => left.localeCompare(right));
+  verifiedIgnored.sort((left, right) => left.localeCompare(right));
+  ignoredPaths.sort((left, right) => left.localeCompare(right));
+  if (JSON.stringify(verifiedPaths) !== JSON.stringify(capturedPaths)
+      || JSON.stringify(verifiedIgnored) !== JSON.stringify(ignoredPaths)) {
+    throw new Error(`Root changed while Bootstrap was scanning it; retry: ${root}`);
+  }
+  const rootAfter = fs.lstatSync(root);
+  if (rootBefore.mtimeMs !== rootAfter.mtimeMs) {
+    throw new Error(`Root changed while Bootstrap was scanning it; retry: ${root}`);
+  }
   return { entries, ignoredPaths, contentFilesRead, contentBytesRead };
 }
 
@@ -712,6 +975,29 @@ function compareEnvironment(previousEntries, currentEntries, baselineScanId) {
 
 function inferPredictions(entries, scanMode = 'metadata') {
   const markdown = entries.filter((entry) => entry.kind === 'file' && entry.extension === '.md');
+  const directoryPaths = entries
+    .filter((entry) => entry.kind === 'directory')
+    .map((entry) => entry.path)
+    .sort((left, right) => left.localeCompare(right));
+  const filePathsByLookup = new Set(entries
+    .filter((entry) => entry.kind === 'file')
+    .map((entry) => entry.path.normalize('NFC').toLowerCase()));
+  const skillCollections = ['.', ...directoryPaths].map((collectionPath) => {
+    const directDirectories = directoryPaths.filter((directory) => (
+      path.posix.dirname(directory) === collectionPath
+    ));
+    const packagePaths = directDirectories.filter((directory) => (
+      filePathsByLookup.has(`${directory}/skill.md`.normalize('NFC').toLowerCase())
+    ));
+    return { collectionPath, directDirectories, packagePaths };
+  }).filter((collection) => collection.packagePaths.length >= 2);
+  const skillPackagePaths = unique(skillCollections.flatMap((collection) => collection.packagePaths));
+  const skillCollectionPaths = new Set(skillCollections
+    .map((collection) => collection.collectionPath)
+    .filter((collectionPath) => collectionPath !== '.'));
+  const isInsideSkillPackage = (entryPath) => skillPackagePaths.some((packagePath) => (
+    entryPath === packagePath || entryPath.startsWith(`${packagePath}/`)
+  ));
   const exact = new Map();
   const linkStems = new Map();
   for (const entry of entries.filter((item) => item.kind === 'file')) {
@@ -739,6 +1025,30 @@ function inferPredictions(entries, scanMode = 'metadata') {
   }
 
   const predictions = [];
+  for (const collection of skillCollections) {
+    const packageMarkers = ['agents', 'references', 'scripts', 'assets', 'rules', 'evals'];
+    const markerCounts = Object.fromEntries(packageMarkers.map((marker) => [
+      marker,
+      entries.filter((entry) => collection.packagePaths.some((skill) => (
+        entry.path === `${skill}/${marker}` || entry.path.startsWith(`${skill}/${marker}/`)
+      ))).length,
+    ]));
+    predictions.push(makePrediction(
+      'agent_skill_collection',
+      `${collection.packagePaths.length} packages under "${collection.collectionPath}" follow the Agent Skill SKILL.md convention.`,
+      collection.packagePaths.length === collection.directDirectories.length ? 0.99 : 0.95,
+      collection.packagePaths.flatMap((skill) => [skill, `${skill}/SKILL.md`]),
+      {
+        scope: 'library_local',
+        collection_path: collection.collectionPath,
+        package_count: collection.packagePaths.length,
+        packages: collection.packagePaths.map((skill) => path.posix.basename(skill)),
+        required_marker: 'SKILL.md',
+        optional_marker_counts: markerCounts,
+      },
+      'Treat these as library-local Agent Skill packages; keep repeated SKILL.md names and package support directories.',
+    ));
+  }
   if (scanMode === 'metadata') {
     const broken = new Map();
     const ambiguous = new Map();
@@ -823,6 +1133,8 @@ function inferPredictions(entries, scanMode = 'metadata') {
   }
   for (const paths of markdownStems.values()) {
     if (paths.length < 2) continue;
+    if (normalizeLookup(path.posix.basename(paths[0])) === 'skill'
+        && paths.every((itemPath) => isInsideSkillPackage(itemPath))) continue;
     predictions.push(makePrediction(
       'duplicate_filename',
       `The filename "${path.posix.basename(paths[0])}" appears in multiple folders.`,
@@ -854,6 +1166,7 @@ function inferPredictions(entries, scanMode = 'metadata') {
   }
   for (const [directory, paths] of topLevelCounts) {
     if (paths.length < 2) continue;
+    if (skillCollectionPaths.has(directory) || skillPackagePaths.includes(directory)) continue;
     predictions.push(makePrediction(
       'project_candidate',
       `Top-level folder "${directory}" may represent a project or project area.`,
@@ -866,6 +1179,7 @@ function inferPredictions(entries, scanMode = 'metadata') {
 
   const entryNames = new Set(['index', 'readme', 'overview', 'home', '00 home']);
   for (const directory of entries.filter((entry) => entry.kind === 'directory').map((entry) => entry.path)) {
+    if (skillCollectionPaths.has(directory) || isInsideSkillPackage(directory)) continue;
     const descendants = markdown.filter((entry) => entry.path.startsWith(`${directory}/`));
     if (descendants.length < 2) continue;
     const hasEntry = descendants.some((entry) => {

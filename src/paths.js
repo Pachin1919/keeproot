@@ -27,11 +27,16 @@ export function normalizeRoot(rootInput) {
   return fs.realpathSync.native(absolute);
 }
 
-export function normalizeStateDir(projectRootInput, stateDirInput) {
+export function normalizeStateDir(projectRootInput, stateDirInput, boundaryRootInput = projectRootInput) {
   const projectRoot = fs.realpathSync.native(path.resolve(projectRootInput));
+  const boundaryRoot = fs.realpathSync.native(path.resolve(boundaryRootInput));
+  if (!isPathInside(boundaryRoot, projectRoot)) {
+    throw new Error(`Atlas Runtime project must remain inside its installation root: ${projectRoot}`);
+  }
   const absolute = path.resolve(stateDirInput);
-  if (!isPathInside(projectRoot, absolute)) {
-    throw new Error(`Atlas state directory must remain inside the Atlas project: ${absolute}`);
+  if (!isPathInside(boundaryRoot, absolute)) {
+    const boundaryLabel = boundaryRoot === projectRoot ? 'project' : 'installation root';
+    throw new Error(`Atlas state directory must remain inside the Atlas ${boundaryLabel}: ${absolute}`);
   }
 
   let nearestExisting = absolute;
@@ -44,12 +49,12 @@ export function normalizeStateDir(projectRootInput, stateDirInput) {
   }
 
   let cursor = nearestExisting;
-  while (isPathInside(projectRoot, cursor)) {
+  while (isPathInside(boundaryRoot, cursor)) {
     const stat = fs.lstatSync(cursor);
     if (stat.isSymbolicLink()) {
       throw new Error(`Atlas state directory cannot pass through a symbolic link or junction: ${cursor}`);
     }
-    if (cursor === projectRoot) break;
+    if (cursor === boundaryRoot) break;
     cursor = path.dirname(cursor);
   }
 
@@ -62,8 +67,9 @@ export function normalizeStateDir(projectRootInput, stateDirInput) {
 
   const realParent = fs.realpathSync.native(nearestExisting);
   const physicalCandidate = path.resolve(realParent, path.relative(nearestExisting, absolute));
-  if (!isPathInside(projectRoot, physicalCandidate)) {
-    throw new Error(`Atlas state directory resolves outside the Atlas project: ${absolute}`);
+  if (!isPathInside(boundaryRoot, physicalCandidate)) {
+    const boundaryLabel = boundaryRoot === projectRoot ? 'project' : 'installation root';
+    throw new Error(`Atlas state directory resolves outside the Atlas ${boundaryLabel}: ${absolute}`);
   }
   return absolute;
 }

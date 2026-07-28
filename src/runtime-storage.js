@@ -158,6 +158,12 @@ export class RuntimeStorage {
     const relative = path.relative(this.workDir, absolute).split(path.sep);
     if (relative.length < 2) return null;
     const workId = relative[0];
+    if (!/^WORK-[A-Za-z0-9-]+$/u.test(workId)) {
+      throw new Error(
+        'Candidate path is inside Atlas managed work but is not a staged Work payload. '
+        + 'Run atlas work stage --file <candidate> --kind candidate and use the returned payload_path.',
+      );
+    }
     return withStateLock(this.stateDir, () => {
       const { itemDir, manifest } = this.#resolveWorkItem(workId);
       const expected = path.resolve(itemDir, manifest.payload);

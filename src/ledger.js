@@ -6,9 +6,12 @@ import { RISK_RULE_VERSION_ID } from './risk.js';
 
 const RULE_VERSION_ID = 'RULE-TRACKED-DIRECT-1';
 const BOOTSTRAP_RULE_VERSION_ID = 'RULE-BOOTSTRAP-2';
-const EVOLUTION_RULE_VERSION_ID = 'RULE-EVOLUTION-1';
+const EVOLUTION_RULE_VERSION_ID = 'RULE-EVOLUTION-6';
+const ORGANIZATION_PLAN_RULE_VERSION_ID = 'RULE-EVOLUTION-PLAN-1';
 const TASK_RULE_VERSION_ID = 'RULE-TASK-CONTRACT-1';
-export const LATEST_SCHEMA_VERSION = 12;
+export const TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID = 'RULE-TASK-SCOPED-EXPLICIT-1';
+const PORTFOLIO_RULE_VERSION_ID = 'RULE-PORTFOLIO-1';
+export const LATEST_SCHEMA_VERSION = 18;
 
 function json(value) {
   return JSON.stringify(value);
@@ -21,11 +24,42 @@ function now() {
   return new Date().toISOString();
 }
 
+function isProcessAlive(processId) {
+  if (!Number.isInteger(processId) || processId <= 0) return false;
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+function assertWritableLedgerState(stateDir, databasePath) {
+  let descriptor = null;
+  let probePath = null;
+  try {
+    if (fs.existsSync(databasePath)) {
+      descriptor = fs.openSync(databasePath, 'r+');
+    } else {
+      probePath = path.join(stateDir, `.ledger-write-probe-${crypto.randomUUID()}`);
+      descriptor = fs.openSync(probePath, 'wx');
+    }
+  } catch (error) {
+    const wrapped = new Error(`Atlas Ledger state is not writable: ${error.message}`);
+    wrapped.code = error.code ?? 'ATLAS_LEDGER_READ_ONLY';
+    throw wrapped;
+  } finally {
+    if (descriptor != null) fs.closeSync(descriptor);
+    if (probePath) fs.rmSync(probePath, { force: true });
+  }
+}
+
 export class Ledger {
   constructor(stateDir) {
     this.stateDir = path.resolve(stateDir);
     fs.mkdirSync(this.stateDir, { recursive: true });
     this.dbPath = path.join(this.stateDir, 'ledger.sqlite');
+    assertWritableLedgerState(this.stateDir, this.dbPath);
     this.db = new DatabaseSync(this.dbPath);
     try {
       // Configure lock waiting before the first schema read. Another Atlas process may
@@ -288,6 +322,55 @@ export class Ledger {
       CREATE INDEX IF NOT EXISTS idx_environment_policies_root_status
         ON environment_policies(root_path, status, activated_at);
 
+      CREATE TABLE IF NOT EXISTS portfolio_inventories (
+        run_id TEXT PRIMARY KEY REFERENCES runs(id),
+        fingerprint TEXT NOT NULL,
+        depth INTEGER NOT NULL,
+        excluded_json TEXT NOT NULL,
+        expanded_json TEXT NOT NULL,
+        summary_json TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_portfolio_inventories_fingerprint
+        ON portfolio_inventories(fingerprint);
+
+      CREATE TABLE IF NOT EXISTS portfolio_roots (
+        id TEXT PRIMARY KEY,
+        current_path TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS portfolio_root_path_history (
+        id INTEGER PRIMARY KEY,
+        root_id TEXT NOT NULL REFERENCES portfolio_roots(id),
+        path TEXT NOT NULL,
+        valid_from TEXT NOT NULL,
+        valid_to TEXT,
+        reason TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS portfolio_inventory_roots (
+        inventory_run_id TEXT NOT NULL REFERENCES runs(id),
+        root_id TEXT NOT NULL REFERENCES portfolio_roots(id),
+        relative_path TEXT NOT NULL,
+        observation_json TEXT NOT NULL,
+        type_prediction_id TEXT NOT NULL UNIQUE REFERENCES predictions(id),
+        relation_prediction_id TEXT NOT NULL UNIQUE REFERENCES predictions(id),
+        PRIMARY KEY(inventory_run_id, root_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS portfolio_plans (
+        id TEXT PRIMARY KEY,
+        inventory_run_id TEXT NOT NULL REFERENCES runs(id),
+        target_root TEXT NOT NULL,
+        plan_hash TEXT NOT NULL,
+        plan_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(inventory_run_id, target_root, plan_hash)
+      );
+
       CREATE TABLE IF NOT EXISTS bootstrap_proposals (
         id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL REFERENCES runs(id),
@@ -386,6 +469,106 @@ export class Ledger {
         UNIQUE(run_id, path)
       );
 
+      CREATE TABLE IF NOT EXISTS task_fulfillment_claims (
+        task_run_id TEXT PRIMARY KEY REFERENCES task_contracts(run_id),
+        claim_token TEXT NOT NULL UNIQUE,
+        process_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        planned_write_run_id TEXT,
+        write_run_id TEXT REFERENCES runs(id),
+        claimed_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS routing_corrections (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+        root_path TEXT NOT NULL,
+        scope_type TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        role TEXT NOT NULL,
+        target_subdirectory TEXT NOT NULL,
+        rule_version_id TEXT NOT NULL REFERENCES rule_versions(id),
+        status TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        superseded_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_routing_corrections_lookup
+        ON routing_corrections(root_path, origin, kind, status, scope_type, scope_key);
+
+      CREATE TABLE IF NOT EXISTS preference_rules (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+        root_path TEXT NOT NULL,
+        scope_type TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        condition_hash TEXT NOT NULL,
+        condition_json TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        priority INTEGER NOT NULL,
+        rule_version_id TEXT NOT NULL REFERENCES rule_versions(id),
+        status TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        basis TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        superseded_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_preference_rules_lookup
+        ON preference_rules(root_path, status, kind, scope_type, scope_key, priority);
+
+      CREATE TABLE IF NOT EXISTS rule_change_proposals (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+        root_path TEXT NOT NULL,
+        proposal_hash TEXT NOT NULL,
+        scope_type TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        condition_hash TEXT NOT NULL,
+        condition_json TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        basis TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        priority INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        base_rule_id TEXT REFERENCES preference_rules(id),
+        impact_json TEXT NOT NULL,
+        activated_rule_id TEXT REFERENCES preference_rules(id),
+        created_at TEXT NOT NULL,
+        reviewed_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_rule_change_proposals_hash
+        ON rule_change_proposals(root_path, proposal_hash, status);
+
+      CREATE TABLE IF NOT EXISTS organization_plans (
+        run_id TEXT PRIMARY KEY REFERENCES runs(id),
+        plan_hash TEXT NOT NULL,
+        operations_json TEXT NOT NULL,
+        approved_plan_hash TEXT,
+        approval_receipt_json TEXT,
+        execution_receipt_json TEXT,
+        rollback_receipt_json TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS organization_plan_items (
+        plan_run_id TEXT NOT NULL REFERENCES organization_plans(run_id),
+        ordinal INTEGER NOT NULL,
+        child_run_id TEXT REFERENCES runs(id),
+        status TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(plan_run_id, ordinal)
+      );
+
       CREATE TABLE IF NOT EXISTS rollback_progress (
         run_id TEXT NOT NULL REFERENCES runs(id),
         path TEXT NOT NULL,
@@ -451,6 +634,8 @@ export class Ledger {
       this.#ensureColumn('artifacts', 'status', "TEXT NOT NULL DEFAULT 'active'");
       this.#ensureColumn('artifacts', 'updated_at', 'TEXT');
       this.#ensureColumn('derived_operations', 'revised_from_run_id', 'TEXT REFERENCES runs(id)');
+      this.#ensureColumn('task_fulfillment_claims', 'planned_write_run_id', 'TEXT');
+      this.#ensureColumn('portfolio_inventories', 'expanded_json', "TEXT NOT NULL DEFAULT '[]'");
       this.db.exec(`
         UPDATE artifacts
         SET root_path = (
@@ -475,6 +660,12 @@ export class Ledger {
       insertMigration.run(10, 'derived_revision_and_artifact_role_evolution', appliedAt);
       insertMigration.run(11, 'guarded_filesystem_evolution_changesets', appliedAt);
       insertMigration.run(12, 'bounded_task_contracts_and_temporal_read_policy', appliedAt);
+      insertMigration.run(13, 'scoped_intake_routing_corrections', appliedAt);
+      insertMigration.run(14, 'immutable_multi_step_organization_plans', appliedAt);
+      insertMigration.run(15, 'exclusive_task_fulfillment_claims', appliedAt);
+      insertMigration.run(16, 'crash_resumable_task_fulfillment_claims', appliedAt);
+      insertMigration.run(17, 'multi_root_portfolio_inventory_review_and_plan', appliedAt);
+      insertMigration.run(18, 'scoped_effective_preference_rules', appliedAt);
       this.db.exec(`PRAGMA user_version = ${LATEST_SCHEMA_VERSION};`);
     });
   }
@@ -1044,9 +1235,15 @@ export class Ledger {
     this.transaction(() => {
       this.db.prepare(`
         INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
-        VALUES (?, 'Guarded filesystem evolution', '1.0.0', ?, ?)
+        VALUES (?, 'Guarded filesystem evolution', '6.0.0', ?, ?)
       `).run(EVOLUTION_RULE_VERSION_ID, json({
-        operations: ['create_directory', 'move_file', 'migrate_project'],
+        operations: [
+          'create_directory',
+          'move_file',
+          'migrate_project',
+          'migrate_directory',
+          'remove_empty_directory',
+        ],
         review_required: true,
         stale_plan_denied: true,
         rollback_conflict_denied: true,
@@ -1308,6 +1505,12 @@ export class Ledger {
           `DIF-${crypto.randomUUID()}`, changeSet.id, operation.target_path, 'added',
           null, null, 'directory', receipt.after_manifest_hash,
         );
+      } else if (operation.operation_type === 'remove_empty_directory') {
+        const baseline = parseJson(operation.baseline_json, {});
+        insert.run(
+          `DIF-${crypto.randomUUID()}`, changeSet.id, operation.source_path, 'deleted',
+          'directory', baseline.source_manifest_hash, null, null,
+        );
       } else {
         const kind = operation.operation_type === 'move_file' ? 'file' : 'directory';
         insert.run(
@@ -1352,6 +1555,236 @@ export class Ledger {
     });
   }
 
+  createOrganizationPlan({ runId, root, intent, operations, planHash, caller = {}, createdAt }) {
+    const predictionId = `PRD-${crypto.randomUUID()}`;
+    const receipt = {
+      run_id: runId,
+      status: 'prepared',
+      plan_hash: planHash,
+      operations,
+      user_decisions_required: 1,
+      source_changes: operations.map((item) => ({
+        operation: item.operation,
+        source: item.source ?? null,
+        target: item.target,
+      })),
+    };
+    this.transaction(() => {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
+        VALUES (?, 'Immutable organization plan policy', '1.0.0', ?, ?)
+      `).run(ORGANIZATION_PLAN_RULE_VERSION_ID, json({
+        approval: 'one approval for the immutable total plan',
+        execution: 'sequential verified Evolution child runs',
+        recovery: 'reverse child rollback with conflict protection',
+      }), createdAt);
+      this.db.prepare(`
+        INSERT INTO runs(
+          id, mode, status, root_path, intent, actor, agent, model, tool, client_run_id,
+          rule_version_id, started_at, receipt_json
+        ) VALUES (?, 'organization_plan', 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        runId, path.resolve(root), intent ?? null,
+        caller.actor ?? 'unknown', caller.agent ?? null, caller.model ?? null,
+        caller.tool ?? 'atlas-cli', caller.client_run_id ?? null,
+        ORGANIZATION_PLAN_RULE_VERSION_ID, createdAt, json(receipt),
+      );
+      this.db.prepare(`
+        INSERT INTO predictions(id, run_id, kind, payload_json, created_at)
+        VALUES (?, ?, 'organization_plan', ?, ?)
+      `).run(predictionId, runId, json({ plan_hash: planHash, operations }), createdAt);
+      this.db.prepare(`
+        INSERT INTO policy_decisions(
+          id, run_id, rule_version_id, decision, reason, details_json, created_at
+        ) VALUES (?, ?, ?, 'warn', 'Organization plan requires one explicit total-plan approval.', ?, ?)
+      `).run(`POL-${crypto.randomUUID()}`, runId, ORGANIZATION_PLAN_RULE_VERSION_ID, json({ plan_hash: planHash }), createdAt);
+      this.db.prepare(`
+        INSERT INTO organization_plans(run_id, plan_hash, operations_json)
+        VALUES (?, ?, ?)
+      `).run(runId, planHash, json(operations));
+      const insertItem = this.db.prepare(`
+        INSERT INTO organization_plan_items(plan_run_id, ordinal, child_run_id, status, updated_at)
+        VALUES (?, ?, NULL, 'pending', ?)
+      `);
+      operations.forEach((operation, ordinal) => insertItem.run(runId, ordinal, createdAt));
+      this.#insertEvent(runId, 'organization_plan_prepared', {
+        plan_hash: planHash, operation_count: operations.length,
+      }, createdAt);
+    });
+    return receipt;
+  }
+
+  getOrganizationPlan(runId) {
+    const run = this.getRun(runId);
+    if (run.mode !== 'organization_plan') throw new Error(`Run is not an organization plan: ${runId}`);
+    const plan = this.db.prepare('SELECT * FROM organization_plans WHERE run_id = ?').get(runId);
+    const prediction = this.db.prepare(`
+      SELECT id, payload_json FROM predictions WHERE run_id = ? AND kind = 'organization_plan'
+    `).get(runId);
+    const label = this.db.prepare(`
+      SELECT value, details_json, created_at FROM labels
+      WHERE run_id = ? AND name = 'organization_plan_review'
+      ORDER BY rowid DESC LIMIT 1
+    `).get(runId);
+    const items = this.db.prepare(`
+      SELECT ordinal, child_run_id, status, updated_at
+      FROM organization_plan_items WHERE plan_run_id = ? ORDER BY ordinal
+    `).all(runId);
+    return {
+      run,
+      status: run.status,
+      plan_hash: plan.plan_hash,
+      operations: parseJson(plan.operations_json, []),
+      approved_plan_hash: plan.approved_plan_hash,
+      approval: label ? { value: label.value, ...parseJson(label.details_json, {}), created_at: label.created_at } : null,
+      items,
+      user_decisions_required: label ? 0 : 1,
+      receipt: parseJson(run.receipt_json, {}),
+      execution_receipt: parseJson(plan.execution_receipt_json),
+      rollback_receipt: parseJson(plan.rollback_receipt_json),
+      events: this.db.prepare(`
+        SELECT event_type AS type, payload_json, occurred_at
+        FROM operation_events WHERE run_id = ? ORDER BY occurred_at, rowid
+      `).all(runId).map((event) => ({
+        type: event.type, payload: parseJson(event.payload_json, {}), occurred_at: event.occurred_at,
+      })),
+      prediction_id: prediction?.id ?? null,
+    };
+  }
+
+  reviewOrganizationPlan(runId, { reason, reviewedAt }) {
+    return this.transaction(() => {
+      const detail = this.getOrganizationPlan(runId);
+      if (detail.run.status === 'approved') return detail.receipt;
+      if (detail.run.status !== 'prepared') throw new Error(`Organization plan cannot be approved from ${detail.run.status}.`);
+      const receipt = {
+        ...detail.receipt,
+        status: 'approved',
+        approval_reason: reason,
+        approved_at: reviewedAt,
+      };
+      this.db.prepare(`
+        INSERT INTO labels(
+          id, run_id, subject_prediction_id, name, value, source, details_json, created_at
+        ) VALUES (?, ?, ?, 'organization_plan_review', 'accepted', 'user', ?, ?)
+      `).run(
+        `LBL-${crypto.randomUUID()}`, runId, detail.prediction_id,
+        json({ reason, plan_hash: detail.plan_hash }), reviewedAt,
+      );
+      this.db.prepare(`
+        INSERT INTO policy_decisions(
+          id, run_id, rule_version_id, decision, reason, details_json, created_at
+        ) VALUES (?, ?, ?, 'allow', ?, ?, ?)
+      `).run(
+        `POL-${crypto.randomUUID()}`, runId, ORGANIZATION_PLAN_RULE_VERSION_ID,
+        `Approved immutable organization plan: ${reason}`, json({ plan_hash: detail.plan_hash }), reviewedAt,
+      );
+      this.db.prepare("UPDATE runs SET status = 'approved', receipt_json = ? WHERE id = ?")
+        .run(json(receipt), runId);
+      this.db.prepare(`
+        UPDATE organization_plans
+        SET approved_plan_hash = ?, approval_receipt_json = ? WHERE run_id = ?
+      `).run(detail.plan_hash, json(receipt), runId);
+      this.#insertEvent(runId, 'organization_plan_approved', { plan_hash: detail.plan_hash, reason }, reviewedAt);
+      return receipt;
+    });
+  }
+
+  rejectOrganizationPlan(runId, { reason, reviewedAt }) {
+    return this.transaction(() => {
+      const detail = this.getOrganizationPlan(runId);
+      if (detail.run.status === 'rejected') return detail.receipt;
+      if (detail.run.status !== 'prepared') {
+        throw new Error(`Organization plan cannot be rejected from ${detail.run.status}.`);
+      }
+      const receipt = {
+        ...detail.receipt,
+        status: 'rejected',
+        rejection_reason: reason,
+        rejected_at: reviewedAt,
+      };
+      this.db.prepare(`
+        INSERT INTO labels(
+          id, run_id, subject_prediction_id, name, value, source, details_json, created_at
+        ) VALUES (?, ?, ?, 'organization_plan_review', 'rejected', 'user', ?, ?)
+      `).run(
+        `LBL-${crypto.randomUUID()}`, runId, detail.prediction_id,
+        json({ reason, plan_hash: detail.plan_hash }), reviewedAt,
+      );
+      this.db.prepare(`
+        INSERT INTO policy_decisions(
+          id, run_id, rule_version_id, decision, reason, details_json, created_at
+        ) VALUES (?, ?, ?, 'deny', ?, ?, ?)
+      `).run(
+        `POL-${crypto.randomUUID()}`, runId, ORGANIZATION_PLAN_RULE_VERSION_ID,
+        `Rejected immutable organization plan: ${reason}`, json({ plan_hash: detail.plan_hash }), reviewedAt,
+      );
+      this.db.prepare("UPDATE runs SET status = 'rejected', receipt_json = ? WHERE id = ?")
+        .run(json(receipt), runId);
+      this.#insertEvent(runId, 'organization_plan_rejected', { plan_hash: detail.plan_hash, reason }, reviewedAt);
+      return receipt;
+    });
+  }
+
+  markOrganizationPlanStale(runId, conflicts, occurredAt) {
+    return this.transaction(() => {
+      const detail = this.getOrganizationPlan(runId);
+      if (detail.run.status === 'stale') return detail.receipt;
+      const receipt = { ...detail.receipt, status: 'stale', conflicts };
+      this.db.prepare("UPDATE runs SET status = 'stale', receipt_json = ? WHERE id = ?")
+        .run(json(receipt), runId);
+      this.#insertEvent(runId, 'organization_plan_stale', { conflicts }, occurredAt);
+      return receipt;
+    });
+  }
+
+  recordOrganizationPlanItem(runId, ordinal, { childRunId = null, status, occurredAt }) {
+    return this.transaction(() => {
+      const current = this.db.prepare(`
+        SELECT child_run_id, status FROM organization_plan_items
+        WHERE plan_run_id = ? AND ordinal = ?
+      `).get(runId, ordinal);
+      if (!current) throw new Error(`Organization plan item not found: ${runId}#${ordinal}`);
+      if (current.child_run_id && childRunId && current.child_run_id !== childRunId) {
+        throw new Error(`Organization plan item already belongs to ${current.child_run_id}.`);
+      }
+      this.db.prepare(`
+        UPDATE organization_plan_items
+        SET child_run_id = COALESCE(child_run_id, ?), status = ?, updated_at = ?
+        WHERE plan_run_id = ? AND ordinal = ?
+      `).run(childRunId, status, occurredAt, runId, ordinal);
+      if (status !== 'rolled_back') {
+        this.db.prepare("UPDATE runs SET status = 'partially_executed' WHERE id = ? AND status = 'approved'")
+          .run(runId);
+      }
+      this.#insertEvent(runId, 'organization_plan_item_updated', {
+        ordinal, child_run_id: childRunId ?? current.child_run_id, status,
+      }, occurredAt);
+    });
+  }
+
+  finishOrganizationPlanExecution(runId, receipt, occurredAt) {
+    return this.transaction(() => {
+      this.db.prepare("UPDATE runs SET status = 'executed', closed_at = ?, receipt_json = ? WHERE id = ?")
+        .run(occurredAt, json(receipt), runId);
+      this.db.prepare('UPDATE organization_plans SET execution_receipt_json = ? WHERE run_id = ?')
+        .run(json(receipt), runId);
+      this.#insertEvent(runId, 'organization_plan_executed', receipt, occurredAt);
+      return receipt;
+    });
+  }
+
+  finishOrganizationPlanRollback(runId, receipt, occurredAt) {
+    return this.transaction(() => {
+      this.db.prepare("UPDATE runs SET status = 'rolled_back', rolled_back_at = ?, rollback_receipt_json = ? WHERE id = ?")
+        .run(occurredAt, json(receipt), runId);
+      this.db.prepare('UPDATE organization_plans SET rollback_receipt_json = ? WHERE run_id = ?')
+        .run(json(receipt), runId);
+      this.#insertEvent(runId, 'organization_plan_rolled_back', receipt, occurredAt);
+      return receipt;
+    });
+  }
+
   findTaskContract(contractId) {
     const row = this.db.prepare(`
       SELECT run_id FROM task_contracts WHERE contract_id = ?
@@ -1379,10 +1812,24 @@ export class Ledger {
       `).run(TASK_RULE_VERSION_ID, json({
         input_scope: 'selected_paths_only',
         output_scope: 'exact_target_only',
-        strategies: ['create', 'append', 'delta', 'new_version', 'supersede', 'deny'],
+        strategies: ['create', 'append', 'delta', 'new_version', 'supersede', 'archive', 'deny'],
         stale_input_denied: true,
-        delete_and_archive_execution: 'deny',
+        delete_execution: 'deny',
+        archive_execution: 'reviewed_organization_plan',
       }), startedAt);
+      if (environmentRuleVersionId === TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID) {
+        this.db.prepare(`
+          INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
+          VALUES (?, 'Task-scoped explicit environment policy', '1.0.0', ?, ?)
+        `).run(TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID, json({
+          mode: 'task_scoped_explicit',
+          prerequisites: ['registered_active_project', 'explicit_existing_inputs', 'exact_new_target'],
+          discovery: 'deny',
+          routing_inference: 'deny',
+          read_scope: 'explicit_selected_paths_only',
+          write_scope: 'exact_target_only',
+        }), startedAt);
+      }
       this.db.prepare(`
         INSERT INTO runs(
           id, mode, status, root_path, intent, actor, agent, model, tool, client_run_id,
@@ -1676,7 +2123,77 @@ export class Ledger {
     };
   }
 
-  recordTaskUnderlyingRun(runId, writeRunId, occurredAt) {
+  claimTaskFulfillment(runId, claimToken, processId, occurredAt, plannedWriteRunId = null) {
+    return this.transaction(() => {
+      const task = this.db.prepare(`SELECT underlying_run_id FROM task_contracts WHERE run_id = ?`).get(runId);
+      if (!task) throw new Error(`Task Contract not found: ${runId}`);
+      if (task.underlying_run_id) return { status: 'staged', write_run_id: task.underlying_run_id };
+      const existing = this.db.prepare(`
+        SELECT claim_token, process_id, status, planned_write_run_id, write_run_id
+        FROM task_fulfillment_claims WHERE task_run_id = ?
+      `).get(runId);
+      if (existing) {
+        if (existing.write_run_id) return { status: 'staged', write_run_id: existing.write_run_id };
+        if (existing.planned_write_run_id && this.db.prepare('SELECT id FROM runs WHERE id = ?').get(existing.planned_write_run_id)) {
+          this.db.prepare(`UPDATE task_contracts SET underlying_run_id = ? WHERE run_id = ?`)
+            .run(existing.planned_write_run_id, runId);
+          this.db.prepare(`
+            UPDATE task_fulfillment_claims SET status = 'staged', write_run_id = ?, updated_at = ?
+            WHERE task_run_id = ?
+          `).run(existing.planned_write_run_id, occurredAt, runId);
+          this.#insertEvent(runId, 'task_write_reconciled_from_claim', {
+            write_run_id: existing.planned_write_run_id,
+          }, occurredAt);
+          return { status: 'staged', write_run_id: existing.planned_write_run_id };
+        }
+        if (existing.claim_token === claimToken && existing.status === 'active') {
+          return { status: 'acquired', planned_write_run_id: existing.planned_write_run_id };
+        }
+        if (existing.status === 'active' && !isProcessAlive(existing.process_id)) {
+          const resumedPlan = existing.planned_write_run_id ?? plannedWriteRunId;
+          this.db.prepare(`
+            UPDATE task_fulfillment_claims
+            SET claim_token = ?, process_id = ?, status = 'active', planned_write_run_id = ?, updated_at = ?
+            WHERE task_run_id = ?
+          `).run(claimToken, processId, resumedPlan, occurredAt, runId);
+          this.#insertEvent(runId, 'task_fulfillment_claim_reclaimed', {
+            abandoned_claim_token: existing.claim_token,
+            abandoned_process_id: existing.process_id,
+            replacement_claim_token: claimToken,
+            planned_write_run_id: resumedPlan,
+          }, occurredAt);
+          return { status: 'acquired', planned_write_run_id: resumedPlan };
+        } else {
+          const error = new Error(`Task Contract is already being fulfilled by process ${existing.process_id}.`);
+          error.code = 'ATLAS_STATE_CONFLICT';
+          throw error;
+        }
+      }
+      this.db.prepare(`
+        INSERT INTO task_fulfillment_claims(
+          task_run_id, claim_token, process_id, status, planned_write_run_id, claimed_at, updated_at
+        ) VALUES (?, ?, ?, 'active', ?, ?, ?)
+      `).run(runId, claimToken, processId, plannedWriteRunId, occurredAt, occurredAt);
+      this.#insertEvent(runId, 'task_fulfillment_claimed', {
+        claim_token: claimToken, process_id: processId, planned_write_run_id: plannedWriteRunId,
+      }, occurredAt);
+      return { status: 'acquired', planned_write_run_id: plannedWriteRunId };
+    });
+  }
+
+  releaseTaskFulfillmentClaim(runId, claimToken, occurredAt) {
+    return this.transaction(() => {
+      const claim = this.db.prepare(`
+        SELECT claim_token, write_run_id FROM task_fulfillment_claims WHERE task_run_id = ?
+      `).get(runId);
+      if (!claim || claim.claim_token !== claimToken || claim.write_run_id) return false;
+      this.db.prepare(`DELETE FROM task_fulfillment_claims WHERE task_run_id = ?`).run(runId);
+      this.#insertEvent(runId, 'task_fulfillment_claim_released', { claim_token: claimToken }, occurredAt);
+      return true;
+    });
+  }
+
+  recordTaskUnderlyingRun(runId, writeRunId, occurredAt, claimToken = null) {
     return this.transaction(() => {
       const task = this.db.prepare(`SELECT underlying_run_id FROM task_contracts WHERE run_id = ?`).get(runId);
       if (!task) throw new Error(`Task Contract not found: ${runId}`);
@@ -1686,12 +2203,67 @@ export class Ledger {
         throw error;
       }
       if (!task.underlying_run_id) {
+        if (claimToken != null) {
+          const claim = this.db.prepare(`
+            SELECT claim_token, status, planned_write_run_id FROM task_fulfillment_claims WHERE task_run_id = ?
+          `).get(runId);
+          if (!claim || claim.claim_token !== claimToken || claim.status !== 'active') {
+            const error = new Error('Task fulfillment claim is missing or owned by another process.');
+            error.code = 'ATLAS_STATE_CONFLICT';
+            throw error;
+          }
+          if (claim.planned_write_run_id && claim.planned_write_run_id !== writeRunId) {
+            const error = new Error('Task fulfillment produced a write run different from its claimed run.');
+            error.code = 'ATLAS_STATE_CONFLICT';
+            throw error;
+          }
+        }
         this.db.prepare(`UPDATE task_contracts SET underlying_run_id = ? WHERE run_id = ?`)
           .run(writeRunId, runId);
+        if (claimToken != null) {
+          this.db.prepare(`
+            UPDATE task_fulfillment_claims
+            SET status = 'staged', write_run_id = ?, updated_at = ?
+            WHERE task_run_id = ? AND claim_token = ?
+          `).run(writeRunId, occurredAt, runId, claimToken);
+        }
         this.#insertEvent(runId, 'task_write_staged', { write_run_id: writeRunId }, occurredAt);
       }
       return this.getTaskDetail(runId);
     });
+  }
+
+  getActiveArtifactContext(rootPath, currentPath) {
+    const artifact = this.db.prepare(`
+      SELECT id, project_id, role, status, created_at, updated_at
+      FROM artifacts
+      WHERE root_path = ? AND current_path = ? AND status = 'active'
+      ORDER BY updated_at DESC, rowid DESC LIMIT 1
+    `).get(rootPath, currentPath);
+    if (!artifact) return null;
+    const material = this.db.prepare(`
+      SELECT id, content_hash, byte_size, stage, created_at
+      FROM materials WHERE artifact_id = ?
+      ORDER BY created_at DESC, rowid DESC LIMIT 1
+    `).get(artifact.id);
+    const lineage = material ? this.db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM material_derivations WHERE input_material_id = ?) AS downstream_count,
+        (SELECT COUNT(*) FROM material_derivations WHERE output_material_id = ?) AS input_count
+    `).get(material.id, material.id) : { downstream_count: 0, input_count: 0 };
+    return {
+      artifact_id: artifact.id,
+      project_id: artifact.project_id,
+      role: artifact.role,
+      material: material ? {
+        material_id: material.id,
+        content_hash: material.content_hash,
+        byte_size: material.byte_size,
+        stage: material.stage,
+        created_at: material.created_at,
+      } : null,
+      lineage,
+    };
   }
 
   markTaskStale(runId, payload, occurredAt) {
@@ -1817,7 +2389,9 @@ export class Ledger {
     const candidateMaterialId = `MAT-${crypto.randomUUID()}`;
     const placementPredictionId = `PRD-${crypto.randomUUID()}`;
     this.transaction(() => {
-      const effectiveRuleVersionId = placementPolicy?.rule_version_id ?? RISK_RULE_VERSION_ID;
+      const effectiveRuleVersionId = placementPolicy?.routing_rule_version_id
+        ?? placementPolicy?.rule_version_id
+        ?? RISK_RULE_VERSION_ID;
       this.db.prepare(`
         INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
         VALUES (?, 'Deterministic V1 risk routing', '1.0.0', ?, ?)
@@ -2531,6 +3105,263 @@ export class Ledger {
     });
   }
 
+  findPortfolioInventory(root, fingerprint) {
+    return this.db.prepare(`
+      SELECT r.id, r.receipt_json
+      FROM runs r
+      JOIN portfolio_inventories p ON p.run_id = r.id
+      WHERE r.mode = 'portfolio' AND r.root_path = ? AND p.fingerprint = ?
+      ORDER BY r.started_at DESC, r.rowid DESC LIMIT 1
+    `).get(root, fingerprint) ?? null;
+  }
+
+  createPortfolioInventory({ runId, root, fingerprint, depth, excluded, expanded, roots, summary, receipt, caller = {}, startedAt }) {
+    this.transaction(() => {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        PORTFOLIO_RULE_VERSION_ID,
+        'Portfolio root classification and planning policy',
+        '1.0.0',
+        json({
+          structure_only: true,
+          uncertain_roots_never_move: true,
+          installed_software_never_moves: true,
+          review_required_before_related_mapping: true,
+        }),
+        startedAt,
+      );
+      this.db.prepare(`
+        INSERT INTO runs(
+          id, mode, status, root_path, intent, actor, agent, model, tool, client_run_id,
+          rule_version_id, started_at, receipt_json
+        ) VALUES (?, 'portfolio', 'inventoried', ?, 'Inventory multiple filesystem roots', ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        runId, root, caller.actor ?? 'unknown', caller.agent ?? null, caller.model ?? null,
+        caller.tool ?? 'atlas-cli', caller.client_run_id ?? null,
+        PORTFOLIO_RULE_VERSION_ID, startedAt, json(receipt),
+      );
+      this.db.prepare(`
+        INSERT INTO portfolio_inventories(run_id, fingerprint, depth, excluded_json, expanded_json, summary_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(runId, fingerprint, depth, json(excluded), json(expanded), json(summary));
+
+      const findRoot = this.db.prepare(`
+        SELECT id FROM portfolio_roots WHERE current_path = ? COLLATE NOCASE
+      `);
+      const insertRoot = this.db.prepare(`
+        INSERT INTO portfolio_roots(id, current_path, status, created_at, updated_at)
+        VALUES (?, ?, 'active', ?, ?)
+      `);
+      const insertHistory = this.db.prepare(`
+        INSERT INTO portfolio_root_path_history(root_id, path, valid_from, reason)
+        VALUES (?, ?, ?, 'portfolio_inventory')
+      `);
+      const insertObservation = this.db.prepare(`
+        INSERT INTO observations(id, run_id, kind, payload_json, created_at)
+        VALUES (?, ?, 'portfolio_root_observed', ?, ?)
+      `);
+      const insertPrediction = this.db.prepare(`
+        INSERT INTO predictions(id, run_id, kind, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      const insertInventoryRoot = this.db.prepare(`
+        INSERT INTO portfolio_inventory_roots(
+          inventory_run_id, root_id, relative_path, observation_json,
+          type_prediction_id, relation_prediction_id
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `);
+
+      for (const item of roots) {
+        let rootId = findRoot.get(item.current_path)?.id ?? null;
+        if (!rootId) {
+          rootId = `ROOT-${crypto.randomUUID()}`;
+          insertRoot.run(rootId, item.current_path, startedAt, startedAt);
+          insertHistory.run(rootId, item.current_path, startedAt);
+        }
+        const observation = { ...item, root_id: rootId };
+        const typePredictionId = `PRD-${crypto.randomUUID()}`;
+        const relationPredictionId = `PRD-${crypto.randomUUID()}`;
+        insertObservation.run(`OBS-${crypto.randomUUID()}`, runId, json(observation), startedAt);
+        insertPrediction.run(typePredictionId, runId, 'portfolio_root_type', json({
+          root_id: rootId,
+          current_path: item.current_path,
+          predicted_type: item.predicted_type,
+          confidence: item.type_confidence,
+          candidate_types: item.candidate_types,
+          evidence: item.evidence,
+        }), startedAt);
+        insertPrediction.run(relationPredictionId, runId, 'portfolio_root_relation', json({
+          root_id: rootId,
+          current_path: item.current_path,
+          predicted_relation: item.predicted_relation,
+          confidence: item.relation_confidence,
+          evidence: item.evidence,
+        }), startedAt);
+        insertInventoryRoot.run(
+          runId, rootId, item.relative_path, json(observation),
+          typePredictionId, relationPredictionId,
+        );
+      }
+      this.#insertEvent(runId, 'portfolio_inventory_completed', receipt, startedAt);
+    });
+  }
+
+  getPortfolioDetail(runId) {
+    const run = this.getRun(runId);
+    if (run.mode !== 'portfolio') throw new Error(`Run is not a Portfolio inventory: ${runId}`);
+    const inventory = this.db.prepare(`
+      SELECT fingerprint, depth, excluded_json, expanded_json, summary_json
+      FROM portfolio_inventories WHERE run_id = ?
+    `).get(runId);
+    if (!inventory) throw new Error(`Portfolio inventory not found: ${runId}`);
+    const labels = this.db.prepare(`
+      SELECT subject_prediction_id, value, details_json, created_at
+      FROM labels WHERE run_id = ? AND subject_prediction_id IS NOT NULL
+      ORDER BY rowid
+    `).all(runId);
+    const latestLabels = new Map(labels.map((row) => [row.subject_prediction_id, row]));
+    const roots = this.db.prepare(`
+      SELECT pir.root_id, pir.relative_path, pir.observation_json,
+             pir.type_prediction_id, tp.payload_json AS type_prediction_json,
+             pir.relation_prediction_id, rp.payload_json AS relation_prediction_json
+      FROM portfolio_inventory_roots pir
+      JOIN predictions tp ON tp.id = pir.type_prediction_id
+      JOIN predictions rp ON rp.id = pir.relation_prediction_id
+      WHERE pir.inventory_run_id = ?
+      ORDER BY pir.relative_path COLLATE NOCASE
+    `).all(runId).map((row) => {
+      const observation = parseJson(row.observation_json, {});
+      const typePrediction = parseJson(row.type_prediction_json, {});
+      const relationPrediction = parseJson(row.relation_prediction_json, {});
+      const typeLabel = latestLabels.get(row.type_prediction_id);
+      const relationLabel = latestLabels.get(row.relation_prediction_id);
+      return {
+        ...observation,
+        root_id: row.root_id,
+        predicted_type: typePrediction.predicted_type,
+        type_confidence: typePrediction.confidence,
+        candidate_types: typePrediction.candidate_types ?? [],
+        predicted_relation: relationPrediction.predicted_relation,
+        relation_confidence: relationPrediction.confidence,
+        prediction_ids: {
+          root_type: row.type_prediction_id,
+          relation: row.relation_prediction_id,
+        },
+        review: typeLabel || relationLabel ? {
+          root_type: typeLabel?.value ?? null,
+          relation: relationLabel?.value ?? null,
+          reason: parseJson(typeLabel?.details_json ?? relationLabel?.details_json, {}).reason ?? null,
+          reviewed_at: typeLabel?.created_at ?? relationLabel?.created_at ?? null,
+        } : null,
+      };
+    });
+    const plans = this.db.prepare(`
+      SELECT id, target_root, plan_hash, plan_json, created_at
+      FROM portfolio_plans WHERE inventory_run_id = ? ORDER BY created_at, rowid
+    `).all(runId).map((row) => ({
+      id: row.id,
+      target_root: row.target_root,
+      plan_hash: row.plan_hash,
+      plan: parseJson(row.plan_json, {}),
+      created_at: row.created_at,
+    }));
+    return {
+      inventory: {
+        id: run.id,
+        status: run.status,
+        root_path: run.root_path,
+        fingerprint: inventory.fingerprint,
+        depth: Number(inventory.depth),
+        excluded: parseJson(inventory.excluded_json, []),
+        expanded: parseJson(inventory.expanded_json, []),
+        started_at: run.started_at,
+        caller: {
+          actor: run.actor, agent: run.agent, model: run.model,
+          tool: run.tool, client_run_id: run.client_run_id,
+        },
+      },
+      summary: parseJson(inventory.summary_json, {}),
+      roots,
+      plans,
+      receipt: parseJson(run.receipt_json, {}),
+    };
+  }
+
+  reviewPortfolioRoot(runId, { rootId, rootType, relation, reason, reviewedAt }) {
+    return this.transaction(() => {
+      const entry = this.db.prepare(`
+        SELECT type_prediction_id, relation_prediction_id
+        FROM portfolio_inventory_roots
+        WHERE inventory_run_id = ? AND root_id = ?
+      `).get(runId, rootId);
+      if (!entry) throw new Error(`Portfolio root not found in inventory ${runId}: ${rootId}`);
+      const insert = this.db.prepare(`
+        INSERT INTO labels(
+          id, run_id, subject_prediction_id, name, value, source, details_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, 'user', ?, ?)
+      `);
+      const typeLabelId = `LBL-${crypto.randomUUID()}`;
+      const relationLabelId = `LBL-${crypto.randomUUID()}`;
+      insert.run(
+        typeLabelId, runId, entry.type_prediction_id, 'portfolio_root_type_review',
+        rootType, json({ reason, root_id: rootId }), reviewedAt,
+      );
+      insert.run(
+        relationLabelId, runId, entry.relation_prediction_id, 'portfolio_root_relation_review',
+        relation, json({ reason, root_id: rootId }), reviewedAt,
+      );
+      const receipt = {
+        inventory_id: runId,
+        root_id: rootId,
+        status: 'reviewed',
+        root_type: rootType,
+        relation,
+        reason,
+        label_ids: [typeLabelId, relationLabelId],
+        reviewed_at: reviewedAt,
+      };
+      this.#insertEvent(runId, 'portfolio_root_reviewed', receipt, reviewedAt);
+      return receipt;
+    });
+  }
+
+  savePortfolioPlan(runId, { targetRoot, planHash, plan, createdAt }) {
+    return this.transaction(() => {
+      const existing = this.db.prepare(`
+        SELECT id, plan_json, created_at FROM portfolio_plans
+        WHERE inventory_run_id = ? AND target_root = ? COLLATE NOCASE AND plan_hash = ?
+      `).get(runId, targetRoot, planHash);
+      if (existing) return {
+        ...parseJson(existing.plan_json, {}),
+        plan_id: existing.id,
+        reused: true,
+        created_at: existing.created_at,
+      };
+      const run = this.getRun(runId);
+      if (run.mode !== 'portfolio') throw new Error(`Run is not a Portfolio inventory: ${runId}`);
+      const planId = `PPL-${crypto.randomUUID()}`;
+      this.db.prepare(`
+        INSERT INTO portfolio_plans(id, inventory_run_id, target_root, plan_hash, plan_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(planId, runId, targetRoot, planHash, json(plan), createdAt);
+      this.db.prepare(`
+        INSERT INTO policy_decisions(
+          id, run_id, rule_version_id, decision, reason, details_json, created_at
+        ) VALUES (?, ?, ?, 'warn', ?, ?, ?)
+      `).run(
+        `POL-${crypto.randomUUID()}`, runId, PORTFOLIO_RULE_VERSION_ID,
+        'Portfolio plan is read-only and does not authorize source movement.',
+        json({ plan_id: planId, target_root: targetRoot, plan_hash: planHash }), createdAt,
+      );
+      this.#insertEvent(runId, 'portfolio_plan_created', {
+        plan_id: planId, target_root: targetRoot, plan_hash: planHash,
+      }, createdAt);
+      return { ...plan, plan_id: planId, reused: false, created_at: createdAt };
+    });
+  }
+
   createBootstrapScan({ runId, root, fingerprint, entries, predictions, summary, receipt, caller = {}, startedAt }) {
     this.transaction(() => {
       this.db.prepare(`
@@ -3026,6 +3857,145 @@ export class Ledger {
     };
   }
 
+  createRoutingCorrection({
+    root, scopeType, scopeKey, origin, kind, role, targetSubdirectory,
+    reason, caller = {}, createdAt = now(),
+  }) {
+    const definition = {
+      schema: 'atlas-routing-correction.v1',
+      root_path: path.resolve(root),
+      scope: scopeType,
+      scope_key: scopeKey,
+      origin,
+      kind,
+      role,
+      target_subdirectory: targetSubdirectory,
+    };
+    const definitionJson = json(definition);
+    const definitionHash = crypto.createHash('sha256').update(definitionJson).digest('hex');
+    const ruleVersionId = `RULE-ROUTE-${definitionHash.slice(0, 16).toUpperCase()}`;
+    const existing = this.db.prepare(`
+      SELECT * FROM routing_corrections
+      WHERE root_path = ? AND scope_type = ? AND scope_key = ?
+        AND origin = ? AND kind = ? AND status = 'active'
+    `).get(definition.root_path, scopeType, scopeKey, origin, kind);
+    if (existing && existing.rule_version_id === ruleVersionId) {
+      return {
+        correction_id: existing.id,
+        run_id: existing.run_id,
+        rule_version_id: existing.rule_version_id,
+        scope: existing.scope_type,
+        scope_key: existing.scope_key,
+        origin: existing.origin,
+        kind: existing.kind,
+        role: existing.role,
+        target_subdirectory: existing.target_subdirectory,
+        status: existing.status,
+        reused: true,
+      };
+    }
+    const runId = `RUL-${createdAt.replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`;
+    const correctionId = `COR-${crypto.randomUUID()}`;
+    const predictionId = `PRD-${crypto.randomUUID()}`;
+    const receipt = {
+      correction_id: correctionId,
+      run_id: runId,
+      rule_version_id: ruleVersionId,
+      scope: scopeType,
+      scope_key: scopeKey,
+      origin,
+      kind,
+      role,
+      target_subdirectory: targetSubdirectory,
+      status: 'active',
+      reused: false,
+    };
+    this.transaction(() => {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
+        VALUES (?, 'Reviewed Intake routing correction', '1.0.0', ?, ?)
+      `).run(ruleVersionId, definitionJson, createdAt);
+      this.db.prepare(`
+        UPDATE routing_corrections SET status = 'superseded', superseded_at = ?
+        WHERE root_path = ? AND scope_type = ? AND scope_key = ?
+          AND origin = ? AND kind = ? AND status = 'active'
+      `).run(createdAt, definition.root_path, scopeType, scopeKey, origin, kind);
+      this.db.prepare(`
+        INSERT INTO runs(
+          id, mode, status, root_path, intent, actor, agent, model, tool, client_run_id,
+          rule_version_id, started_at, closed_at, receipt_json
+        ) VALUES (?, 'rule_correction', 'closed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        runId, definition.root_path, reason,
+        caller.actor ?? 'unknown', caller.agent ?? null, caller.model ?? null,
+        caller.tool ?? 'atlas-cli', caller.client_run_id ?? null,
+        ruleVersionId, createdAt, createdAt, json(receipt),
+      );
+      this.db.prepare(`
+        INSERT INTO predictions(id, run_id, kind, payload_json, created_at)
+        VALUES (?, ?, 'routing_rule_correction', ?, ?)
+      `).run(predictionId, runId, definitionJson, createdAt);
+      this.db.prepare(`
+        INSERT INTO labels(
+          id, run_id, subject_prediction_id, name, value, source, details_json, created_at
+        ) VALUES (?, ?, ?, 'routing_rule_correction', 'corrected', 'user', ?, ?)
+      `).run(`LBL-${crypto.randomUUID()}`, runId, predictionId, json({ reason, scope: scopeType }), createdAt);
+      this.db.prepare(`
+        INSERT INTO policy_decisions(
+          id, run_id, rule_version_id, decision, reason, details_json, created_at
+        ) VALUES (?, ?, ?, 'allow', ?, ?, ?)
+      `).run(
+        `POL-${crypto.randomUUID()}`, runId, ruleVersionId,
+        `Reviewed routing correction: ${reason}`, json({ scope: scopeType, scope_key: scopeKey }), createdAt,
+      );
+      this.db.prepare(`
+        INSERT INTO routing_corrections(
+          id, run_id, root_path, scope_type, scope_key, origin, kind, role,
+          target_subdirectory, rule_version_id, status, reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+      `).run(
+        correctionId, runId, definition.root_path, scopeType, scopeKey, origin, kind,
+        role, targetSubdirectory, ruleVersionId, reason, createdAt,
+      );
+      this.#insertEvent(runId, 'routing_correction_activated', receipt, createdAt);
+    });
+    return receipt;
+  }
+
+  findRoutingCorrection({ root, origin, kind, candidateHash = null, projectId = null }) {
+    const rows = this.db.prepare(`
+      SELECT * FROM routing_corrections
+      WHERE root_path = ? AND origin = ? AND kind = ? AND status = 'active'
+      ORDER BY created_at DESC, rowid DESC
+    `).all(path.resolve(root), origin, kind);
+    const selected = rows.find((row) => row.scope_type === 'artifact' && row.scope_key === `sha256:${candidateHash}`)
+      ?? rows.find((row) => row.scope_type === 'project' && row.scope_key === projectId)
+      ?? rows.find((row) => row.scope_type === 'global' && row.scope_key === '*')
+      ?? null;
+    if (!selected) return null;
+    return {
+      correction_id: selected.id,
+      run_id: selected.run_id,
+      rule_version_id: selected.rule_version_id,
+      scope: selected.scope_type,
+      scope_key: selected.scope_key,
+      origin: selected.origin,
+      kind: selected.kind,
+      role: selected.role,
+      target_subdirectory: selected.target_subdirectory,
+      status: selected.status,
+      reason: selected.reason,
+    };
+  }
+
+  listRoutingCorrections(root) {
+    return this.db.prepare(`
+      SELECT id AS correction_id, run_id, rule_version_id, scope_type AS scope,
+             scope_key, origin, kind, role, target_subdirectory, status, reason, created_at, superseded_at
+      FROM routing_corrections WHERE root_path = ? ORDER BY created_at, rowid
+    `).all(path.resolve(root));
+  }
+
   findLatestBootstrapScanForRoot(root) {
     return this.db.prepare(`
       SELECT r.id
@@ -3451,12 +4421,17 @@ export class Ledger {
     `).get() ?? null;
   }
 
-  listRuns() {
-    return this.db.prepare(`
+  listRuns({ limit = null } = {}) {
+    const query = `
       SELECT id, mode, status, root_path, actor, agent, model, tool, client_run_id,
              started_at, closed_at, aborted_at, rolled_back_at
       FROM runs ORDER BY started_at DESC
-    `).all();
+    `;
+    if (limit === null) return this.db.prepare(query).all();
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error('Run list limit must be an integer from 1 to 100.');
+    }
+    return this.db.prepare(`${query} LIMIT ?`).all(limit);
   }
 
   getScopes(runId) {

@@ -6,6 +6,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { Bootstrap } from '../src/bootstrap.js';
 import { Registry } from '../src/registry.js';
+import { Tracker } from '../src/tracker.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cliPath = path.join(projectRoot, 'bin', 'atlas.js');
@@ -31,6 +32,39 @@ function cli(stateDir, args, extraEnv = {}) {
   });
 }
 
+test('CLI lists verified Ledger backups and restores only with the current canonical hash', () => {
+  const { stateDir } = setup('cli-ledger-maintenance');
+  const tracker = new Tracker({ stateDir });
+  tracker.status();
+  tracker.dispose();
+  const backupDir = path.join(stateDir, 'backups');
+  fs.mkdirSync(backupDir, { recursive: true });
+  fs.copyFileSync(path.join(stateDir, 'ledger.sqlite'), path.join(backupDir, 'manual.sqlite'));
+
+  const listedResult = cli(stateDir, ['ledger', 'backups', '--json']);
+  assert.equal(listedResult.status, 0, listedResult.stderr);
+  const listed = JSON.parse(listedResult.stdout).data;
+  assert.match(listed.current_hash, /^[a-f0-9]{64}$/);
+  assert.equal(listed.backups[0].name, 'manual.sqlite');
+  assert.equal(listed.backups[0].integrity, 'ok');
+
+  const stale = cli(stateDir, [
+    'ledger', 'restore', '--backup', 'manual.sqlite', '--expect-current-hash', '0'.repeat(64), '--json',
+  ]);
+  assert.notEqual(stale.status, 0);
+  assert.equal(JSON.parse(stale.stdout).error.code, 'ATLAS_STATE_CONFLICT');
+
+  const restoredResult = cli(stateDir, [
+    'ledger', 'restore', '--backup', 'manual.sqlite', '--expect-current-hash', listed.current_hash, '--json',
+  ]);
+  assert.equal(restoredResult.status, 0, restoredResult.stderr);
+  const restored = JSON.parse(restoredResult.stdout).data;
+  assert.equal(restored.status, 'restored');
+  assert.equal(restored.restored_from, 'manual.sqlite');
+  assert.ok(restored.safety_backup);
+  assert.equal(cli(stateDir, ['doctor', '--json']).status, 0);
+});
+
 test('CLI exposes the bounded Task Contract create and rollback flow', () => {
   const { caseRoot, vault, stateDir } = setup('cli-task-contract');
   fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Sources'), { recursive: true });
@@ -46,6 +80,14 @@ test('CLI exposes the bounded Task Contract create and rollback flow', () => {
   const registry = new Registry({ stateDir });
   const project = registry.create({ name: 'Atlas', currentPath: 'Projects/Atlas' });
   registry.dispose();
+  const discoveredResult = cli(stateDir, [
+    'task', 'discover', '--root', vault, '--project', project.project_id,
+    '--role', 'source', '--extension', '.md', '--max-candidates', '5', '--json',
+  ]);
+  assert.equal(discoveredResult.status, 0, discoveredResult.stderr);
+  const discovered = JSON.parse(discoveredResult.stdout).data;
+  assert.deepEqual(discovered.candidates.map((item) => item.path), ['Projects/Atlas/Sources/source.md']);
+  assert.equal(discovered.content_files_read, 0);
   const requestFile = path.join(caseRoot, 'task-request.json');
   fs.writeFileSync(requestFile, JSON.stringify({
     intent: 'Create one governed report.',
@@ -75,6 +117,62 @@ test('CLI exposes the bounded Task Contract create and rollback flow', () => {
   assert.equal(JSON.parse(shown.stdout).data.run.status, 'completed');
   assert.equal(cli(stateDir, ['task', 'rollback', prepared.task_id, '--json']).status, 0);
   assert.equal(fs.existsSync(path.join(vault, 'Projects', 'Atlas', 'Outputs', 'report.md')), false);
+
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Archive'), { recursive: true });
+  const archiveRequest = path.join(caseRoot, 'archive-request.json');
+  fs.writeFileSync(archiveRequest, JSON.stringify({
+    intent: 'Retain and archive the source.',
+    project_id: project.project_id,
+    inputs: [{ path: 'Projects/Atlas/Sources/source.md' }],
+    output: {
+      target: 'Projects/Atlas/Archive/source.md',
+      base_input: 'Projects/Atlas/Sources/source.md',
+      role: 'archive', data_class: 'human_writing', action: 'archive',
+    },
+  }), 'utf8');
+  const archiveTaskResult = cli(stateDir, [
+    'task', 'prepare', '--root', vault, '--request-file', archiveRequest, '--json',
+  ]);
+  assert.equal(archiveTaskResult.status, 0, archiveTaskResult.stderr);
+  const archiveTask = JSON.parse(archiveTaskResult.stdout).data;
+  const archivePlanResult = cli(stateDir, ['task', 'archive-plan', archiveTask.task_id, '--json']);
+  assert.equal(archivePlanResult.status, 0, archivePlanResult.stderr);
+  assert.equal(JSON.parse(archivePlanResult.stdout).data.status, 'prepared');
+  assert.equal(fs.existsSync(path.join(vault, 'Projects', 'Atlas', 'Sources', 'source.md')), true);
+});
+
+test('CLI Intake creates one Agent-proposed target without a Library Contract', () => {
+  const { caseRoot, vault, stateDir } = setup('cli-intake-explicit-target');
+  fs.mkdirSync(path.join(vault, '08 AI聊天记录'), { recursive: true });
+  const registry = new Registry({ stateDir });
+  const project = registry.create({ name: 'AI聊天记录', currentPath: '08 AI聊天记录' });
+  registry.dispose();
+  const candidateFile = path.join(caseRoot, 'chat-export.md');
+  fs.writeFileSync(candidateFile, '# Chat export\n', 'utf8');
+  const target = '08 AI聊天记录/ChatGPT聊天记录 感情反转分析（2026-07）.md';
+
+  const preparedResult = cli(stateDir, [
+    'intake', 'prepare', '--root', vault, '--candidate-file', candidateFile,
+    '--origin', 'download', '--kind', 'source', '--project', project.project_id,
+    '--target', target, '--intent', 'Save one classified chat export.', '--json',
+  ]);
+  assert.equal(preparedResult.status, 0, preparedResult.stderr);
+  const prepared = JSON.parse(preparedResult.stdout).data;
+  assert.equal(prepared.status, 'prepared');
+  assert.equal(prepared.target, target);
+  assert.equal(prepared.placement_policy.intake.route_source, 'agent_explicit_target');
+
+  const executedResult = cli(stateDir, [
+    'intake', 'execute', prepared.run_id,
+    '--reason', 'The user authorized this exact destination.', '--json',
+  ]);
+  assert.equal(executedResult.status, 0, executedResult.stderr);
+  assert.equal(JSON.parse(executedResult.stdout).data.verified, true);
+  assert.equal(fs.readFileSync(path.join(vault, target), 'utf8'), '# Chat export\n');
+
+  const rolledBack = cli(stateDir, ['intake', 'rollback', prepared.run_id, '--json']);
+  assert.equal(rolledBack.status, 0, rolledBack.stderr);
+  assert.equal(fs.existsSync(path.join(vault, target)), false);
 });
 
 test('CLI exposes Risk, Project Registry, and the complete single-file Guarded flow', () => {
@@ -111,9 +209,17 @@ test('CLI exposes Risk, Project Registry, and the complete single-file Guarded f
   assert.equal(unapproved.status, 1);
   assert.match(unapproved.stderr, /approval/i);
   assert.equal(fs.readFileSync(target, 'utf8'), baseline);
-  assert.equal(cli(stateDir, ['guarded', 'approve', runId, '--reason', 'approved']).status, 0);
-  const executed = cli(stateDir, ['guarded', 'execute', runId]);
+  const executed = cli(stateDir, [
+    'guarded', 'apply-approved', runId, '--reason', 'approved', '--json',
+  ]);
   assert.equal(executed.status, 0, executed.stderr);
+  const executionReceipt = JSON.parse(executed.stdout).data;
+  assert.equal(executionReceipt.verified, true);
+  assert.equal(executionReceipt.rollback_ready, true);
+  assert.equal(executionReceipt.fast_path, true);
+  assert.equal(typeof executionReceipt.elapsed_ms, 'number');
+  assert.equal(executionReceipt.within_10_second_budget, true);
+  assert.doesNotMatch(executed.stdout, /diff_text|CLI approved candidate/u);
   assert.equal(fs.readFileSync(target, 'utf8'), '# CLI approved candidate\n');
   const preview = cli(stateDir, ['guarded', 'preview', runId, '--json']);
   assert.equal(JSON.parse(preview.stdout).data.run.status, 'executed');
@@ -216,6 +322,30 @@ test('Agent JSON protocol exposes version, capabilities, doctor, and structured 
   assert.equal(errorEnvelope.error.code, 'ATLAS_PATH_BOUNDARY');
   assert.equal(errorEnvelope.error.retryable, false);
   assert.equal(fs.existsSync(outside), false);
+});
+
+test('CLI status can return only the newest requested runs', () => {
+  const { vault, stateDir } = setup('cli-bounded-status');
+  const tracker = new Tracker({ stateDir });
+  for (let index = 0; index < 3; index += 1) {
+    const run = tracker.begin({
+      root: vault,
+      allow: ['allowed-a.md'],
+      intent: `Bounded status ${index}`,
+    });
+    tracker.abort(run.run_id, { reason: 'status fixture' });
+  }
+  tracker.dispose();
+
+  const result = cli(stateDir, ['status', '--limit', '2', '--json']);
+  assert.equal(result.status, 0, result.stderr);
+  const envelope = JSON.parse(result.stdout);
+  assert.equal(envelope.command, 'status');
+  assert.equal(envelope.data.length, 2);
+
+  const invalid = cli(stateDir, ['status', '--limit', '0', '--json']);
+  assert.equal(invalid.status, 1);
+  assert.match(JSON.parse(invalid.stdout).error.message, /limit/i);
 });
 
 test('Agent JSON protocol traces caller metadata across Tracked Direct and Guarded runs', () => {

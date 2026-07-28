@@ -96,6 +96,42 @@ test('repeating an unchanged scan reuses the existing environment baseline', (t)
   assert.equal(bootstrap.status().length, 1);
 });
 
+test('structure scan recognizes a local Agent Skill collection instead of reporting note-library defects', (t) => {
+  const caseRoot = path.join(tempRoot, 'bootstrap-agent-skill-collection');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const skillsRoot = path.join(caseRoot, 'skills');
+  const stateDir = path.join(caseRoot, 'state');
+  for (const skill of ['context-budget', 'copy-editing', 'social-content']) {
+    fs.mkdirSync(path.join(skillsRoot, skill, 'references'), { recursive: true });
+    fs.writeFileSync(path.join(skillsRoot, skill, 'SKILL.md'), `# ${skill}\n`, 'utf8');
+    fs.writeFileSync(path.join(skillsRoot, skill, 'references', 'guide.md'), '# Guide\n', 'utf8');
+  }
+  fs.mkdirSync(path.join(skillsRoot, 'social-content', 'agents'), { recursive: true });
+  fs.writeFileSync(path.join(skillsRoot, 'social-content', 'agents', 'openai.yaml'), 'name: social\n', 'utf8');
+  const bootstrap = openBootstrap(t, stateDir);
+
+  const scan = bootstrap.scan({ root: skillsRoot, scanMode: 'structure' });
+  const detail = bootstrap.show(scan.scan_id);
+  const collection = detail.predictions.find((item) => item.kind === 'agent_skill_collection');
+
+  assert.ok(collection);
+  assert.equal(collection.evidence.scope, 'library_local');
+  assert.equal(collection.evidence.package_count, 3);
+  assert.deepEqual(collection.evidence.packages, ['context-budget', 'copy-editing', 'social-content']);
+  assert.equal(scan.content_files_read, 0);
+  assert.equal(scan.content_bytes_read, 0);
+  assert.ok(!detail.predictions.some((item) => (
+    item.kind === 'duplicate_filename' && item.evidence.paths.every((itemPath) => itemPath.endsWith('/SKILL.md'))
+  )));
+  assert.ok(!detail.predictions.some((item) => (
+    item.kind === 'project_candidate' && collection.evidence.packages.includes(item.evidence.directory)
+  )));
+  assert.ok(!detail.predictions.some((item) => (
+    item.kind === 'directory_missing_index'
+    && collection.evidence.packages.includes(item.evidence.directory.split('/')[0])
+  )));
+});
+
 test('a changed environment produces a new scan while retaining history', (t) => {
   const { vault, stateDir } = setup('bootstrap-rescan');
   const bootstrap = openBootstrap(t, stateDir);
@@ -166,6 +202,22 @@ test('Bootstrap supports explicit internal-directory ignores and rejects ignore 
   assert.ok(!detail.entries.some((entry) => entry.path.startsWith('Private/')));
   assert.ok(detail.summary.ignored_paths.includes('Private'));
   assert.throws(() => bootstrap.scan({ root: vault, ignore: ['../outside'] }), /ignore.*escape/i);
+});
+
+test('Bootstrap excludes conventional dependency stores from library observations', (t) => {
+  const { vault, stateDir } = setup('bootstrap-conventional-dependency-ignore');
+  for (const directory of ['.venv', '.pnpm-store']) {
+    fs.mkdirSync(path.join(vault, directory), { recursive: true });
+    fs.writeFileSync(path.join(vault, directory, 'dependency.bin'), 'fixture\n', 'utf8');
+  }
+  const bootstrap = openBootstrap(t, stateDir);
+
+  const scan = bootstrap.scan({ root: vault, scanMode: 'structure' });
+  const detail = bootstrap.show(scan.scan_id);
+
+  assert.ok(detail.summary.ignored_paths.includes('.venv'));
+  assert.ok(detail.summary.ignored_paths.includes('.pnpm-store'));
+  assert.ok(!detail.entries.some((entry) => /^\.(?:venv|pnpm-store)(?:\/|$)/u.test(entry.path)));
 });
 
 test('Initialize requires reviews and writes outputs outside the Vault', (t) => {
@@ -268,6 +320,44 @@ test('structure-only rescan detects stat changes and does not reuse a metadata s
   assert.notEqual(changed.scan_id, structureScan.scan_id);
   assert.ok(detail.summary.changes.modified.includes('Loose Note.md'));
   assert.deepEqual(detail.summary.changes.moved_candidates, []);
+});
+
+test('Bootstrap rejects a mixed metadata baseline when a file changes during metadata extraction', (t) => {
+  const { vault, stateDir } = setup('bootstrap-scan-mutation');
+  const bootstrap = openBootstrap(t, stateDir);
+  const target = path.join(vault, '00 Home.md');
+  const originalRead = fs.readSync;
+  let injected = false;
+  fs.readSync = function mutateAfterMetadataRead(descriptor, buffer, offset, length, position, ...rest) {
+    const bytes = originalRead.call(this, descriptor, buffer, offset, length, position, ...rest);
+    if (!injected && position === 0 && length < 1024 * 1024) {
+      injected = true;
+      fs.appendFileSync(target, '\nmutation during metadata read\n', 'utf8');
+    }
+    return bytes;
+  };
+  try {
+    assert.throws(() => bootstrap.scan({ root: vault, scanMode: 'metadata' }), /changed while Bootstrap was scanning/i);
+  } finally {
+    fs.readSync = originalRead;
+  }
+  assert.equal(injected, true);
+  assert.deepEqual(bootstrap.status(), []);
+});
+
+test('forced scans of the same evidence keep a deterministic fingerprint and Library Contract', (t) => {
+  const { vault, stateDir } = setup('bootstrap-deterministic-contract');
+  const bootstrap = openBootstrap(t, stateDir);
+  const first = bootstrap.scan({ root: vault, scanMode: 'structure', forceNew: true });
+  const firstContract = bootstrap.contract(first.scan_id);
+  const second = bootstrap.scan({ root: vault, scanMode: 'structure', forceNew: true });
+  const secondContract = bootstrap.contract(second.scan_id);
+
+  assert.equal(second.fingerprint, first.fingerprint);
+  assert.equal(secondContract.contract_id, firstContract.contract_id);
+  assert.deepEqual(secondContract.profile, firstContract.profile);
+  assert.deepEqual(secondContract.zones, firstContract.zones);
+  assert.deepEqual(secondContract.questions, firstContract.questions);
 });
 
 test('Bootstrap provides bounded Agent context without file bodies', (t) => {

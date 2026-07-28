@@ -509,8 +509,8 @@ export class Tracker {
     return result;
   }
 
-  status() {
-    return this.ledger.listRuns();
+  status({ limit = null } = {}) {
+    return this.ledger.listRuns({ limit });
   }
 
   show(runId) {

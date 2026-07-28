@@ -87,6 +87,56 @@ test('Guarded executes exactly the approved candidate and rolls it back safely',
   assert.equal(fs.readFileSync(target, 'utf8'), baseline);
 });
 
+test('Guarded applyApproved records one approval and executes idempotently', (t) => {
+  const { vault, stateDir } = setup('guarded-apply-approved');
+  const guarded = openGuarded(t, stateDir);
+  const target = path.join(vault, 'allowed-a.md');
+  const baseline = fs.readFileSync(target, 'utf8');
+  const candidate = '# One-step approved result\n';
+  const prepared = guarded.prepare({
+    root: vault,
+    target: 'allowed-a.md',
+    candidateContent: candidate,
+  });
+
+  const first = guarded.applyApproved(prepared.run_id, { reason: 'User approved the reviewed Candidate.' });
+  const second = guarded.applyApproved(prepared.run_id, { reason: 'User approved the reviewed Candidate.' });
+
+  assert.deepEqual(second, first);
+  assert.equal(first.status, 'executed');
+  assert.equal(first.verified, true);
+  assert.equal(first.rollback_ready, true);
+  assert.equal(fs.readFileSync(target, 'utf8'), candidate);
+  assert.equal(guarded.preview(prepared.run_id).run.status, 'executed');
+
+  guarded.rollback(prepared.run_id);
+  assert.equal(fs.readFileSync(target, 'utf8'), baseline);
+  assert.throws(
+    () => guarded.applyApproved(prepared.run_id, { reason: 'Do not replay a rolled-back run.' }),
+    /rolled-back/i,
+  );
+});
+
+test('Guarded applyApproved stops when the reviewed target changed', (t) => {
+  const { vault, stateDir } = setup('guarded-apply-approved-stale');
+  const guarded = openGuarded(t, stateDir);
+  const target = path.join(vault, 'allowed-a.md');
+  const prepared = guarded.prepare({
+    root: vault,
+    target: 'allowed-a.md',
+    candidateContent: '# Approved candidate\n',
+  });
+  fs.appendFileSync(target, 'later external change\n', 'utf8');
+  const externalState = fs.readFileSync(target, 'utf8');
+
+  assert.throws(
+    () => guarded.applyApproved(prepared.run_id, { reason: 'User approved the reviewed Candidate.' }),
+    /changed after preview/i,
+  );
+  assert.equal(fs.readFileSync(target, 'utf8'), externalState);
+  assert.equal(guarded.preview(prepared.run_id).run.status, 'stale');
+});
+
 test('Guarded rejection and revision preserve the original Candidate ChangeSet', (t) => {
   const { vault, stateDir } = setup('guarded-reject-revise');
   const guarded = openGuarded(t, stateDir);

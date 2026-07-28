@@ -42,6 +42,154 @@ test('bundled library profiles are versioned, semantic, and explain their routin
   assert.ok(ARTIFACT_ROLES.some((role) => role.id === 'canonical'));
 });
 
+test('golden mixed Project Vault maps existing directories and recommends mixed-minimal deterministically', (t) => {
+  const { vault, stateDir } = setup('bootstrap-golden-profile');
+  const bootstrap = new Bootstrap({ stateDir });
+  t.after(() => bootstrap.dispose());
+  const scan = bootstrap.scan({ root: vault, scanMode: 'structure' });
+  const contract = bootstrap.contract(scan.scan_id);
+
+  assert.equal(contract.profile.id, 'mixed-minimal');
+  assert.equal(contract.profile.selection, 'deterministic_recommendation');
+  assert.equal(contract.zones.find((zone) => zone.area_role === 'projects').current_path, 'Projects');
+  assert.equal(contract.zones.find((zone) => zone.area_role === 'library').current_path, 'Notes');
+  assert.equal(contract.zones.find((zone) => zone.area_role === 'archive').current_path, 'Archive');
+  assert.equal(contract.status, 'ready');
+  assert.ok(contract.questions.length <= 3);
+  assert.deepEqual(contract.source_changes, []);
+});
+
+test('numbered Chinese personal Vault reuses its semantic zones instead of proposing a generic replacement tree', (t) => {
+  const caseRoot = path.join(tempRoot, 'numbered-personal-profile');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const vault = path.join(caseRoot, 'vault');
+  const stateDir = path.join(caseRoot, 'state');
+  for (const directory of [
+    '00Templates', '01 就业与生活', '02 海外文案和广告业务', '03 学习',
+    '04 工作项目', '05 媒体库', '06 随笔', '07 财务审计',
+    '08 AI聊天记录', '09 自媒体选题思考', '10 Reports',
+  ]) {
+    fs.mkdirSync(path.join(vault, directory), { recursive: true });
+    fs.writeFileSync(path.join(vault, directory, 'placeholder.md'), '# fixture\n', 'utf8');
+  }
+  for (const skill of ['context-budget', 'copy-editing']) {
+    fs.mkdirSync(path.join(vault, 'skills', skill), { recursive: true });
+    fs.writeFileSync(path.join(vault, 'skills', skill, 'SKILL.md'), `# ${skill}\n`, 'utf8');
+  }
+  const bootstrap = new Bootstrap({ stateDir });
+  t.after(() => bootstrap.dispose());
+  const scan = bootstrap.scan({ root: vault, scanMode: 'structure' });
+  const contract = bootstrap.contract(scan.scan_id);
+
+  assert.equal(contract.profile.id, 'personal-knowledge');
+  assert.equal(contract.status, 'ready');
+  assert.equal(contract.zones.find((zone) => zone.area_role === 'projects').current_path, '04 工作项目');
+  assert.equal(contract.zones.find((zone) => zone.area_role === 'journal').current_path, '06 随笔');
+  assert.equal(contract.zones.find((zone) => zone.area_role === 'templates').current_path, '00Templates');
+  assert.equal(contract.zones.find((zone) => zone.area_role === 'outputs').current_path, '10 Reports');
+  assert.deepEqual(contract.zones.find((zone) => zone.area_role === 'areas').candidates, [
+    '01 就业与生活', '02 海外文案和广告业务', '03 学习', '07 财务审计', '09 自媒体选题思考',
+  ]);
+  assert.deepEqual(contract.zones.find((zone) => zone.area_role === 'resources').candidates, [
+    '05 媒体库', '08 AI聊天记录',
+  ]);
+  assert.equal(contract.review_card.schema, 'atlas-library-contract-review-card.v1');
+  assert.equal(contract.review_card.status, 'ready');
+  assert.deepEqual(
+    contract.review_card.current_map
+      .filter((item) => item.role === 'resources')
+      .map((item) => item.path),
+    ['05 媒体库', '08 AI聊天记录'],
+  );
+  assert.deepEqual(
+    contract.review_card.current_map.find((item) => item.path === '04 工作项目'),
+    {
+      path: '04 工作项目',
+      role: 'projects',
+      note: 'Active efforts with a finite outcome.',
+      action: 'keep',
+    },
+  );
+  assert.ok(contract.review_card.suggestions.some((item) => (
+    item.role === 'inbox' && item.action === 'consider_create'
+  )));
+  assert.ok(contract.review_card.route_summary.some((item) => (
+    item.destination === '04 工作项目'
+    && item.roles.includes('draft')
+    && item.roles.includes('intermediate')
+  )));
+  assert.deepEqual(contract.review_card.questions, []);
+  assert.equal(contract.review_card.technical.contract_id, contract.contract_id);
+  assert.equal(contract.review_card.technical.source_changes, 0);
+  const skillCollection = bootstrap.show(scan.scan_id).predictions
+    .find((prediction) => prediction.kind === 'agent_skill_collection');
+  assert.equal(skillCollection.evidence.scope, 'library_local');
+  assert.ok(!contract.suggestions.some((item) => ['Projects', 'Resources', 'Journal', 'Templates', 'Outputs']
+    .includes(item.proposed_path)));
+  assert.deepEqual(contract.source_changes, []);
+});
+
+test('code-heavy Website workspace selects Project Work even when a top-level skills directory exists', (t) => {
+  const caseRoot = path.join(tempRoot, 'website-project-profile');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const root = path.join(caseRoot, 'root');
+  const stateDir = path.join(caseRoot, 'state');
+  fs.mkdirSync(path.join(root, 'skills'), { recursive: true });
+  const app = path.join(root, '01个人网站项目', '03 网站代码', 'app');
+  fs.mkdirSync(app, { recursive: true });
+  fs.mkdirSync(path.join(root, '01个人网站项目', '00 规划文档'), { recursive: true });
+  fs.mkdirSync(path.join(root, '01个人网站项目', '01 素材示意'), { recursive: true });
+  fs.mkdirSync(path.join(root, '01个人网站项目', '02 动画演示'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.tools'), { recursive: true });
+  fs.writeFileSync(path.join(app, 'package.json'), '{}', 'utf8');
+  for (let index = 0; index < 6; index += 1) {
+    fs.writeFileSync(path.join(app, `component-${index}.tsx`), 'export {};\n', 'utf8');
+  }
+  const bootstrap = new Bootstrap({ stateDir });
+  t.after(() => bootstrap.dispose());
+  const scan = bootstrap.scan({ root, scanMode: 'structure' });
+  const contract = bootstrap.contract(scan.scan_id);
+  assert.equal(contract.profile.id, 'project-work');
+  assert.equal(contract.zones.find((zone) => zone.area_role === 'projects').current_path, '01个人网站项目');
+  assert.deepEqual(
+    contract.review_card.directory_map
+      .filter((item) => item.path.startsWith('01个人网站项目/'))
+      .map((item) => [item.path, item.kind]),
+    [
+      ['01个人网站项目/00 规划文档', 'planning'],
+      ['01个人网站项目/01 素材示意', 'sources'],
+      ['01个人网站项目/02 动画演示', 'experiments'],
+      ['01个人网站项目/03 网站代码', 'implementation'],
+    ],
+  );
+  assert.equal(
+    contract.review_card.directory_map.find((item) => item.path === '.tools').kind,
+    'local_tooling',
+  );
+});
+
+test('a code tool repository can map its own root as the Project Work project area', (t) => {
+  const caseRoot = path.join(tempRoot, 'tool-root-project-profile');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const root = path.join(caseRoot, 'root');
+  const stateDir = path.join(caseRoot, 'state');
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'reports'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'asset-library'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'template-library'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), '{}', 'utf8');
+  const bootstrap = new Bootstrap({ stateDir });
+  t.after(() => bootstrap.dispose());
+  const scan = bootstrap.scan({ root, scanMode: 'structure' });
+  const contract = bootstrap.contract(scan.scan_id);
+  assert.equal(contract.profile.id, 'project-work');
+  assert.equal(contract.zones.find((zone) => zone.area_role === 'projects').current_path, '.');
+  assert.equal(contract.zones.find((zone) => zone.area_role === 'templates').current_path, 'template-library');
+  assert.equal(contract.review_card.directory_map.find((item) => item.path === 'src').kind, 'implementation');
+  assert.equal(contract.review_card.directory_map.find((item) => item.path === 'reports').kind, 'outputs');
+  assert.equal(contract.review_card.directory_map.find((item) => item.path === 'asset-library').kind, 'reusable_assets');
+});
+
 test('Bootstrap recommends a reviewable default profile and activates an immutable environment policy', (t) => {
   const { vault, stateDir } = setup('bootstrap-default-profile');
   const bootstrap = new Bootstrap({ stateDir });

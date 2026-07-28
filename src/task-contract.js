@@ -3,8 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Derived } from './derived.js';
 import { Guarded } from './guarded.js';
-import { Ledger } from './ledger.js';
+import { Evolution } from './evolution.js';
+import { Ledger, TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID } from './ledger.js';
 import { isPathInside, normalizeRoot, toPortablePath } from './paths.js';
+import { PreferenceRules } from './preference-rules.js';
 import { getArtifactRole } from './profiles.js';
 import { captureBlob, sha256File } from './snapshots.js';
 import { withStateLock } from './state-lock.js';
@@ -16,6 +18,12 @@ const DEFAULT_MAX_FILES = 12;
 const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
 const ACTIONS = new Set(['auto', 'create', 'append', 'delta', 'new_version', 'supersede', 'delete', 'archive']);
 const DATA_CLASSES = new Set(['generated_output', 'temporal_snapshot', 'append_only_data', 'human_writing']);
+const DIRECT_TEXT_EXTENSIONS = new Set([
+  '.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl',
+  '.yaml', '.yml', '.xml', '.html', '.htm', '.css',
+  '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.py',
+  '.ps1', '.sh', '.sql', '.toml', '.ini', '.cfg', '.conf', '.log',
+]);
 
 function timestamp() {
   return new Date().toISOString();
@@ -24,6 +32,12 @@ function timestamp() {
 function makeRunId() {
   const date = timestamp().replace(/[-:.TZ]/g, '').slice(0, 14);
   return `TSK-${date}-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function makeClaimedWriteRunId(executor) {
+  const date = timestamp().replace(/[-:.TZ]/g, '').slice(0, 14);
+  const prefix = executor === 'derived_create' ? 'DRV' : executor === 'guarded_update' ? 'GRD' : 'EVP';
+  return `${prefix}-${date}-${crypto.randomUUID().slice(0, 8)}`;
 }
 
 function stateConflict(message) {
@@ -150,13 +164,37 @@ function publicContract(taskId, contract) {
   return { task_id: taskId, ...contract };
 }
 
+function estimateModelVisibleTokens(selected) {
+  let textBytes = 0;
+  let binaryBytes = 0;
+  const requiresLocalExtraction = [];
+  for (const input of selected) {
+    if (DIRECT_TEXT_EXTENSIONS.has(path.extname(input.path).toLowerCase())) {
+      textBytes += input.byte_size;
+    } else {
+      binaryBytes += input.byte_size;
+      requiresLocalExtraction.push(input.path);
+    }
+  }
+  return {
+    selected_text_bytes: textBytes,
+    selected_binary_bytes: binaryBytes,
+    estimated_tokens: Math.ceil(textBytes / 4),
+    token_estimate_basis: 'direct_text_bytes_only',
+    requires_local_extraction: requiresLocalExtraction,
+  };
+}
+
 function normalizedRequest(request) {
   if (!request || typeof request !== 'object' || Array.isArray(request)) throw new Error('Task request must be an object.');
   if (Buffer.byteLength(JSON.stringify(request), 'utf8') > MAX_REQUEST_BYTES) throw new Error('Task request is too large.');
   if (typeof request.intent !== 'string' || !request.intent.trim()) throw new Error('Task intent is required.');
   if (typeof request.project_id !== 'string' || !request.project_id.trim()) throw new Error('Task project_id is required.');
-  if (!Array.isArray(request.inputs) || request.inputs.length === 0 || request.inputs.length > MAX_INPUTS) {
-    throw new Error(`Task requires 1-${MAX_INPUTS} explicit inputs.`);
+  if (!Array.isArray(request.inputs) || request.inputs.length > MAX_INPUTS) {
+    throw new Error(`Task inputs must be an array with at most ${MAX_INPUTS} items.`);
+  }
+  if (request.inputs.length === 0 && !request.discovery) {
+    throw new Error('Task requires explicit inputs or bounded candidate discovery.');
   }
   if (!request.output || typeof request.output !== 'object') throw new Error('Task output is required.');
   const action = request.output.action ?? 'auto';
@@ -168,6 +206,27 @@ function normalizedRequest(request) {
   const maxBytes = request.budget?.max_bytes ?? DEFAULT_MAX_BYTES;
   if (!Number.isSafeInteger(maxFiles) || maxFiles < 1 || maxFiles > MAX_INPUTS) throw new Error('Task budget max_files is invalid.');
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error('Task budget max_bytes is invalid.');
+  let discovery = null;
+  if (request.discovery != null) {
+    if (!request.discovery || typeof request.discovery !== 'object' || Array.isArray(request.discovery)) {
+      throw new Error('Task discovery must be an object.');
+    }
+    const roles = [...new Set((request.discovery.roles ?? []).map((roleId) => getArtifactRole(roleId).id))];
+    const extensions = [...new Set((request.discovery.extensions ?? []).map((extension) => {
+      const normalized = String(extension).trim().toLowerCase();
+      if (!/^\.[a-z0-9]+$/u.test(normalized)) throw new Error(`Task discovery extension is invalid: ${extension}`);
+      return normalized;
+    }))];
+    const modifiedAfter = request.discovery.modified_after ?? null;
+    if (modifiedAfter != null && Number.isNaN(Date.parse(modifiedAfter))) {
+      throw new Error('Task discovery modified_after must be an ISO date or timestamp.');
+    }
+    const maxCandidates = request.discovery.max_candidates ?? Math.min(DEFAULT_MAX_FILES, MAX_INPUTS);
+    if (!Number.isSafeInteger(maxCandidates) || maxCandidates < 1 || maxCandidates > MAX_INPUTS) {
+      throw new Error(`Task discovery max_candidates must be between 1 and ${MAX_INPUTS}.`);
+    }
+    discovery = { roles, extensions, modified_after: modifiedAfter, max_candidates: maxCandidates };
+  }
   return {
     intent: request.intent.trim(),
     project_id: request.project_id.trim(),
@@ -188,6 +247,7 @@ function normalizedRequest(request) {
       };
     }),
     budget: { max_files: maxFiles, max_bytes: maxBytes },
+    discovery,
     output: {
       target: request.output.target,
       role,
@@ -268,7 +328,12 @@ function chooseReadSet(inputs, temporalExcluded, budget) {
     if (temporalReason) {
       excluded.push({ ...input, reason: temporalReason });
     } else if (selected.length >= budget.max_files || bytes + input.byte_size > budget.max_bytes) {
-      excluded.push({ ...input, reason: 'read_budget' });
+      const budgetReason = input.byte_size > budget.max_bytes
+        ? 'single_file_too_large'
+        : selected.length >= budget.max_files
+          ? 'file_count_limit'
+          : 'total_byte_limit';
+      excluded.push({ ...input, reason: 'read_budget', budget_reason: budgetReason });
     } else {
       selected.push({ ...input, reason: 'selected' });
       bytes += input.byte_size;
@@ -279,10 +344,24 @@ function chooseReadSet(inputs, temporalExcluded, budget) {
   return { selected, excluded, bytes };
 }
 
-function chooseWrite(target, output, inputs, relations) {
+function chooseWrite(target, output, inputs, relations, strategyOverride = null) {
   const base = { target: target.path, role: output.role, data_class: output.data_class, scope: 'exact_target_only' };
-  if (['delete', 'archive'].includes(output.action)) {
-    return { ...base, strategy: 'deny', executor: 'none', decision: 'deny', relation_type: null, reason: 'Task Contract V1 does not execute delete or archive actions.' };
+  if (output.action === 'delete') {
+    return { ...base, strategy: 'deny', executor: 'none', decision: 'deny', relation_type: null, reason: 'Task Contract V1 does not execute delete actions.' };
+  }
+  if (output.action === 'archive') {
+    if (target.exists || !output.base_input || !inputs.some((input) => input.path === output.base_input)) {
+      return { ...base, strategy: 'deny', executor: 'none', decision: 'deny', relation_type: null, reason: 'Archive requires one absent target and one selected base_input.' };
+    }
+    return {
+      ...base,
+      strategy: 'archive',
+      executor: 'organization_plan',
+      decision: 'warn',
+      relation_type: null,
+      source: output.base_input,
+      reason: 'Archive is a retained move and requires one reviewed organization plan.',
+    };
   }
   if (target.exists) {
     if (output.data_class === 'append_only_data' && ['auto', 'append'].includes(output.action)
@@ -296,7 +375,8 @@ function chooseWrite(target, output, inputs, relations) {
   }
   let strategy = output.action;
   if (strategy === 'auto') {
-    if (output.data_class === 'temporal_snapshot' && relations.some((relation) => relation.type === 'supersedes')) strategy = 'supersede';
+    if (strategyOverride && strategyOverride !== 'auto') strategy = strategyOverride;
+    else if (output.data_class === 'temporal_snapshot' && relations.some((relation) => relation.type === 'supersedes')) strategy = 'supersede';
     else if (output.data_class === 'append_only_data') strategy = 'delta';
     else if (output.data_class === 'human_writing' && output.base_input) strategy = 'new_version';
     else strategy = 'create';
@@ -311,6 +391,8 @@ export class TaskContract {
     this._ledger = null;
     this._derived = null;
     this._guarded = null;
+    this._evolution = null;
+    this._rules = null;
   }
 
   get ledger() {
@@ -328,21 +410,146 @@ export class TaskContract {
     return this._guarded;
   }
 
+  get evolution() {
+    if (!this._evolution) this._evolution = new Evolution({ stateDir: this.stateDir });
+    return this._evolution;
+  }
+
+  get rules() {
+    if (!this._rules) this._rules = new PreferenceRules({ stateDir: this.stateDir, ledger: this.ledger });
+    return this._rules;
+  }
+
+  discover({ root: rootInput, projectId, roles = [], extensions = [], modifiedAfter = null, maxCandidates = 12 }) {
+    const root = normalizeRoot(rootInput);
+    if (isPathInside(root, this.stateDir)) throw new Error(`Atlas state directory must be outside the Task root: ${this.stateDir}`);
+    const active = this.ledger.getActiveEnvironmentPolicy(root);
+    const project = this.ledger.getProject(projectId);
+    if (project.status !== 'active' || !project.current_path) throw new Error(`Task Project is not active: ${projectId}`);
+    const normalizedRoles = [...new Set(roles.map((roleId) => getArtifactRole(roleId).id))];
+    const normalizedExtensions = [...new Set(extensions.map((extension) => String(extension).toLowerCase()))];
+    if (!Number.isSafeInteger(maxCandidates) || maxCandidates < 1 || maxCandidates > MAX_INPUTS) {
+      throw new Error(`Task discovery maxCandidates must be between 1 and ${MAX_INPUTS}.`);
+    }
+    const cutoff = modifiedAfter == null ? null : Date.parse(modifiedAfter);
+    if (cutoff != null && Number.isNaN(cutoff)) throw new Error('Task discovery modifiedAfter must be an ISO date or timestamp.');
+    const projectRoot = path.resolve(root, ...project.current_path.split('/'));
+    assertRealPathChain(root, projectRoot);
+    const candidates = [];
+    const excluded = [];
+    const ignored = new Set(['.git', '.atlas', 'node_modules', '.next', 'dist', 'build', 'coverage']);
+    const routes = active?.policy.derived_routes ?? {};
+    const ledger = this.ledger;
+    const roleForPath = (relativeToProject) => {
+      const matches = Object.entries(routes)
+        .filter(([, route]) => route.project_subdirectory
+          && (relativeToProject === route.project_subdirectory
+            || relativeToProject.startsWith(`${route.project_subdirectory}/`)))
+        .map(([role]) => role);
+      return [...new Set(matches)];
+    };
+    function walk(directory) {
+      const children = fs.readdirSync(directory, { withFileTypes: true })
+        .sort((left, right) => left.name.localeCompare(right.name));
+      for (const child of children) {
+        const absolute = path.join(directory, child.name);
+        const projectRelative = toPortablePath(path.relative(projectRoot, absolute));
+        const rootRelative = `${project.current_path}/${projectRelative}`;
+        const stat = fs.lstatSync(absolute);
+        if (child.isSymbolicLink() || stat.isSymbolicLink()) {
+          excluded.push({ path: rootRelative, reason: 'symbolic_link' });
+          continue;
+        }
+        if (child.isDirectory()) {
+          if (ignored.has(child.name)) excluded.push({ path: rootRelative, reason: 'generated_or_internal_directory' });
+          else walk(absolute);
+          continue;
+        }
+        if (!child.isFile()) {
+          excluded.push({ path: rootRelative, reason: 'special_file' });
+          continue;
+        }
+        const inferredRoles = roleForPath(projectRelative);
+        const registered = ledger.getActiveArtifactContext(root, rootRelative);
+        if (registered?.role && !inferredRoles.includes(registered.role)) inferredRoles.push(registered.role);
+        const extension = path.extname(child.name).toLowerCase();
+        if (normalizedExtensions.length && !normalizedExtensions.includes(extension)) continue;
+        if (cutoff != null && stat.mtimeMs < cutoff) continue;
+        if (normalizedRoles.length && !normalizedRoles.some((role) => inferredRoles.includes(role))) continue;
+        candidates.push({
+          path: rootRelative,
+          byte_size: stat.size,
+          modified_at: stat.mtime.toISOString(),
+          extension,
+          inferred_roles: inferredRoles,
+          registered_artifact: registered,
+          discovered_by: active
+            ? 'project_structure_and_active_routes'
+            : 'project_structure_and_registered_artifacts',
+        });
+      }
+    }
+    walk(projectRoot);
+    candidates.sort((left, right) => right.modified_at.localeCompare(left.modified_at) || left.path.localeCompare(right.path));
+    return {
+      schema: 'atlas-task-candidate-discovery.v1',
+      project_id: project.id,
+      project_path: project.current_path,
+      environment_policy_mode: active ? 'library_contract' : 'task_scoped_project',
+      criteria: {
+        roles: normalizedRoles,
+        extensions: normalizedExtensions,
+        modified_after: modifiedAfter,
+        max_candidates: maxCandidates,
+      },
+      candidates: candidates.slice(0, maxCandidates),
+      excluded: [...excluded, ...candidates.slice(maxCandidates).map((item) => ({ path: item.path, reason: 'candidate_limit' }))],
+      content_files_read: 0,
+      source_changes: [],
+    };
+  }
+
   prepare({ root: rootInput, request: rawRequest, caller = {} }) {
     const root = normalizeRoot(rootInput);
     if (isPathInside(root, this.stateDir)) throw new Error(`Atlas state directory must be outside the Task root: ${this.stateDir}`);
     const request = normalizedRequest(rawRequest);
     const active = this.ledger.getActiveEnvironmentPolicy(root);
-    if (!active) throw new Error('Task Contract requires an active reviewed Library Contract for this root.');
+    const environmentPolicyMode = active ? 'library_contract' : 'task_scoped_explicit';
+    const environmentRuleVersionId = active?.rule_version_id ?? TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID;
     const project = this.ledger.getProject(request.project_id);
     if (project.status !== 'active' || !project.current_path) throw new Error(`Task Project is not active: ${request.project_id}`);
+    const discovery = request.discovery ? this.discover({
+      root,
+      projectId: request.project_id,
+      roles: request.discovery.roles,
+      extensions: request.discovery.extensions,
+      modifiedAfter: request.discovery.modified_after,
+      maxCandidates: request.discovery.max_candidates,
+    }) : null;
+    const combinedInputRequests = [...request.inputs];
+    const requestedPaths = new Set(combinedInputRequests.map((input) => input.path));
+    for (const item of discovery?.candidates ?? []) {
+      if (!requestedPaths.has(item.path)) {
+        combinedInputRequests.push({
+          ordinal: combinedInputRequests.length,
+          path: item.path,
+          series: null,
+          temporal_mode: null,
+          coverage: null,
+          required: false,
+          priority: 100 + combinedInputRequests.length,
+        });
+        requestedPaths.add(item.path);
+      }
+    }
     const seen = new Set();
-    const inputs = request.inputs.map((input) => {
+    const inputs = combinedInputRequests.map((input, ordinal) => {
       const normalized = normalizeExistingFile(root, input.path, 'Task input');
       if (seen.has(normalized.path)) throw new Error(`Task input is duplicated: ${normalized.path}`);
       seen.add(normalized.path);
       return {
         ...input,
+        ordinal,
         ...normalized,
         content_hash: sha256File(normalized.absolute),
         byte_size: normalized.stat.size,
@@ -365,19 +572,56 @@ export class TaskContract {
     request.output.target = target.path;
     const temporal = buildTemporalRelations(inputs);
     const readSet = chooseReadSet(inputs, temporal.excluded, request.budget);
-    const write = chooseWrite(target, request.output, inputs, temporal.relations);
+    const tokenEstimate = estimateModelVisibleTokens(readSet.selected);
+    const attention = this.rules.context({
+      root,
+      request: {
+        operation: 'content_task',
+        project_id: project.id,
+        artifact_role: request.output.role,
+        data_class: request.output.data_class,
+        target_path: target.path,
+        extension: path.extname(target.path).toLowerCase(),
+      },
+    });
+    if (attention.conflicts.some((item) => item.kind === 'content_versioning')) {
+      throw stateConflict('Reviewed content-versioning preferences conflict for this Task.');
+    }
+    const versioningPreference = attention.applied_rules.find(
+      (item) => item.kind === 'content_versioning',
+    ) ?? null;
+    const write = chooseWrite(
+      target,
+      request.output,
+      inputs,
+      temporal.relations,
+      versioningPreference?.value.strategy ?? null,
+    );
+    if (versioningPreference && request.output.action === 'auto') {
+      write.preference_rule_id = versioningPreference.rule_id;
+      write.rule_version_id = versioningPreference.rule_version_id;
+      write.reason = `Create one governed ${write.strategy} output using the reviewed content-versioning preference.`;
+    }
     const missingRequired = readSet.excluded.filter((input) => input.required && input.reason === 'read_budget');
     const appendInputMissing = write.strategy === 'append'
       && !readSet.selected.some((input) => input.path === target.path);
     const questions = [];
+    if (inputs.length === 0) questions.push({
+      field: 'discovery',
+      question: 'No candidate matched the bounded discovery criteria; refine roles, extensions, or time.',
+      paths: [],
+    });
     if (missingRequired.length) questions.push({ field: 'budget', question: 'Increase the explicit read budget or make the excluded input optional.', paths: missingRequired.map((input) => input.path) });
     if (appendInputMissing) questions.push({ field: 'inputs', question: 'The append target must fit in the selected read set.', paths: [target.path] });
-    const status = write.decision === 'deny' ? 'blocked' : (missingRequired.length || appendInputMissing) ? 'needs_input' : 'ready';
+    const status = write.decision === 'deny'
+      ? 'blocked'
+      : (inputs.length === 0 || missingRequired.length || appendInputMissing) ? 'needs_input' : 'ready';
     const cleanItem = (item) => ({
       ordinal: item.ordinal, path: item.path, content_hash: item.content_hash,
       byte_size: item.byte_size, series: item.series, temporal_mode: item.temporal_mode,
       coverage: item.coverage, required: item.required, priority: item.priority,
       ...(item.reason ? { reason: item.reason } : {}),
+      ...(item.budget_reason ? { budget_reason: item.budget_reason } : {}),
     });
     const contract = {
       schema: 'atlas-task-contract.v1',
@@ -388,11 +632,30 @@ export class TaskContract {
         excluded: readSet.excluded.map(cleanItem),
         budget: request.budget,
         selected_bytes: readSet.bytes,
-        estimated_tokens: Math.ceil(readSet.bytes / 4),
+        ...tokenEstimate,
       },
       temporal_relations: temporal.relations,
+      discovery,
+      attention,
       write,
-      boundaries: { root, project_id: project.id, project_path: project.current_path, environment_rule_version_id: active.rule_version_id },
+      boundaries: {
+        root,
+        project_id: project.id,
+        project_path: project.current_path,
+        environment_policy_mode: environmentPolicyMode,
+        environment_rule_version_id: environmentRuleVersionId,
+        allowed_read_paths: readSet.selected.map((item) => item.path),
+        forbidden_read_policy: 'all_unlisted_paths',
+        candidate_area: path.join(this.stateDir, 'work'),
+        candidate_must_be_outside_root: true,
+        formal_target: write.target,
+        allowed_write_paths: write.executor === 'none' ? [] : [write.target],
+      },
+      registration: {
+        required: write.executor !== 'none',
+        method: write.executor === 'guarded_update' ? 'task_complete_after_guarded' : 'task_fulfill_or_complete',
+        records: ['output_artifact', 'output_material', 'input_material_lineage', 'actual_hash', 'write_run', 'rollback_entry'],
+      },
       questions: questions.slice(0, 3),
     };
     const contractHash = sha256Json({ request, contract });
@@ -418,7 +681,7 @@ export class TaskContract {
       });
       this.ledger.createTaskContract({
         runId, contractId, root, request, contract, contractHash, project,
-        environmentRuleVersionId: active.rule_version_id, inputs: capturedInputs, caller,
+        environmentRuleVersionId, inputs: capturedInputs, caller,
         startedAt: timestamp(),
       });
       result = publicContract(runId, contract);
@@ -439,13 +702,27 @@ export class TaskContract {
     const active = this.ledger.getActiveEnvironmentPolicy(detail.run.root_path);
     const project = this.ledger.getProject(detail.project_id);
     let stale = null;
-    if (!active || active.rule_version_id !== detail.environment_rule_version_id) stale = { reason: 'environment_rule_changed' };
-    else if (project.status !== 'active' || project.current_path !== detail.project_path) stale = { reason: 'project_path_changed' };
-    else if (!allowDerivedTarget && detail.contract.write.executor === 'derived_create'
+    if (detail.contract.boundaries.environment_policy_mode === 'library_contract'
+      && (!active || active.rule_version_id !== detail.environment_rule_version_id)) {
+      stale = { reason: 'environment_rule_changed' };
+    }
+    if (!stale && detail.contract.attention) {
+      const currentAttention = this.rules.context({
+        root: detail.run.root_path,
+        request: detail.contract.attention.request,
+      });
+      if (currentAttention.context_hash !== detail.contract.attention.context_hash) {
+        stale = { reason: 'effective_rule_context_changed' };
+      }
+    }
+    if (!stale && (project.status !== 'active' || project.current_path !== detail.project_path)) {
+      stale = { reason: 'project_path_changed' };
+    }
+    if (!stale && !allowDerivedTarget && detail.contract.write.executor === 'derived_create'
         && fs.existsSync(path.resolve(detail.run.root_path, ...detail.contract.write.target.split('/')))) {
       stale = { reason: 'target_claimed', path: detail.contract.write.target };
     }
-    else {
+    if (!stale) {
       for (const input of detail.inputs.filter((item) => item.selected)) {
         const absolute = path.resolve(detail.run.root_path, ...input.path.split('/'));
         let observed = null;
@@ -468,6 +745,9 @@ export class TaskContract {
     }
     if (stale) {
       this.ledger.markTaskStale(detail.run.id, stale, timestamp());
+      if (stale.reason === 'effective_rule_context_changed') {
+        throw stateConflict('Task Contract is stale because the effective rule context changed.');
+      }
       throw stateConflict(`Task Contract is stale because ${stale.path ?? stale.reason} changed.`);
     }
   }
@@ -483,19 +763,32 @@ export class TaskContract {
     if (contract.write.executor === 'derived_create') {
       let writeRunId = detail.underlying_run_id;
       if (!writeRunId) {
-        const prepared = this.derived.prepare({
-          root: detail.run.root_path,
-          inputs: detail.inputs.filter((input) => input.selected).map((input) => input.path),
-          target: contract.write.target,
-          candidateFile: candidate,
-          projectId: detail.project_id,
-          role: contract.write.role,
-          relationType: contract.write.relation_type,
-          intent: detail.request.intent,
-          caller: detail.run.caller,
-        });
-        writeRunId = prepared.run_id;
-        this.ledger.recordTaskUnderlyingRun(taskId, writeRunId, timestamp());
+        const claimToken = crypto.randomUUID();
+        const claim = this.ledger.claimTaskFulfillment(
+          taskId, claimToken, process.pid, timestamp(), makeClaimedWriteRunId(contract.write.executor),
+        );
+        if (claim.status === 'staged') writeRunId = claim.write_run_id;
+        else {
+          try {
+            const prepared = this.derived.prepare({
+              root: detail.run.root_path,
+              inputs: detail.inputs.filter((input) => input.selected).map((input) => input.path),
+              target: contract.write.target,
+              candidateFile: candidate,
+              projectId: detail.project_id,
+              role: contract.write.role,
+              relationType: contract.write.relation_type,
+              intent: detail.request.intent,
+              caller: detail.run.caller,
+              runId: claim.planned_write_run_id,
+            });
+            writeRunId = prepared.run_id;
+            this.ledger.recordTaskUnderlyingRun(taskId, writeRunId, timestamp(), claimToken);
+          } catch (error) {
+            this.ledger.releaseTaskFulfillmentClaim(taskId, claimToken, timestamp());
+            throw error;
+          }
+        }
       }
       const write = this.derived.preview(writeRunId);
       if (write.run.status === 'prepared') this.derived.approve(writeRunId, { reason: reason ?? 'Authorized by the exact Task Contract.' });
@@ -509,18 +802,63 @@ export class TaskContract {
       }
       let writeRunId = detail.underlying_run_id;
       if (!writeRunId) {
-        const prepared = this.guarded.prepare({
-          root: detail.run.root_path, target: contract.write.target, candidateFile: candidate,
-          intent: detail.request.intent, caller: detail.run.caller,
-        });
-        writeRunId = prepared.run_id;
-        this.ledger.recordTaskUnderlyingRun(taskId, writeRunId, timestamp());
+        const claimToken = crypto.randomUUID();
+        const claim = this.ledger.claimTaskFulfillment(
+          taskId, claimToken, process.pid, timestamp(), makeClaimedWriteRunId(contract.write.executor),
+        );
+        if (claim.status === 'staged') writeRunId = claim.write_run_id;
+        else {
+          try {
+            const prepared = this.guarded.prepare({
+              root: detail.run.root_path, target: contract.write.target, candidateFile: candidate,
+              intent: detail.request.intent, caller: detail.run.caller,
+              runId: claim.planned_write_run_id,
+            });
+            writeRunId = prepared.run_id;
+            this.ledger.recordTaskUnderlyingRun(taskId, writeRunId, timestamp(), claimToken);
+          } catch (error) {
+            this.ledger.releaseTaskFulfillmentClaim(taskId, claimToken, timestamp());
+            throw error;
+          }
+        }
       }
       const write = this.guarded.preview(writeRunId);
       if (write.run.status === 'executed') return this.complete(taskId, { runId: writeRunId });
       return { task_id: taskId, contract_id: detail.contract_id, status: 'needs_approval', write_run: { run_id: writeRunId, mode: 'guarded' }, target: contract.write.target, reason: reason ?? contract.write.reason };
     }
     throw new Error(`Unknown Task executor: ${contract.write.executor}`);
+  }
+
+  archivePlan(taskId) {
+    const detail = this.show(taskId);
+    if (detail.underlying_run_id) return this.evolution.previewPlan(detail.underlying_run_id).receipt;
+    this.#validateCurrent(detail);
+    if (detail.contract.status !== 'ready' || detail.contract.write.executor !== 'organization_plan') {
+      throw new Error('Task Contract does not contain a ready archive organization plan.');
+    }
+    const claimToken = crypto.randomUUID();
+    const claim = this.ledger.claimTaskFulfillment(
+      taskId, claimToken, process.pid, timestamp(), makeClaimedWriteRunId(detail.contract.write.executor),
+    );
+    if (claim.status === 'staged') return this.evolution.previewPlan(claim.write_run_id).receipt;
+    try {
+      const prepared = this.evolution.preparePlan({
+        root: detail.run.root_path,
+        intent: detail.request.intent,
+        operations: [{
+          operation: 'move_file',
+          source: detail.contract.write.source,
+          target: detail.contract.write.target,
+        }],
+        caller: detail.run.caller,
+        runId: claim.planned_write_run_id,
+      });
+      this.ledger.recordTaskUnderlyingRun(taskId, prepared.run_id, timestamp(), claimToken);
+      return prepared;
+    } catch (error) {
+      this.ledger.releaseTaskFulfillmentClaim(taskId, claimToken, timestamp());
+      throw error;
+    }
   }
 
   complete(taskId, { runId } = {}) {
@@ -597,11 +935,14 @@ export class TaskContract {
   }
 
   dispose() {
+    if (this._rules) this._rules.dispose();
     if (this._derived) this._derived.dispose();
     if (this._guarded) this._guarded.dispose();
+    if (this._evolution) this._evolution.dispose();
     if (this._ledger) this._ledger.close();
     this._derived = null;
     this._guarded = null;
+    this._evolution = null;
     this._ledger = null;
   }
 }

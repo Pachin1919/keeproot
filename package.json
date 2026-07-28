@@ -1,14 +1,15 @@
 {
   "name": "atlas",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "Atlas 0.1 local file-governance foundation and Agent Skill runtime",
+  "description": "Atlas V1 local Agent file-governance Runtime and Skill",
   "type": "module",
   "bin": {
     "atlas": "./bin/atlas.js"
   },
   "scripts": {
     "test": "node --test --test-concurrency=1",
+    "runtime": "node ./scripts/runtime-manager.js",
     "demo": "node ./scripts/demo.js",
     "demo:v0.1": "node ./scripts/v1-demo.js",
     "demo:v1": "npm run demo:v0.1"

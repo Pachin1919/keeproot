@@ -93,6 +93,7 @@ export class Guarded {
     modifiesRules = false,
     revisedFromRunId = null,
     caller = {},
+    runId: requestedRunId = null,
   }) {
     const root = normalizeRoot(rootInput);
     if (isPathInside(root, this.stateDir)) {
@@ -110,6 +111,7 @@ export class Guarded {
       modifiesRules,
       revisedFromRunId,
       caller,
+      requestedRunId,
     }));
     if (candidateFile) {
       new RuntimeStorage({ stateDir: this.stateDir, ledger: this.ledger })
@@ -130,6 +132,7 @@ export class Guarded {
     modifiesRules,
     revisedFromRunId,
     caller,
+    requestedRunId,
   }) {
     const normalizedTarget = normalizeTarget(root, target);
     if (candidateContent == null && !candidateFile) {
@@ -179,7 +182,7 @@ export class Guarded {
     };
     const { diffText, diffHash } = buildCompleteDiff([change]);
     const startedAt = timestamp();
-    const runId = makeRunId();
+    const runId = requestedRunId ?? makeRunId();
     const ids = this.ledger.createGuardedRun({
       runId,
       root,
@@ -221,6 +224,27 @@ export class Guarded {
       decision: 'rejected',
       reason,
       reviewedAt: timestamp(),
+    });
+  }
+
+  applyApproved(runId, { reason = null } = {}) {
+    if (!reason?.trim()) throw new Error('Guarded apply-approved requires the user approval reason.');
+    return withStateLock(this.stateDir, () => {
+      const detail = this.preview(runId);
+      if (detail.run.status === 'executed') return detail.execution_receipt;
+      if (detail.run.status === 'rolled_back') {
+        throw new Error('Guarded apply-approved cannot re-execute a rolled-back run.');
+      }
+      if (detail.run.status === 'prepared') {
+        this.ledger.reviewGuarded(runId, {
+          decision: 'accepted',
+          reason,
+          reviewedAt: timestamp(),
+        });
+      } else if (detail.run.status !== 'approved') {
+        throw new Error(`Guarded apply-approved requires a prepared or approved run; current status is ${detail.run.status}.`);
+      }
+      return this.#execute(runId);
     });
   }
 
