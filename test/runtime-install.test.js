@@ -150,7 +150,7 @@ test('Runtime upgrade reports compatibility versions and refuses downgrade', () 
   });
   const manifestPath = path.join(scope.installRoot, 'atlas-install.json');
   const older = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-  older.atlas_version = '1.0.0-rc.1';
+  older.atlas_version = '0.9.0';
   fs.writeFileSync(manifestPath, `${JSON.stringify(older, null, 2)}\n`, 'utf8');
 
   const upgraded = installRuntime({
@@ -160,7 +160,7 @@ test('Runtime upgrade reports compatibility versions and refuses downgrade', () 
     nodePath: process.execPath,
     operation: 'upgrade',
   });
-  assert.equal(upgraded.from_version, '1.0.0-rc.1');
+  assert.equal(upgraded.from_version, '0.9.0');
   assert.equal(upgraded.to_version, upgraded.atlas_version);
 
   const newer = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));

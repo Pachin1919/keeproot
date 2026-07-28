@@ -274,7 +274,21 @@ function buildTemporalRelations(inputs) {
         });
         continue;
       }
-      if (!left.coverage || !right.coverage) continue;
+      if (!left.coverage || !right.coverage) {
+        relations.push({
+          type: 'coverage_unknown',
+          from: right.path,
+          to: left.path,
+          confidence: 1,
+          decision: 'preserve_both',
+          evidence: {
+            same_series: true,
+            left_coverage_known: Boolean(left.coverage),
+            right_coverage_known: Boolean(right.coverage),
+          },
+        });
+        continue;
+      }
       let container = null;
       let contained = null;
       if (containsRange(left.coverage, right.coverage)) [container, contained] = [left, right];

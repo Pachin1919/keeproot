@@ -268,6 +268,39 @@ test('Task Contract preserves partially overlapping snapshots and explains both 
   assert.equal(prepared.temporal_relations[0].evidence.content_inclusion, false);
 });
 
+test('Task Contract preserves same-series inputs and reports when coverage is unknown', (t) => {
+  const { root, stateDir, projectId } = setup('task-coverage-unknown');
+  write(root, 'Projects/Atlas/Sources/chat-export-a.txt', 'Export A without reliable message dates.\n');
+  write(root, 'Projects/Atlas/Sources/chat-export-b.txt', 'Export B without reliable message dates.\n');
+  const task = new TaskContract({ stateDir });
+  t.after(() => task.dispose());
+
+  const prepared = task.prepare({
+    root,
+    request: {
+      intent: 'Keep both chat exports when their coverage cannot be proved.',
+      project_id: projectId,
+      inputs: [
+        { path: 'Projects/Atlas/Sources/chat-export-a.txt', series: 'chat-main', temporal_mode: 'snapshot' },
+        { path: 'Projects/Atlas/Sources/chat-export-b.txt', series: 'chat-main', temporal_mode: 'snapshot' },
+      ],
+      budget: { max_files: 2, max_bytes: 1024 },
+      output: {
+        target: 'Projects/Atlas/Outputs/chat-coverage-review.md',
+        role: 'report',
+        data_class: 'temporal_snapshot',
+        action: 'auto',
+      },
+    },
+  });
+
+  assert.equal(prepared.status, 'ready');
+  assert.equal(prepared.read.selected.length, 2);
+  assert.equal(prepared.read.excluded.length, 0);
+  assert.equal(prepared.temporal_relations[0].type, 'coverage_unknown');
+  assert.equal(prepared.temporal_relations[0].decision, 'preserve_both');
+});
+
 test('Task Contract deduplicates identical Materials while retaining both source facts', (t) => {
   const { root, stateDir, projectId } = setup('task-duplicate');
   write(root, 'Projects/Atlas/Sources/export-a.txt', 'same export\n');
