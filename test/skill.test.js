@@ -156,7 +156,7 @@ test('Skill command sequence completes Agent Bootstrap, Derived, Tracked Direct,
   const baselineA = fs.readFileSync(path.join(vault, 'allowed-a.md'), 'utf8');
   const baselineB = fs.readFileSync(path.join(vault, 'allowed-b.md'), 'utf8');
 
-  assert.equal(agentCli(stateDir, ['version']).version, '1.1.0');
+  assert.equal(agentCli(stateDir, ['version']).version, '1.2.0');
   assert.equal(agentCli(stateDir, ['doctor']).status, 'ok');
   const capabilities = agentCli(stateDir, ['capabilities']);
   assert.ok(capabilities.workflows.bootstrap.includes('scan'));

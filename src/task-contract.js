@@ -18,7 +18,7 @@ const DEFAULT_MAX_FILES = 12;
 const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
 const ACTIONS = new Set(['auto', 'create', 'append', 'delta', 'new_version', 'supersede', 'delete', 'archive']);
 const DATA_CLASSES = new Set(['generated_output', 'temporal_snapshot', 'append_only_data', 'human_writing']);
-const DIRECT_TEXT_EXTENSIONS = new Set([
+export const DIRECT_TEXT_EXTENSIONS = new Set([
   '.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl',
   '.yaml', '.yml', '.xml', '.html', '.htm', '.css',
   '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.py',

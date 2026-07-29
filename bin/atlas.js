@@ -2,6 +2,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  doctorAnalyticsComponent,
+  installAnalyticsComponent,
+  removeAnalyticsComponent,
+} from '../src/analytics-component.js';
+import {
+  evaluateAnalytics,
+  showAnalyticsEvaluation,
+} from '../src/analytics-evaluation.js';
 import { Bootstrap } from '../src/bootstrap.js';
 import { BrowserCapture } from '../src/browser-capture.js';
 import { exportAnalytics } from '../src/analytics-export.js';
@@ -68,11 +77,15 @@ function usage() {
 Usage:
   atlas version [--json]
   atlas capabilities [--json]
-  atlas doctor [--json]
+  atlas doctor [analytics] [--json]
   atlas inspect --root <path> [--max-depth <1..8>]
   atlas ledger backups
   atlas ledger restore --backup <filename> --expect-current-hash <sha256>
   atlas analytics export [--name <export_name>]
+  atlas analytics install [--python <python_path>]
+  atlas analytics evaluate --export <export_name> [--name <evaluation_id>]
+  atlas analytics show <evaluation_id>
+  atlas analytics remove
   atlas begin --root <path> --allow <path> [--allow <path> ...] [--intent <text>]
               [--operation <type>] [--importance <level>] [--link-impact <count>] [--confidence <0..1>] [--rules]
   atlas close [run_id]
@@ -1378,36 +1391,66 @@ function handleLedgerMaintenance(args) {
   throw new Error(`Unknown ledger action: ${action ?? '(missing)'}`);
 }
 
-function parseAnalyticsExport(args) {
+function parseAnalytics(args) {
   const [action, ...rest] = args;
-  if (action !== 'export') throw new Error(`Unknown analytics action: ${action ?? '(missing)'}`);
-  let exportName = null;
-  for (let index = 0; index < rest.length; index += 1) {
-    if (rest[index] === '--name') exportName = rest[++index];
-    else throw new Error(`Unknown analytics export argument: ${rest[index]}`);
+  if (action === 'export') {
+    let exportName = null;
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--name') exportName = rest[++index];
+      else throw new Error(`Unknown analytics export argument: ${rest[index]}`);
+    }
+    if (rest.includes('--name') && !exportName) {
+      throw new Error('analytics export --name requires a value');
+    }
+    return { action, exportName };
   }
-  if (rest.includes('--name') && !exportName) {
-    throw new Error('analytics export --name requires a value');
+  if (action === 'evaluate') {
+    let exportName = null;
+    let evaluationName = null;
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--export') exportName = rest[++index];
+      else if (rest[index] === '--name') evaluationName = rest[++index];
+      else throw new Error(`Unknown analytics evaluate argument: ${rest[index]}`);
+    }
+    if (!exportName) throw new Error('analytics evaluate requires --export <export_name>');
+    if (rest.includes('--name') && !evaluationName) {
+      throw new Error('analytics evaluate --name requires a value');
+    }
+    return { action, exportName, evaluationName };
   }
-  return { exportName };
+  if (action === 'install') {
+    let sourcePython = null;
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--python') sourcePython = rest[++index];
+      else throw new Error(`Unknown analytics install argument: ${rest[index]}`);
+    }
+    if (rest.includes('--python') && !sourcePython) {
+      throw new Error('analytics install --python requires a value');
+    }
+    return { action, sourcePython };
+  }
+  if (action === 'show') {
+    if (rest.length !== 1 || rest[0].startsWith('--')) {
+      throw new Error('analytics show requires one evaluation_id');
+    }
+    return { action, evaluationId: rest[0] };
+  }
+  if (action === 'remove') {
+    if (rest.length) throw new Error('analytics remove does not accept arguments');
+    return { action };
+  }
+  throw new Error(`Unknown analytics action: ${action ?? '(missing)'}`);
 }
 
 function optionalPythonCapability() {
-  const candidates = [
-    process.env.ATLAS_PYTHON,
-    path.join(installationRoot, 'python', 'venv', 'Scripts', 'python.exe'),
-    path.join(installationRoot, 'python', 'venv', 'bin', 'python'),
-  ].filter(Boolean).map((item) => path.resolve(item));
-  const executable = candidates.find((item) => {
-    try {
-      return fs.lstatSync(item).isFile();
-    } catch {
-      return false;
-    }
-  }) ?? null;
+  const detail = doctorAnalyticsComponent({
+    installationRoot,
+    runtimeRoot: projectRoot,
+  });
   return {
-    available: Boolean(executable),
-    configured_path: executable,
+    available: detail.status === 'ready',
+    ...detail,
+    configured_path: detail.python_path ?? null,
     required_for_file_governance: false,
     input: 'analytics_export_directory_only',
   };
@@ -1461,7 +1504,14 @@ async function main() {
   const rules = new PreferenceRules({ stateDir, ledger: tracker.ledger });
   try {
     if (command === 'doctor') {
-      if (args.length) throw new Error('doctor does not accept arguments');
+      if (args.length === 1 && args[0] === 'analytics') {
+        const data = optionalPythonCapability();
+        emit('doctor.analytics', data, (detail) => {
+          console.log(`Atlas analytics doctor: ${detail.status}; ${detail.mode}.`);
+        });
+        return;
+      }
+      if (args.length) throw new Error('doctor accepts only the optional analytics target');
       const ledger = tracker.ledger.diagnostics();
       const data = {
         status: ledger.integrity === 'ok' && ledger.schema_version === ledger.supported_schema_version
@@ -1488,15 +1538,47 @@ async function main() {
       });
       if (data.status !== 'ok' || !data.node.supported) process.exitCode = 1;
     } else if (command === 'analytics') {
-      const options = parseAnalyticsExport(args);
-      const result = withStateLock(stateDir, () => exportAnalytics({
-        ledger: tracker.ledger,
-        stateDir,
-        exportName: options.exportName,
-      }));
-      emit('analytics.export', result, (detail) => {
-        console.log(`Exported ${detail.record_count} analytics record(s) to ${detail.output_dir}.`);
-      });
+      const options = parseAnalytics(args);
+      if (options.action === 'export') {
+        const result = withStateLock(stateDir, () => exportAnalytics({
+          ledger: tracker.ledger,
+          stateDir,
+          exportName: options.exportName,
+        }));
+        emit('analytics.export', result, (detail) => {
+          console.log(`Exported ${detail.record_count} analytics record(s) to ${detail.output_dir}.`);
+        });
+      } else if (options.action === 'install') {
+        const result = withStateLock(stateDir, () => installAnalyticsComponent({
+          installationRoot,
+          runtimeRoot: projectRoot,
+          sourcePython: options.sourcePython ?? process.env.ATLAS_PYTHON,
+        }));
+        emit('analytics.install', result, (detail) => {
+          console.log(`Atlas analytics component: ${detail.status}; Python ${detail.python_version}.`);
+        });
+      } else if (options.action === 'evaluate') {
+        const result = withStateLock(stateDir, () => evaluateAnalytics({
+          stateDir,
+          projectRoot,
+          installationRoot,
+          exportName: options.exportName,
+          evaluationName: options.evaluationName,
+        }));
+        emit('analytics.evaluate', result, (detail) => {
+          console.log(`Evaluated ${detail.source_export}: ${detail.status}; ${detail.evaluation_id}.`);
+        });
+      } else if (options.action === 'show') {
+        const result = showAnalyticsEvaluation({ stateDir, evaluationId: options.evaluationId });
+        emit('analytics.show', result, (detail) => {
+          console.log(JSON.stringify(detail, null, 2));
+        });
+      } else if (options.action === 'remove') {
+        const result = withStateLock(stateDir, () => removeAnalyticsComponent({ installationRoot }));
+        emit('analytics.remove', result, (detail) => {
+          console.log(`Atlas analytics component: ${detail.status}; state preserved.`);
+        });
+      }
     } else if (command === 'bootstrap') {
       handleBootstrap(bootstrap, storage, args);
     } else if (command === 'portfolio') {

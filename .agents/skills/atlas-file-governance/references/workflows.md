@@ -264,15 +264,26 @@ The fast-path receipt includes verification, rollback readiness, elapsed millise
 
 Inbox is durable Vault data. Never describe it as Temp. Expired staged Work is reported but not deleted; captured/released Work, stale technical Temp, and unreferenced blobs may enter the plan. Ledger, referenced blobs, backups, staged Work, Inbox, and source Vault files remain protected.
 
-## Read-only Analytics Handoff
+## Read-only Analytics Evaluation
 
 ```powershell
-$export = & $atlasCli analytics export --json | ConvertFrom-Json
+& $atlasCli doctor analytics --json
+# If setup is authorized and Python 3.11+ is available:
+& $atlasCli analytics install --python '<PYTHON_PATH>' --json
+$export = & $atlasCli analytics export --name '<EXPORT_NAME>' --json | ConvertFrom-Json
 if (-not $export.ok) { throw $export.error.message }
-$export.data.manifest_path
+$evaluation = & $atlasCli analytics evaluate --export '<EXPORT_NAME>' --json | ConvertFrom-Json
+if (-not $evaluation.ok) { throw $evaluation.error.message }
+& $atlasCli analytics show $evaluation.data.evaluation_id --json
 ```
 
-Pass only `$export.data.output_dir` to a local analytics consumer. The consumer validates `manifest.json`; it does not receive the Ledger or governed Library paths.
+The Python component receives only `$export.data.output_dir`; it does not receive the Ledger or governed Library paths. Require `quality.status` to be `PASS` or `WARN` before using official metrics. Report unavailable candidates as unavailable, not zero. Read `official_metrics`, the bounded anomaly samples, and `report_path`; do not read `records.jsonl` into model context. The context-selection metric uses directly readable text bytes and excludes binary inputs that require local extraction. It is not measured Token usage.
+
+Remove the optional component only on explicit request:
+
+```powershell
+& $atlasCli analytics remove --json
+```
 
 ## Reconciliation
 

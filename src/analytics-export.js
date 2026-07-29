@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { isPathInside } from './paths.js';
+import { DIRECT_TEXT_EXTENSIONS } from './task-contract.js';
 
 export const ANALYTICS_SCHEMA_VERSION = 'atlas.analytics.v1';
 
@@ -26,6 +27,11 @@ const CSV_COLUMNS = Object.freeze([
   'excluded_count',
   'input_bytes',
   'selected_bytes',
+  'input_text_bytes',
+  'selected_text_bytes',
+  'input_binary_bytes',
+  'selected_binary_bytes',
+  'selected_extraction_inputs',
   'payload_json',
 ]);
 
@@ -52,6 +58,36 @@ function parseJson(value, fallback = null) {
 
 function rootFingerprint(rootPath) {
   return sha256Buffer(Buffer.from(path.resolve(rootPath).toLowerCase(), 'utf8'));
+}
+
+export function classifyTaskContractContextBytes(contract) {
+  const selected = Array.isArray(contract?.read?.selected) ? contract.read.selected : [];
+  const excluded = Array.isArray(contract?.read?.excluded) ? contract.read.excluded : [];
+  const totals = {
+    input_text_bytes: 0,
+    selected_text_bytes: 0,
+    input_binary_bytes: 0,
+    selected_binary_bytes: 0,
+    selected_extraction_inputs: 0,
+  };
+  const add = (item, isSelected) => {
+    const bytes = Number(item?.byte_size);
+    if (!Number.isFinite(bytes) || bytes < 0) return;
+    const directText = DIRECT_TEXT_EXTENSIONS.has(path.extname(String(item?.path ?? '')).toLowerCase());
+    if (directText) {
+      totals.input_text_bytes += bytes;
+      if (isSelected) totals.selected_text_bytes += bytes;
+    } else {
+      totals.input_binary_bytes += bytes;
+      if (isSelected) {
+        totals.selected_binary_bytes += bytes;
+        totals.selected_extraction_inputs += 1;
+      }
+    }
+  };
+  selected.forEach((item) => add(item, true));
+  excluded.forEach((item) => add(item, false));
+  return totals;
 }
 
 function receiptMetrics(row) {
@@ -103,6 +139,11 @@ function record({
   excludedCount = null,
   inputBytes = null,
   selectedBytes = null,
+  inputTextBytes = null,
+  selectedTextBytes = null,
+  inputBinaryBytes = null,
+  selectedBinaryBytes = null,
+  selectedExtractionInputs = null,
   payload = null,
 }) {
   return {
@@ -126,6 +167,11 @@ function record({
     excluded_count: excludedCount,
     input_bytes: inputBytes,
     selected_bytes: selectedBytes,
+    input_text_bytes: inputTextBytes,
+    selected_text_bytes: selectedTextBytes,
+    input_binary_bytes: inputBinaryBytes,
+    selected_binary_bytes: selectedBinaryBytes,
+    selected_extraction_inputs: selectedExtractionInputs,
     payload,
   };
 }
@@ -236,6 +282,8 @@ function publicRecords(source) {
     }));
   }
   for (const row of source.taskContracts) {
+    const contract = parseJson(row.contract_json, {});
+    const contextBytes = classifyTaskContractContextBytes(contract);
     records.push(record({
       recordType: 'task_contract',
       recordId: row.contract_id,
@@ -248,12 +296,17 @@ function publicRecords(source) {
       excludedCount: Number(row.excluded_count),
       inputBytes: Number(row.input_bytes),
       selectedBytes: Number(row.selected_bytes),
+      inputTextBytes: contextBytes.input_text_bytes,
+      selectedTextBytes: contextBytes.selected_text_bytes,
+      inputBinaryBytes: contextBytes.input_binary_bytes,
+      selectedBinaryBytes: contextBytes.selected_binary_bytes,
+      selectedExtractionInputs: contextBytes.selected_extraction_inputs,
       payload: {
         contract_hash: row.contract_hash,
         underlying_run_id: row.underlying_run_id,
         input_count: Number(row.input_count),
         request: parseJson(row.request_json, {}),
-        contract: parseJson(row.contract_json, {}),
+        contract,
         completion: parseJson(row.completion_receipt_json, null),
       },
     }));

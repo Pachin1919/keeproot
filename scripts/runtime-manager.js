@@ -26,14 +26,16 @@ function parse(args) {
   const result = { libraryRoots: [] };
   for (let index = 0; index < args.length; index += 1) {
     const token = args[index];
-    if (token === '--install-root') result.installRoot = args[++index];
-    else if (token === '--skill-root') result.skillRoot = args[++index];
-    else if (token === '--node') result.nodePath = args[++index];
-    else if (token === '--library-root') result.libraryRoots.push(args[++index]);
-    else throw new Error(`Unknown Runtime manager argument: ${token}`);
-  }
-  if ([result.installRoot, result.skillRoot, result.nodePath, ...result.libraryRoots].some((value) => value === undefined)) {
-    throw new Error('Runtime manager option requires a value.');
+    if (['--install-root', '--skill-root', '--node', '--library-root'].includes(token)) {
+      const value = args[++index];
+      if (value === undefined) throw new Error(`${token} requires a value.`);
+      if (token === '--install-root') result.installRoot = value;
+      else if (token === '--skill-root') result.skillRoot = value;
+      else if (token === '--node') result.nodePath = value;
+      else result.libraryRoots.push(value);
+    } else {
+      throw new Error(`Unknown Runtime manager argument: ${token}`);
+    }
   }
   result.installRoot ??= defaultInstallRoot();
   result.skillRoot ??= defaultSkillRoot();

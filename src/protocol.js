@@ -1,4 +1,4 @@
-export const ATLAS_VERSION = '1.1.0';
+export const ATLAS_VERSION = '1.2.0';
 export const PROTOCOL_VERSION = 'atlas-cli.v1';
 
 export const CAPABILITIES = Object.freeze({
@@ -31,7 +31,7 @@ export const CAPABILITIES = Object.freeze({
     work: ['stage', 'status', 'release'],
     storage: ['status', 'plan', 'execute'],
     ledger: ['backups', 'restore'],
-    analytics: ['export'],
+    analytics: ['install', 'export', 'evaluate', 'show', 'remove'],
     registry: ['create', 'list', 'show', 'evolve', 'move', 'merge'],
     rules: ['list', 'show', 'active', 'history', 'context', 'propose', 'preview', 'approve', 'reject'],
     risk: ['evaluate'],
@@ -84,6 +84,28 @@ export const CAPABILITIES = Object.freeze({
     formats: ['jsonl', 'csv'],
     ledger_access: 'node_consistent_read',
     python_access: 'export_files_only',
+  },
+  analytics_evaluation: {
+    schema: 'atlas.analytics.evaluation.v1',
+    current_status: 'ready_for_interpretation',
+    python_required: true,
+    outputs: [
+      'manifest.json',
+      'measurement-gaps.json',
+      'quality.json',
+      'metrics.json',
+      'anomalies.jsonl',
+      'analysis_context.md',
+      'report.md',
+    ],
+  },
+  analytics_component: {
+    format: 'atlas-analytics-component.v1',
+    mode: 'optional_managed_python_venv',
+    minimum_python: '3.11',
+    network_install_required: true,
+    runtime_network_required: false,
+    lifecycle: ['install', 'doctor', 'remove'],
   },
   browser_capture: {
     bridge: 'installed_skill_script',

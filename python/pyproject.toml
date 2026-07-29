@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atlas-analytics"
-version = "0.1.0"
-description = "Read-only consumer for Atlas analytics exports"
+version = "0.3.0"
+description = "Read-only validation and evaluation for Atlas analytics exports"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["pandas==3.0.1"]
 
 [project.scripts]
 atlas-analytics = "atlas_analytics.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+atlas_analytics = ["contracts/*.json", "sql/*.sql"]

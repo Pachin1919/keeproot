@@ -1,0 +1,26 @@
+{
+  "business_question": "What share of directly readable candidate text bytes did Atlas select for bounded Agent content work?",
+  "denominator": "SUM(input_text_bytes) for eligible task_contract facts",
+  "dimensions": [
+    "project_id",
+    "status"
+  ],
+  "exclusions": [
+    "input_text_bytes is missing or zero",
+    "selected_text_bytes is missing",
+    "selected_text_bytes is greater than input_text_bytes",
+    "binary inputs that require local extraction"
+  ],
+  "grain": "one eligible task_contract",
+  "limitations": [
+    "Selected text bytes are not proof that the Agent host read every selected byte.",
+    "This metric is not measured model tokens or token savings.",
+    "Binary files are excluded; their extracted text is not yet measured in V1.2.",
+    "Small samples must be shown with numerator, denominator, and eligible row count."
+  ],
+  "metric_id": "context_selection_text_byte_rate",
+  "numerator": "SUM(selected_text_bytes) for eligible task_contract facts",
+  "schema": "atlas.metric-contract.v1",
+  "unit": "ratio",
+  "version": "1.0.0"
+}

@@ -100,11 +100,11 @@ Preview the Candidate Diff, placement Prediction, route policy, input hashes, ro
 
 Use `storage status`, then `storage plan`, before any `storage execute`. Never delete staged Work, referenced blobs, Ledger, backups, Inbox, or source files. An expired staged item is a warning, not cleanup authorization.
 
-## Analytics Export
+## Analytics Evaluation
 
-Use `analytics export --json` to measure Atlas usage, rule reuse, confirmations, failures, recovery, selected input bytes, or Token-related cost. The Node Runtime reads one consistent Ledger snapshot and writes versioned `records.jsonl`, `records.csv`, and `manifest.json` under the installed state directory. Treat the export as local private data.
+Use `analytics export --json` to create one consistent, versioned Ledger dataset under the installed state directory. Treat the export as local private data. Check `doctor analytics --json` before evaluation. If the component is not installed and the user authorizes setup plus the one-time dependency download, run `analytics install --python <python-3.11-or-newer> --json`; it creates a managed local venv and installs the pinned Pandas version. Then use `analytics evaluate --export <export_name> --json` and read the bounded result with `analytics show <evaluation_id> --json`; evaluation does not require network access and the JSONL dataset must not be sent to the model. Use `analytics remove --json` only when the user asks to remove the optional component; it preserves Atlas state and Node file governance.
 
-Python or another analysis tool may read only the returned export directory. Do not give it the Ledger path or user Library write access. Validate the manifest and file Hashes before analysis. Do not send the whole export to the model when a local summary or bounded query is enough. Python is optional; missing Python must not block Atlas file governance or Node export.
+V1.2 first reports which candidate metrics are available, partial, or unavailable; unavailable data must never be described as zero. When data quality has no critical error, it publishes one contracted SQL metric, a Pandas cross-check, at most five anomaly samples, interpretation context, and a local report. Read the bounded `analytics show` result or `report_path`; do not load the JSONL export into model context. The text-context metric excludes binary inputs that require local extraction and is not measured Token usage. Python receives only the export directory and Atlas evaluation output directory. Do not give it the Ledger path or governed Library access. Missing Python must not block Atlas file governance or Node export.
 
 ## Task Contract
 

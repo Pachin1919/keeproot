@@ -5,7 +5,10 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { exportAnalytics } from '../src/analytics-export.js';
+import {
+  classifyTaskContractContextBytes,
+  exportAnalytics,
+} from '../src/analytics-export.js';
 import { Tracker } from '../src/tracker.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -14,6 +17,29 @@ const tempRoot = path.join(projectRoot, 'test', '.tmp');
 function sha256(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
+
+test('analytics export separates direct-text bytes from binary extraction inputs', () => {
+  const result = classifyTaskContractContextBytes({
+    read: {
+      selected: [
+        { path: 'notes/context.md', byte_size: 80 },
+        { path: 'slides/source.pptx', byte_size: 2400 },
+      ],
+      excluded: [
+        { path: 'notes/older.md', byte_size: 20 },
+        { path: 'documents/source.pdf', byte_size: 600 },
+      ],
+    },
+  });
+
+  assert.deepEqual(result, {
+    input_text_bytes: 100,
+    selected_text_bytes: 80,
+    input_binary_bytes: 3000,
+    selected_binary_bytes: 2400,
+    selected_extraction_inputs: 1,
+  });
+});
 
 test('analytics export publishes a versioned consistent JSONL/CSV dataset and manifest', (t) => {
   const caseRoot = path.join(tempRoot, 'analytics-export');

@@ -14,6 +14,8 @@
 /.cache/
 /.venv/
 /python/.venv/
+/python/venv/
+/python/component.json
 **/__pycache__/
 *.py[cod]
 .pytest_cache/
