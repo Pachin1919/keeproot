@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Pachin1919/Atlas/schemas/atlas.analytics.v1.schema.json",
+  "title": "Atlas Analytics Export V1",
+  "description": "Public, read-only analytics contract produced by the Node.js Atlas Runtime.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/record"
+    },
+    {
+      "$ref": "#/$defs/manifest"
+    }
+  ],
+  "$defs": {
+    "record": {
+      "type": "object",
+      "required": [
+        "export_schema",
+        "record_type",
+        "record_id",
+        "recorded_at",
+        "payload"
+      ],
+      "properties": {
+        "export_schema": {
+          "const": "atlas.analytics.v1"
+        },
+        "record_type": {
+          "enum": [
+            "run",
+            "prediction",
+            "label",
+            "policy_decision",
+            "operation_event",
+            "rule_version",
+            "preference_rule",
+            "task_contract",
+            "file_change",
+            "material_derivation"
+          ]
+        },
+        "record_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recorded_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "payload": {
+          "type": [
+            "object",
+            "array",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "manifest": {
+      "type": "object",
+      "required": [
+        "export_schema",
+        "ledger_schema",
+        "generated_at",
+        "record_count",
+        "source_range",
+        "privacy",
+        "files",
+        "content_hash"
+      ],
+      "properties": {
+        "export_schema": {
+          "const": "atlas.analytics.v1"
+        },
+        "ledger_schema": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "record_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_range": {
+          "type": "object"
+        },
+        "privacy": {
+          "type": "object"
+        },
+        "files": {
+          "type": "object",
+          "required": [
+            "records.jsonl",
+            "records.csv"
+          ]
+        },
+        "content_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

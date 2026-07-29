@@ -100,6 +100,12 @@ Preview the Candidate Diff, placement Prediction, route policy, input hashes, ro
 
 Use `storage status`, then `storage plan`, before any `storage execute`. Never delete staged Work, referenced blobs, Ledger, backups, Inbox, or source files. An expired staged item is a warning, not cleanup authorization.
 
+## Analytics Export
+
+Use `analytics export --json` to measure Atlas usage, rule reuse, confirmations, failures, recovery, selected input bytes, or Token-related cost. The Node Runtime reads one consistent Ledger snapshot and writes versioned `records.jsonl`, `records.csv`, and `manifest.json` under the installed state directory. Treat the export as local private data.
+
+Python or another analysis tool may read only the returned export directory. Do not give it the Ledger path or user Library write access. Validate the manifest and file Hashes before analysis. Do not send the whole export to the model when a local summary or bounded query is enough. Python is optional; missing Python must not block Atlas file governance or Node export.
+
 ## Task Contract
 
 Use Task Contract as the preferred handoff to writing, summarization, analysis, PPT, website-content, or other content-production Skills. Before opening bodies, call `task discover` when the user or Agent does not already have an exact candidate list. Bound discovery by stable Project ID, role, extension, modification time, and maximum count. A stable explicit Project permits project-scoped structural discovery without adopting a whole-Library Contract; active Profile routes are used only when present. It reads structure rather than file bodies and includes registered Artifact/Material/lineage context when available.

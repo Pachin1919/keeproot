@@ -151,6 +151,17 @@ function unifiedHunks(operations, before, after) {
 }
 
 function fileDiff(change) {
+  if ((change.before?.kind && change.before.kind !== 'file')
+    || (change.after?.kind && change.after.kind !== 'file')) {
+    const beforeLabel = change.before ? `a/${change.path}` : '/dev/null';
+    const afterLabel = change.after ? `b/${change.path}` : '/dev/null';
+    return [
+      `diff --atlas ${beforeLabel} ${afterLabel}`,
+      `--- ${beforeLabel}`,
+      `+++ ${afterLabel}`,
+      `Filesystem entry changed (before=${change.before?.kind ?? 'absent'}:${change.before?.contentHash ?? 'absent'}, after=${change.after?.kind ?? 'absent'}:${change.after?.contentHash ?? 'absent'})`,
+    ].join('\n');
+  }
   const beforeBuffer = change.before ? fs.readFileSync(change.before.blobPath) : Buffer.alloc(0);
   const afterBuffer = change.after ? fs.readFileSync(change.after.blobPath) : Buffer.alloc(0);
   const beforeText = decodeText(beforeBuffer);

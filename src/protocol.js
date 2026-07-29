@@ -1,4 +1,4 @@
-export const ATLAS_VERSION = '1.0.0';
+export const ATLAS_VERSION = '1.1.0';
 export const PROTOCOL_VERSION = 'atlas-cli.v1';
 
 export const CAPABILITIES = Object.freeze({
@@ -31,6 +31,7 @@ export const CAPABILITIES = Object.freeze({
     work: ['stage', 'status', 'release'],
     storage: ['status', 'plan', 'execute'],
     ledger: ['backups', 'restore'],
+    analytics: ['export'],
     registry: ['create', 'list', 'show', 'evolve', 'move', 'merge'],
     rules: ['list', 'show', 'active', 'history', 'context', 'propose', 'preview', 'approve', 'reject'],
     risk: ['evaluate'],
@@ -77,6 +78,12 @@ export const CAPABILITIES = Object.freeze({
     default_visual_images: 0,
     maximum_visual_images: 8,
     maximum_visual_resolution: '768x432',
+  },
+  analytics_export: {
+    schema: 'atlas.analytics.v1',
+    formats: ['jsonl', 'csv'],
+    ledger_access: 'node_consistent_read',
+    python_access: 'export_files_only',
   },
   browser_capture: {
     bridge: 'installed_skill_script',

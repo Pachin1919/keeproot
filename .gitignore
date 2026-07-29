@@ -12,6 +12,18 @@
 /node_modules/
 /.npm/
 /.cache/
+/.venv/
+/python/.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+/python/build/
+/python/dist/
+/python/*.egg-info/
 
 # SQLite safety net if a state directory is configured outside .atlas
 *.sqlite

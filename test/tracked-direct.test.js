@@ -72,6 +72,30 @@ test('close identifies a file changed outside the allowed scope', (t) => {
   assert.equal(tracker.show(run.run_id).decisions.at(-1).decision, 'violation');
 });
 
+test('an unrelated junction inside the tracked root is recorded without being followed or blocking allowed work', (t) => {
+  const { caseRoot, vault, stateDir } = setup('unrelated-junction');
+  const tracker = openTracker(t, stateDir);
+  const external = path.join(caseRoot, 'external-dependency');
+  const junction = path.join(vault, 'node_modules-link');
+  fs.mkdirSync(external, { recursive: true });
+  fs.writeFileSync(path.join(external, 'outside.txt'), 'must not be tracked\n', 'utf8');
+  try {
+    fs.symlinkSync(external, junction, 'junction');
+  } catch (error) {
+    t.skip(`Junction creation is unavailable: ${error.message}`);
+    return;
+  }
+
+  const run = tracker.begin({ root: vault, allow: ['allowed-a.md'] });
+  append(path.join(vault, 'allowed-a.md'), 'allowed change\n');
+  const receipt = tracker.close(run.run_id);
+  const detail = tracker.show(run.run_id);
+
+  assert.equal(receipt.policy, 'pass');
+  assert.equal(receipt.changed_files, 1);
+  assert.equal(detail.changes.some((change) => change.path.includes('outside.txt')), false);
+});
+
 test('multiple explicitly allowed files can change together', (t) => {
   const { vault, stateDir } = setup('multiple-allowed');
   const tracker = openTracker(t, stateDir);

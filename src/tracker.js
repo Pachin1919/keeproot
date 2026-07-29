@@ -10,7 +10,12 @@ import {
   normalizeRoot,
   normalizeScopes,
 } from './paths.js';
-import { scanRoot, sha256File, snapshotChangedFiles } from './snapshots.js';
+import {
+  scanRoot,
+  sha256Buffer,
+  sha256File,
+  snapshotChangedFiles,
+} from './snapshots.js';
 import { withStateLock } from './state-lock.js';
 import { evaluateRisk } from './risk.js';
 
@@ -52,9 +57,20 @@ function compareStates(beforeStates, afterStates, scopes) {
 }
 
 function currentFileState(filePath) {
-  if (!fs.existsSync(filePath)) return null;
-  const stat = fs.lstatSync(filePath);
-  if (!stat.isFile() || stat.isSymbolicLink()) {
+  let stat;
+  try {
+    stat = fs.lstatSync(filePath);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (stat.isSymbolicLink()) {
+    return {
+      kind: 'symbolic_link',
+      contentHash: sha256Buffer(Buffer.from(fs.readlinkSync(filePath), 'utf8')),
+    };
+  }
+  if (!stat.isFile()) {
     return { kind: 'unsupported', contentHash: null };
   }
   return { kind: 'file', contentHash: sha256File(filePath) };
@@ -265,7 +281,9 @@ export class Tracker {
         violation_kind: decision.details.violation_kind,
         actual_risk_mode: actualRisk.mode,
         diff_sha256: diffHash,
-        rollback_ready: true,
+        rollback_ready: changes.every((change) => (
+          change.before === null || change.before.kind === 'file'
+        )),
         closed_at: closedAt,
       };
 

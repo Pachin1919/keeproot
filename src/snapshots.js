@@ -24,6 +24,17 @@ export function sha256File(filePath) {
   return hash.digest('hex');
 }
 
+function symbolicLinkState(filePath) {
+  const target = fs.readlinkSync(filePath);
+  const value = Buffer.from(target, 'utf8');
+  return {
+    kind: 'symbolic_link',
+    contentHash: sha256Buffer(value),
+    byteSize: value.length,
+    blobPath: null,
+  };
+}
+
 function sameFileVersion(before, after) {
   return before.size === after.size && before.mtimeMs === after.mtimeMs;
 }
@@ -107,7 +118,8 @@ export function scanRoot(root, { stateDir, capture = false } = {}) {
       const relative = toPortablePath(path.relative(root, absolute));
 
       if (child.isSymbolicLink()) {
-        throw new Error(`Symbolic links are not supported inside a tracked root: ${absolute}`);
+        entries.push({ path: relative, ...symbolicLinkState(absolute) });
+        continue;
       }
       if (child.isDirectory()) {
         walk(absolute);
@@ -139,7 +151,7 @@ export function scanRoot(root, { stateDir, capture = false } = {}) {
 
 export function snapshotChangedFiles(root, stateDir, changes) {
   for (const change of changes) {
-    if (!change.after) continue;
+    if (!change.after || change.after.kind !== 'file') continue;
     const absolute = path.join(root, ...change.path.split('/'));
     const snapshot = captureBlob(absolute, stateDir);
     if (snapshot.contentHash !== change.after.contentHash) {

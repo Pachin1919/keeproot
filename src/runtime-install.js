@@ -108,7 +108,7 @@ function assertOutsideLibraries(installRoot, stateDir, libraryRoots) {
 
 function copyRuntime(sourceRoot, target) {
   fs.mkdirSync(target, { recursive: true });
-  for (const relative of ['bin', 'src', 'package.json']) {
+  for (const relative of ['bin', 'src', 'schemas', 'package.json']) {
     const source = path.join(sourceRoot, relative);
     if (!fs.existsSync(source)) throw new Error(`Runtime source is incomplete: ${source}`);
     fs.cpSync(source, path.join(target, relative), { recursive: true, force: true });

@@ -696,6 +696,7 @@ export class Ledger {
   }
 
   #storeBlobPath(blobPath) {
+    if (!blobPath) return null;
     const absolute = path.resolve(blobPath);
     const relative = path.relative(this.stateDir, absolute);
     if (relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative)) {
@@ -766,7 +767,7 @@ export class Ledger {
 
       const insertArtifact = this.db.prepare(`
         INSERT INTO artifacts(id, origin_run_id, kind, current_path, created_at)
-        VALUES (?, ?, 'file', ?, ?)
+        VALUES (?, ?, ?, ?, ?)
       `);
       const insertMaterial = this.db.prepare(`
         INSERT INTO materials(id, artifact_id, stage, content_hash, byte_size, blob_path, created_at)
@@ -778,16 +779,19 @@ export class Ledger {
       `);
       for (const entry of baseline) {
         const artifactId = `ART-${crypto.randomUUID()}`;
-        const materialId = `MAT-${crypto.randomUUID()}`;
-        insertArtifact.run(artifactId, runId, entry.path, startedAt);
-        insertMaterial.run(
-          materialId,
-          artifactId,
-          entry.contentHash,
-          entry.byteSize,
-          this.#storeBlobPath(entry.blobPath),
-          startedAt,
-        );
+        let materialId = null;
+        insertArtifact.run(artifactId, runId, entry.kind, entry.path, startedAt);
+        if (entry.kind === 'file') {
+          materialId = `MAT-${crypto.randomUUID()}`;
+          insertMaterial.run(
+            materialId,
+            artifactId,
+            entry.contentHash,
+            entry.byteSize,
+            this.#storeBlobPath(entry.blobPath),
+            startedAt,
+          );
+        }
         insertState.run(
           runId,
           entry.path,
@@ -4180,7 +4184,7 @@ export class Ledger {
       `);
       const insertArtifact = this.db.prepare(`
         INSERT INTO artifacts(id, origin_run_id, kind, current_path, created_at)
-        VALUES (?, ?, 'file', ?, ?)
+        VALUES (?, ?, ?, ?, ?)
       `);
       const insertMaterial = this.db.prepare(`
         INSERT INTO materials(id, artifact_id, stage, content_hash, byte_size, blob_path, created_at)
@@ -4197,13 +4201,13 @@ export class Ledger {
         let artifact = artifactForPath.get(runId, entry.path);
         if (!artifact) {
           const artifactId = `ART-${crypto.randomUUID()}`;
-          insertArtifact.run(artifactId, runId, entry.path, closedAt);
+          insertArtifact.run(artifactId, runId, entry.kind, entry.path, closedAt);
           artifact = { id: artifactId };
         }
 
         let materialId = null;
         const changed = changedByPath.get(entry.path);
-        if (changed) {
+        if (changed && entry.kind === 'file') {
           materialId = `MAT-${crypto.randomUUID()}`;
           insertMaterial.run(
             materialId,
@@ -4555,6 +4559,79 @@ export class Ledger {
     return this.db.prepare(`
       SELECT DISTINCT blob_path, content_hash FROM materials WHERE blob_path IS NOT NULL
     `).all().map((row) => this.#resolveBlobPath(row.blob_path, row.content_hash));
+  }
+
+  readAnalyticsSource() {
+    this.db.exec('BEGIN;');
+    try {
+      const source = {
+        ledgerSchema: this.db.prepare('PRAGMA user_version').get().user_version,
+        runs: this.db.prepare(`
+          SELECT id, mode, status, root_path, intent, actor, agent, model, tool, client_run_id,
+                 rule_version_id, started_at, closed_at, aborted_at, rolled_back_at,
+                 receipt_json, abort_receipt_json, rollback_receipt_json
+          FROM runs ORDER BY started_at, id
+        `).all(),
+        predictions: this.db.prepare(`
+          SELECT id, run_id, kind, payload_json, created_at
+          FROM predictions ORDER BY created_at, id
+        `).all(),
+        labels: this.db.prepare(`
+          SELECT id, run_id, subject_prediction_id, name, value, source, details_json, created_at
+          FROM labels ORDER BY created_at, id
+        `).all(),
+        policyDecisions: this.db.prepare(`
+          SELECT id, run_id, rule_version_id, decision, reason, details_json, created_at
+          FROM policy_decisions ORDER BY created_at, id
+        `).all(),
+        operationEvents: this.db.prepare(`
+          SELECT id, run_id, event_type, payload_json, occurred_at
+          FROM operation_events ORDER BY occurred_at, id
+        `).all(),
+        ruleVersions: this.db.prepare(`
+          SELECT id, name, version, definition_json, created_at
+          FROM rule_versions ORDER BY created_at, id
+        `).all(),
+        preferenceRules: this.db.prepare(`
+          SELECT id, run_id, scope_type, scope_key, kind, condition_hash, condition_json,
+                 value_json, priority, rule_version_id, status, summary, basis,
+                 evidence_json, created_at, superseded_at
+          FROM preference_rules ORDER BY created_at, id
+        `).all(),
+        taskContracts: this.db.prepare(`
+          SELECT tc.run_id, r.started_at, tc.contract_id, tc.project_id, tc.environment_rule_version_id,
+                 tc.contract_hash, tc.request_json, tc.contract_json, tc.underlying_run_id,
+                 tc.completion_receipt_json, tc.completed_at,
+                 COUNT(ti.ordinal) AS input_count,
+                 COALESCE(SUM(CASE WHEN ti.selected = 1 THEN 1 ELSE 0 END), 0) AS selected_count,
+                 COALESCE(SUM(CASE WHEN ti.selected = 0 THEN 1 ELSE 0 END), 0) AS excluded_count,
+                 COALESCE(SUM(ti.byte_size), 0) AS input_bytes,
+                 COALESCE(SUM(CASE WHEN ti.selected = 1 THEN ti.byte_size ELSE 0 END), 0) AS selected_bytes
+          FROM task_contracts tc
+          JOIN runs r ON r.id = tc.run_id
+          LEFT JOIN task_inputs ti ON ti.run_id = tc.run_id
+          GROUP BY tc.run_id
+          ORDER BY tc.run_id
+        `).all(),
+        changes: this.db.prepare(`
+          SELECT c.id, cs.run_id, r.started_at, c.path, c.change_type, c.allowed,
+                 c.before_kind, c.before_hash, c.after_kind, c.after_hash
+          FROM changes c
+          JOIN change_sets cs ON cs.id = c.change_set_id
+          JOIN runs r ON r.id = cs.run_id
+          ORDER BY cs.run_id, c.path
+        `).all(),
+        materialDerivations: this.db.prepare(`
+          SELECT output_material_id, input_material_id, run_id, relation_type, ordinal, created_at
+          FROM material_derivations ORDER BY created_at, run_id, ordinal
+        `).all(),
+      };
+      this.db.exec('COMMIT;');
+      return source;
+    } catch (error) {
+      this.db.exec('ROLLBACK;');
+      throw error;
+    }
   }
 
   diagnostics() {

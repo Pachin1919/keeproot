@@ -264,6 +264,16 @@ The fast-path receipt includes verification, rollback readiness, elapsed millise
 
 Inbox is durable Vault data. Never describe it as Temp. Expired staged Work is reported but not deleted; captured/released Work, stale technical Temp, and unreferenced blobs may enter the plan. Ledger, referenced blobs, backups, staged Work, Inbox, and source Vault files remain protected.
 
+## Read-only Analytics Handoff
+
+```powershell
+$export = & $atlasCli analytics export --json | ConvertFrom-Json
+if (-not $export.ok) { throw $export.error.message }
+$export.data.manifest_path
+```
+
+Pass only `$export.data.output_dir` to a local analytics consumer. The consumer validates `manifest.json`; it does not receive the Ledger or governed Library paths.
+
 ## Reconciliation
 
 ```powershell

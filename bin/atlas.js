@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Bootstrap } from '../src/bootstrap.js';
 import { BrowserCapture } from '../src/browser-capture.js';
+import { exportAnalytics } from '../src/analytics-export.js';
 import { Derived } from '../src/derived.js';
 import { Evolution } from '../src/evolution.js';
 import { Guarded } from '../src/guarded.js';
@@ -15,6 +16,7 @@ import { Registry } from '../src/registry.js';
 import { evaluateRisk } from '../src/risk.js';
 import { isPathInside, normalizeStateDir } from '../src/paths.js';
 import { RuntimeStorage } from '../src/runtime-storage.js';
+import { withStateLock } from '../src/state-lock.js';
 import { TaskContract } from '../src/task-contract.js';
 import {
   ATLAS_VERSION,
@@ -70,6 +72,7 @@ Usage:
   atlas inspect --root <path> [--max-depth <1..8>]
   atlas ledger backups
   atlas ledger restore --backup <filename> --expect-current-hash <sha256>
+  atlas analytics export [--name <export_name>]
   atlas begin --root <path> --allow <path> [--allow <path> ...] [--intent <text>]
               [--operation <type>] [--importance <level>] [--link-impact <count>] [--confidence <0..1>] [--rules]
   atlas close [run_id]
@@ -1375,6 +1378,41 @@ function handleLedgerMaintenance(args) {
   throw new Error(`Unknown ledger action: ${action ?? '(missing)'}`);
 }
 
+function parseAnalyticsExport(args) {
+  const [action, ...rest] = args;
+  if (action !== 'export') throw new Error(`Unknown analytics action: ${action ?? '(missing)'}`);
+  let exportName = null;
+  for (let index = 0; index < rest.length; index += 1) {
+    if (rest[index] === '--name') exportName = rest[++index];
+    else throw new Error(`Unknown analytics export argument: ${rest[index]}`);
+  }
+  if (rest.includes('--name') && !exportName) {
+    throw new Error('analytics export --name requires a value');
+  }
+  return { exportName };
+}
+
+function optionalPythonCapability() {
+  const candidates = [
+    process.env.ATLAS_PYTHON,
+    path.join(installationRoot, 'python', 'venv', 'Scripts', 'python.exe'),
+    path.join(installationRoot, 'python', 'venv', 'bin', 'python'),
+  ].filter(Boolean).map((item) => path.resolve(item));
+  const executable = candidates.find((item) => {
+    try {
+      return fs.lstatSync(item).isFile();
+    } catch {
+      return false;
+    }
+  }) ?? null;
+  return {
+    available: Boolean(executable),
+    configured_path: executable,
+    required_for_file_governance: false,
+    input: 'analytics_export_directory_only',
+  };
+}
+
 async function main() {
   const rawArgs = process.argv.slice(2);
   outputJson = rawArgs.includes('--json');
@@ -1436,6 +1474,11 @@ async function main() {
         state_inside_project: isPathInside(projectRoot, stateDir),
         state_inside_installation: isPathInside(installationRoot, stateDir),
         ledger,
+        capabilities: {
+          file_governance: true,
+          analytics_export: true,
+          analytics_python: optionalPythonCapability(),
+        },
       };
       emit('doctor', data, (detail) => {
         console.log(`Atlas doctor: ${detail.status}`);
@@ -1444,6 +1487,16 @@ async function main() {
         console.log(`State: ${detail.state_dir}`);
       });
       if (data.status !== 'ok' || !data.node.supported) process.exitCode = 1;
+    } else if (command === 'analytics') {
+      const options = parseAnalyticsExport(args);
+      const result = withStateLock(stateDir, () => exportAnalytics({
+        ledger: tracker.ledger,
+        stateDir,
+        exportName: options.exportName,
+      }));
+      emit('analytics.export', result, (detail) => {
+        console.log(`Exported ${detail.record_count} analytics record(s) to ${detail.output_dir}.`);
+      });
     } else if (command === 'bootstrap') {
       handleBootstrap(bootstrap, storage, args);
     } else if (command === 'portfolio') {
