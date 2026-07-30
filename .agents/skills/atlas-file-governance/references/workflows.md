@@ -172,6 +172,33 @@ If same-series inputs have different hashes but lack reliable coverage, expect `
 
 For binary inputs, use `read.requires_local_extraction` to select a local parser. `read.estimated_tokens` covers only directly readable text bytes; it is not a raw binary-size estimate. Do not send the binary file or a full-resolution render set into model context. Presentation comparison is text/object/layout extraction first, compact local diff second, and at most eight explicitly selected 768×432 JPEG renders only when unresolved visual evidence remains.
 
+## Reusable cross-Project context
+
+Configure the relationship once:
+
+```powershell
+& $atlasCli root adopt --path '<SOURCE_ROOT>' --type '<ROOT_TYPE>' --content-policy bounded_content --json
+& $atlasCli root adopt --path '<TARGET_ROOT>' --type '<ROOT_TYPE>' --content-policy bounded_content --json
+& $atlasCli project attach-root '<SOURCE_PROJECT_ID>' --root '<SOURCE_ROOT_ID>' --reason '<REVIEWED_REASON>' --json
+& $atlasCli project attach-root '<TARGET_PROJECT_ID>' --root '<TARGET_ROOT_ID>' --reason '<REVIEWED_REASON>' --json
+& $atlasCli project link-context '<TARGET_PROJECT_ID>' --source '<SOURCE_PROJECT_ID>' --purpose '<PURPOSE>' --extension '.md' --max-candidates 20 --reason '<REVIEWED_REASON>' --json
+```
+
+Reuse it in later tasks:
+
+```powershell
+& $atlasCli task discover-context --project '<TARGET_PROJECT_ID>' --purpose '<PURPOSE>' --term '<AGENT_SEARCH_TERM>' --actor agent --agent '<AGENT>' --model '<MODEL>' --tool '<CONTENT_SKILL>' --client-run-id '<TASK_ID>' --json
+& $atlasCli task context-candidates '<CANDIDATE_SET_ID>' --json
+& $atlasCli task prepare-context --candidate-set '<CANDIDATE_SET_ID>' --select '<CATALOG_ENTRY_ID>' --request-file '<ATLAS_STATE_REQUEST_JSON>' --actor agent --agent '<AGENT>' --model '<MODEL>' --tool '<CONTENT_SKILL>' --client-run-id '<TASK_ID>' --json
+& $atlasCli task source-set '<SOURCE_SET_ID>' --json
+# Open only selected source paths and create one Candidate outside the target Root.
+& $atlasCli task fulfill '<TASK_ID_FROM_PREPARE>' --candidate-file '<CANDIDATE_FILE>' --reason '<CURRENT_USER_TASK_AUTHORIZATION>' --json
+```
+
+The Context Link persists; Candidate Set and Source Set are per-task facts. Atlas indexes authorized Markdown/plain-text locally and returns bounded metadata/snippets instead of full bodies. The Agent still interprets meaning and selects sources. The Task reads from multiple adopted Roots but writes to exactly one target Root. A changed selected source makes fulfillment stale.
+
+Use extension and candidate-count filters only. V1.3 rejects Context Link role filters because its direct-text Catalog cannot enforce them completely. A disabled or superseded Link, a changed Candidate snapshot, or a source/target Project reattachment makes the prior Candidate Set or Task stale; run discovery again under the current relationship.
+
 ## Project Evolution
 
 ```powershell

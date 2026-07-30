@@ -125,7 +125,7 @@ test('Ledger maintenance rejects a corrupt or escaping backup before replacing t
   assert.equal(ledgerFileHash(stateDir), beforeHash);
 });
 
-for (const legacyVersion of [8, 10, 11]) {
+for (const legacyVersion of [8, 10, 11, 18]) {
   test(`Ledger schema ${legacyVersion} reopens through a verified backup and converges to the current schema`, () => {
     const caseRoot = freshCase(`ledger-migration-v${legacyVersion}`);
     const stateDir = path.join(caseRoot, '.atlas');
@@ -136,6 +136,17 @@ for (const legacyVersion of [8, 10, 11]) {
     const databasePath = path.join(stateDir, 'ledger.sqlite');
     const legacy = new DatabaseSync(databasePath);
     try {
+      legacy.exec(`
+        DROP TABLE catalog_fts;
+        DROP TABLE source_set_items;
+        DROP TABLE source_sets;
+        DROP TABLE context_candidate_items;
+        DROP TABLE context_candidate_sets;
+        DROP TABLE catalog_entries;
+        DROP TABLE catalog_generations;
+        DROP TABLE project_context_links;
+        DROP TABLE project_locations;
+      `);
       if (legacyVersion < 11) legacy.exec('DROP TABLE evolution_operations;');
       if (legacyVersion < 12) {
         legacy.exec('DROP TABLE task_inputs; DROP TABLE task_contracts;');

@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { installRuntime } from '../src/runtime-install.js';
+import { InstalledSkillDriver } from '../test-support/installed-skill-driver.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cliPath = path.join(projectRoot, 'bin', 'atlas.js');
@@ -84,6 +85,181 @@ test('repository Agent Skill is a complete user-installable source and reference
   assert.equal(path.dirname(skillRoot), path.join(projectRoot, '.agents', 'skills'));
 });
 
+test('installed Skill reuses one cross-Project Context Link without rereading unchanged source bodies', () => {
+  const caseRoot = path.join(tempRoot, 'skill-cross-project-context');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const sourceRoot = path.join(caseRoot, 'knowledge');
+  const targetRoot = path.join(caseRoot, 'website');
+  fs.mkdirSync(path.join(sourceRoot, 'Career'), { recursive: true });
+  fs.mkdirSync(path.join(targetRoot, 'Site'), { recursive: true });
+  fs.writeFileSync(
+    path.join(sourceRoot, 'Career', 'direction.md'),
+    '# Career direction\n\nThe website should present Atlas as a local data-governance project.\n',
+    'utf8',
+  );
+  fs.writeFileSync(
+    path.join(sourceRoot, 'Career', 'unrelated.md'),
+    '# Grocery list\n\nMilk and fruit.\n',
+    'utf8',
+  );
+  const installRoot = path.join(caseRoot, 'installed-atlas');
+  const installedSkillRoot = path.join(caseRoot, 'installed-skill', 'atlas-file-governance');
+  installRuntime({
+    sourceRoot: projectRoot,
+    installRoot,
+    skillRoot: installedSkillRoot,
+    nodePath: process.execPath,
+  });
+  const atlas = new InstalledSkillDriver({ installRoot });
+  assert.match(atlas.skill, /recurring cross-Project work/);
+  assert.match(atlas.workflows, /task\s+discover-context/);
+
+  const sourceRootReceipt = atlas.call([
+    'root', 'adopt', '--path', sourceRoot, '--type', 'managed_library',
+    '--content-policy', 'bounded_content',
+  ]);
+  const targetRootReceipt = atlas.call([
+    'root', 'adopt', '--path', targetRoot, '--type', 'project_workspace',
+    '--content-policy', 'bounded_content',
+  ]);
+  const sourceProject = atlas.call([
+    'project', 'create', '--name', 'Career', '--path', 'Career',
+  ]);
+  const targetProject = atlas.call([
+    'project', 'create', '--name', 'Website', '--path', 'Site',
+  ]);
+  atlas.call([
+    'project', 'attach-root', sourceProject.project_id,
+    '--root', sourceRootReceipt.root_id,
+    '--reason', 'Bind the representative source Project.',
+  ]);
+  atlas.call([
+    'project', 'attach-root', targetProject.project_id,
+    '--root', targetRootReceipt.root_id,
+    '--reason', 'Bind the representative target Project.',
+  ]);
+  const link = atlas.call([
+    'project', 'link-context', targetProject.project_id,
+    '--source', sourceProject.project_id,
+    '--purpose', 'portfolio_positioning',
+    '--extension', '.md',
+    '--max-candidates', '5',
+    '--reason', 'Reuse reviewed career direction for later website tasks.',
+  ]);
+
+  const caller = [
+    '--actor', 'agent', '--agent', 'Codex', '--model', 'gpt-5',
+    '--tool', 'atlas-skill-test', '--client-run-id', 'cross-project-001',
+  ];
+  const first = atlas.call([
+    'task', 'discover-context',
+    '--project', targetProject.project_id,
+    '--purpose', 'portfolio_positioning',
+    '--term', 'data-governance',
+    ...caller,
+  ]);
+  assert.equal(first.context_links[0].link_id, link.link_id);
+  assert.equal(first.candidates.length, 1);
+  assert.equal(first.content_files_read, 2);
+  assert.equal(Object.hasOwn(first.candidates[0], 'body'), false);
+
+  const repeated = atlas.call([
+    'task', 'discover-context',
+    '--project', targetProject.project_id,
+    '--purpose', 'portfolio_positioning',
+    '--term', 'data-governance',
+    ...caller,
+  ]);
+  assert.equal(repeated.candidates.length, 1);
+  assert.equal(repeated.content_files_read, 0);
+  assert.equal(repeated.catalog_generations[0].reused_files, 2);
+
+  const requestFile = path.join(caseRoot, 'request.json');
+  fs.writeFileSync(requestFile, JSON.stringify({
+    intent: 'Create one website direction note from the selected career source.',
+    project_id: targetProject.project_id,
+    output: {
+      target: 'Site/direction.md',
+      role: 'report',
+      action: 'create',
+      data_class: 'generated_output',
+    },
+    budget: { max_files: 3, max_bytes: 1024 * 1024 },
+  }), 'utf8');
+  const prepared = atlas.call([
+    'task', 'prepare-context',
+    '--candidate-set', repeated.candidate_set_id,
+    '--select', repeated.candidates[0].entry_id,
+    '--request-file', requestFile,
+    ...caller,
+  ]);
+  assert.deepEqual(prepared.boundaries.read_root_ids, [sourceRootReceipt.root_id]);
+  assert.equal(prepared.boundaries.write_root_id, targetRootReceipt.root_id);
+  const sourceSet = atlas.call(['task', 'source-set', prepared.source_set_id]);
+  assert.equal(sourceSet.items.length, 1);
+  assert.equal(sourceSet.items[0].source_project_id, sourceProject.project_id);
+
+  const candidateFile = path.join(caseRoot, 'candidate.md');
+  fs.writeFileSync(
+    candidateFile,
+    '# Website direction\n\nPresent Atlas as a local data-governance project.\n',
+    'utf8',
+  );
+  const completed = atlas.call([
+    'task', 'fulfill', prepared.task_id,
+    '--candidate-file', candidateFile,
+    '--reason', 'The representative task authorizes this exact output.',
+  ]);
+  assert.equal(completed.status, 'completed');
+  const detail = atlas.call(['task', 'show', prepared.task_id]);
+  assert.equal(detail.output.lineage.length, 1);
+  assert.equal(detail.inputs[0].source_root_id, sourceRootReceipt.root_id);
+  const rolledBack = atlas.call(['task', 'rollback', prepared.task_id]);
+  assert.equal(rolledBack.status, 'rolled_back');
+  assert.equal(fs.existsSync(path.join(targetRoot, 'Site', 'direction.md')), false);
+
+  const staleDiscovery = atlas.call([
+    'task', 'discover-context',
+    '--project', targetProject.project_id,
+    '--purpose', 'portfolio_positioning',
+    '--term', 'data-governance',
+    ...caller,
+  ]);
+  fs.writeFileSync(requestFile, JSON.stringify({
+    intent: 'Verify that a changed selected source cannot produce an output.',
+    project_id: targetProject.project_id,
+    output: {
+      target: 'Site/stale.md',
+      role: 'report',
+      action: 'create',
+      data_class: 'generated_output',
+    },
+    budget: { max_files: 3, max_bytes: 1024 * 1024 },
+  }), 'utf8');
+  const stalePrepared = atlas.call([
+    'task', 'prepare-context',
+    '--candidate-set', staleDiscovery.candidate_set_id,
+    '--select', staleDiscovery.candidates[0].entry_id,
+    '--request-file', requestFile,
+    ...caller,
+  ]);
+  fs.appendFileSync(
+    path.join(sourceRoot, 'Career', 'direction.md'),
+    '\nA later legitimate source change.\n',
+    'utf8',
+  );
+  assert.throws(
+    () => atlas.call([
+      'task', 'fulfill', stalePrepared.task_id,
+      '--candidate-file', candidateFile,
+      '--reason', 'Attempt a stale representative task.',
+    ]),
+    /ATLAS_STATE_CONFLICT|selected input|stale|changed/i,
+  );
+  assert.equal(atlas.call(['task', 'show', stalePrepared.task_id]).run.status, 'stale');
+  assert.equal(fs.existsSync(path.join(targetRoot, 'Site', 'stale.md')), false);
+});
+
 test('Skill attachment Intake script preserves spaced Chinese paths and returns one compact receipt', {
   skip: process.platform !== 'win32',
 }, () => {
@@ -156,7 +332,7 @@ test('Skill command sequence completes Agent Bootstrap, Derived, Tracked Direct,
   const baselineA = fs.readFileSync(path.join(vault, 'allowed-a.md'), 'utf8');
   const baselineB = fs.readFileSync(path.join(vault, 'allowed-b.md'), 'utf8');
 
-  assert.equal(agentCli(stateDir, ['version']).version, '1.2.0');
+  assert.equal(agentCli(stateDir, ['version']).version, '1.3.0');
   assert.equal(agentCli(stateDir, ['doctor']).status, 'ok');
   const capabilities = agentCli(stateDir, ['capabilities']);
   assert.ok(capabilities.workflows.bootstrap.includes('scan'));

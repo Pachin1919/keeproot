@@ -9,6 +9,7 @@ import { evaluateRisk } from './risk.js';
 import { RuntimeStorage } from './runtime-storage.js';
 import { captureBlob, captureBuffer, sha256File } from './snapshots.js';
 import { withStateLock } from './state-lock.js';
+import { ProjectContextRepository } from './storage/repositories/project-context-repository.js';
 import { RollbackConflictError } from './tracker.js';
 
 const RELATION_TYPES = new Set([
@@ -56,6 +57,21 @@ function normalizeInput(root, input) {
   const real = fs.realpathSync.native(lexical);
   if (!isPathInside(root, real)) throw new Error(`Derived input resolves outside the root: ${input}`);
   return { absolute: real, relative: toPortablePath(path.relative(root, real)) };
+}
+
+function normalizeTrustedInput(targetRoot, input) {
+  if (!input || typeof input !== 'object') throw new Error('Trusted Derived input must be an object.');
+  const sourceRoot = normalizeRoot(input.sourceRootPath ?? targetRoot);
+  const sourcePath = input.sourceRelativePath ?? input.path;
+  const normalized = normalizeInput(sourceRoot, sourcePath);
+  return {
+    ...normalized,
+    relative: input.path ?? normalized.relative,
+    sourceRootId: input.sourceRootId ?? null,
+    sourceProjectId: input.sourceProjectId ?? null,
+    sourceRootPath: sourceRoot,
+    sourceRelativePath: normalized.relative,
+  };
 }
 
 function normalizeNewTarget(root, targetInput) {
@@ -296,11 +312,22 @@ export class Derived {
     if (!stateDir) throw new Error('Derived requires a stateDir');
     this.stateDir = path.resolve(stateDir);
     this._ledger = null;
+    this._projectContext = null;
   }
 
   get ledger() {
     if (!this._ledger) this._ledger = new Ledger(this.stateDir);
     return this._ledger;
+  }
+
+  get projectContext() {
+    if (!this._projectContext) {
+      this._projectContext = new ProjectContextRepository({
+        db: this.ledger.db,
+        transaction: (callback) => this.ledger.transaction(callback),
+      });
+    }
+    return this._projectContext;
   }
 
   recommend({ root: rootInput, inputs, role, filename, projectId = null, routeOverride = null }) {
@@ -349,6 +376,7 @@ export class Derived {
     intakeContext = null,
     caller = {},
     runId: requestedRunId = null,
+    trustedInputs = null,
   }) {
     const root = normalizeRoot(rootInput);
     if (isPathInside(root, this.stateDir)) {
@@ -372,6 +400,7 @@ export class Derived {
       intakeContext,
       caller,
       requestedRunId,
+      trustedInputs,
     }));
     if (candidateFile) {
       new RuntimeStorage({ stateDir: this.stateDir, ledger: this.ledger })
@@ -398,6 +427,7 @@ export class Derived {
     intakeContext,
     caller,
     requestedRunId,
+    trustedInputs,
   }) {
     if (!Array.isArray(inputs) || (inputs.length === 0 && !allowNoInputs)) {
       throw new Error('Derived prepare requires at least one input path.');
@@ -415,8 +445,24 @@ export class Derived {
     }
     const normalizedInputs = [];
     const inputPaths = new Set();
-    for (const input of inputs) {
-      const normalized = normalizeInput(root, input);
+    for (const input of trustedInputs ?? inputs) {
+      const normalized = trustedInputs
+        ? normalizeTrustedInput(root, input)
+        : normalizeInput(root, input);
+      if (trustedInputs && normalized.sourceRootId) {
+        const governedRoot = this.projectContext.getRoot(normalized.sourceRootId).root;
+        if (path.resolve(governedRoot.current_path) !== path.resolve(normalized.sourceRootPath)
+            || governedRoot.governance_status !== 'adopted') {
+          throw new Error(`Trusted Derived input Root is not the active adopted Root: ${normalized.sourceRootId}`);
+        }
+        const location = this.projectContext.getActiveLocation(normalized.sourceProjectId);
+        if (!location
+            || location.root_id !== normalized.sourceRootId
+            || !(normalized.sourceRelativePath === location.relative_path
+              || normalized.sourceRelativePath.startsWith(`${location.relative_path}/`))) {
+          throw new Error(`Trusted Derived input is outside its active source Project: ${normalized.relative}`);
+        }
+      }
       if (normalized.relative === normalizedTarget.relative) {
         throw new Error('Derived target cannot also be an input.');
       }
@@ -454,6 +500,10 @@ export class Derived {
     }
     const capturedInputs = normalizedInputs.map((input) => ({
       path: input.relative,
+      sourceRootId: input.sourceRootId ?? null,
+      sourceProjectId: input.sourceProjectId ?? null,
+      sourceRootPath: input.sourceRootPath ?? null,
+      sourceRelativePath: input.sourceRelativePath ?? null,
       ...captureBlob(input.absolute, this.stateDir),
     }));
     const explicitIntakePlacement = intakeContext?.route_source === 'agent_explicit_target'
@@ -608,6 +658,13 @@ export class Derived {
       allowNoInputs: original.inputs.length === 0,
       intakeContext: original.placement.policy?.intake ?? null,
       caller: original.run.caller,
+      trustedInputs: original.inputs.map((input) => ({
+        path: input.path,
+        sourceRootId: input.source_root_id,
+        sourceProjectId: input.source_project_id,
+        sourceRootPath: input.source_root_path,
+        sourceRelativePath: input.source_relative_path,
+      })),
     });
     this.ledger.markDerivedRevised(runId, revised.run_id, reason, timestamp());
     return revised;
@@ -649,7 +706,9 @@ export class Derived {
     validateMaterial(detail.candidate, 'Candidate');
     for (const input of detail.inputs) {
       validateMaterial(input, `Input ${input.path}`);
-      const absoluteInput = path.resolve(detail.run.root_path, ...input.path.split('/'));
+      const inputRoot = input.source_root_path ?? detail.run.root_path;
+      const inputPath = input.source_relative_path ?? input.path;
+      const absoluteInput = path.resolve(inputRoot, ...inputPath.split('/'));
       const observed = currentHash(absoluteInput);
       if (observed !== input.content_hash) {
         this.ledger.markDerivedStale(runId, {
@@ -789,5 +848,6 @@ export class Derived {
   dispose() {
     if (this._ledger) this._ledger.close();
     this._ledger = null;
+    this._projectContext = null;
   }
 }

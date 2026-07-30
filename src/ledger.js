@@ -3,6 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { RISK_RULE_VERSION_ID } from './risk.js';
+import {
+  applyProjectContextMigration,
+  PROJECT_CONTEXT_SCHEMA_VERSION,
+} from './storage/migrations/v19-project-context.js';
 
 const RULE_VERSION_ID = 'RULE-TRACKED-DIRECT-1';
 const BOOTSTRAP_RULE_VERSION_ID = 'RULE-BOOTSTRAP-2';
@@ -11,7 +15,7 @@ const ORGANIZATION_PLAN_RULE_VERSION_ID = 'RULE-EVOLUTION-PLAN-1';
 const TASK_RULE_VERSION_ID = 'RULE-TASK-CONTRACT-1';
 export const TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID = 'RULE-TASK-SCOPED-EXPLICIT-1';
 const PORTFOLIO_RULE_VERSION_ID = 'RULE-PORTFOLIO-1';
-export const LATEST_SCHEMA_VERSION = 18;
+export const LATEST_SCHEMA_VERSION = PROJECT_CONTEXT_SCHEMA_VERSION;
 
 function json(value) {
   return JSON.stringify(value);
@@ -666,6 +670,7 @@ export class Ledger {
       insertMigration.run(16, 'crash_resumable_task_fulfillment_claims', appliedAt);
       insertMigration.run(17, 'multi_root_portfolio_inventory_review_and_plan', appliedAt);
       insertMigration.run(18, 'scoped_effective_preference_rules', appliedAt);
+      applyProjectContextMigration(this.db, appliedAt);
       this.db.exec(`PRAGMA user_version = ${LATEST_SCHEMA_VERSION};`);
     });
   }
@@ -1817,6 +1822,9 @@ export class Ledger {
     environmentRuleVersionId,
     inputs,
     caller = {},
+    candidateSetId = null,
+    sourceSetId = null,
+    writeRootId = null,
     startedAt,
   }) {
     this.transaction(() => {
@@ -1865,8 +1873,9 @@ export class Ledger {
       this.db.prepare(`
         INSERT INTO task_contracts(
           run_id, contract_id, project_id, project_path, environment_rule_version_id,
-          contract_hash, request_json, contract_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          contract_hash, request_json, contract_json,
+          candidate_set_id, source_set_id, write_root_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         runId,
         contractId,
@@ -1876,6 +1885,9 @@ export class Ledger {
         contractHash,
         json(request),
         json(contract),
+        candidateSetId,
+        sourceSetId,
+        writeRootId,
       );
 
       const findArtifact = this.db.prepare(`
@@ -1901,26 +1913,29 @@ export class Ledger {
         INSERT INTO task_inputs(
           run_id, ordinal, path, artifact_id, material_id, prepared_hash, byte_size,
           selected, selection_reason, series_id, temporal_mode, coverage_start,
-          coverage_end, required, priority
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          coverage_end, required, priority, source_root_id, source_project_id,
+          source_root_path, source_relative_path, catalog_entry_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const insertObservation = this.db.prepare(`
         INSERT INTO observations(id, run_id, kind, subject_artifact_id, payload_json, created_at)
         VALUES (?, ?, 'task_input_observed', ?, ?, ?)
       `);
       for (const input of inputs) {
+        const inputRoot = input.source_root_path ?? root;
+        const inputPath = input.source_relative_path ?? input.path;
         let artifactId = null;
         let materialId = null;
         if (input.selected) {
-          let artifact = findArtifact.get(root, input.path);
+          let artifact = findArtifact.get(inputRoot, inputPath);
           if (!artifact) {
             artifact = { id: `ART-${crypto.randomUUID()}` };
             insertArtifact.run(
               artifact.id,
               runId,
-              null,
-              input.path,
-              root,
+              input.source_project_id ?? null,
+              inputPath,
+              inputRoot,
               startedAt,
               startedAt,
             );
@@ -1956,6 +1971,11 @@ export class Ledger {
           input.coverage?.end ?? null,
           input.required ? 1 : 0,
           input.priority,
+          input.source_root_id ?? null,
+          input.source_project_id ?? null,
+          input.source_root_path ?? null,
+          input.source_relative_path ?? null,
+          input.catalog_entry_id ?? null,
         );
         insertObservation.run(
           `OBS-${crypto.randomUUID()}`,
@@ -1963,6 +1983,9 @@ export class Ledger {
           artifactId,
           json({
             path: input.path,
+            source_root_id: input.source_root_id ?? null,
+            source_project_id: input.source_project_id ?? null,
+            source_relative_path: input.source_relative_path ?? null,
             content_hash: input.content_hash,
             byte_size: input.byte_size,
             selected: input.selected,
@@ -2061,7 +2084,9 @@ export class Ledger {
     const inputs = this.db.prepare(`
       SELECT ordinal, path, artifact_id, material_id, prepared_hash AS content_hash,
              byte_size, selected, selection_reason, series_id AS series,
-             temporal_mode, coverage_start, coverage_end, required, priority
+             temporal_mode, coverage_start, coverage_end, required, priority,
+             source_root_id, source_project_id, source_root_path,
+             source_relative_path, catalog_entry_id
       FROM task_inputs WHERE run_id = ? ORDER BY ordinal
     `).all(runId).map((input) => ({
       ...input,
@@ -2144,6 +2169,9 @@ export class Ledger {
       project_id: row.project_id,
       project_path: row.project_path,
       environment_rule_version_id: row.environment_rule_version_id,
+      candidate_set_id: row.candidate_set_id,
+      source_set_id: row.source_set_id,
+      write_root_id: row.write_root_id,
       request: parseJson(row.request_json, {}),
       contract: parseJson(row.contract_json, {}),
       inputs,
@@ -2564,8 +2592,9 @@ export class Ledger {
       `);
       const insertInput = this.db.prepare(`
         INSERT INTO derived_inputs(
-          run_id, ordinal, path, artifact_id, material_id, prepared_hash
-        ) VALUES (?, ?, ?, ?, ?, ?)
+          run_id, ordinal, path, artifact_id, material_id, prepared_hash,
+          source_root_id, source_project_id, source_root_path, source_relative_path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const insertObservation = this.db.prepare(`
         INSERT INTO observations(id, run_id, kind, subject_artifact_id, payload_json, created_at)
@@ -2573,10 +2602,12 @@ export class Ledger {
       `);
       const inputRecords = [];
       inputs.forEach((input, ordinal) => {
-        let artifact = findArtifact.get(root, input.path);
+        const inputRoot = input.sourceRootPath ?? root;
+        const inputPath = input.sourceRelativePath ?? input.path;
+        let artifact = findArtifact.get(inputRoot, inputPath);
         if (!artifact) {
           artifact = { id: `ART-${crypto.randomUUID()}` };
-          insertArtifact.run(artifact.id, runId, input.path, root, startedAt, startedAt);
+          insertArtifact.run(artifact.id, runId, inputPath, inputRoot, startedAt, startedAt);
         }
         let material = findMaterial.get(artifact.id, input.contentHash);
         if (!material) {
@@ -2590,12 +2621,30 @@ export class Ledger {
             startedAt,
           );
         }
-        insertInput.run(runId, ordinal, input.path, artifact.id, material.id, input.contentHash);
+        insertInput.run(
+          runId,
+          ordinal,
+          input.path,
+          artifact.id,
+          material.id,
+          input.contentHash,
+          input.sourceRootId ?? null,
+          input.sourceProjectId ?? null,
+          input.sourceRootPath ?? null,
+          input.sourceRelativePath ?? null,
+        );
         insertObservation.run(
           `OBS-${crypto.randomUUID()}`,
           runId,
           artifact.id,
-          json({ path: input.path, content_hash: input.contentHash, material_id: material.id }),
+          json({
+            path: input.path,
+            source_root_id: input.sourceRootId ?? null,
+            source_project_id: input.sourceProjectId ?? null,
+            source_relative_path: input.sourceRelativePath ?? null,
+            content_hash: input.contentHash,
+            material_id: material.id,
+          }),
           startedAt,
         );
         inputRecords.push({ path: input.path, artifact_id: artifact.id, material_id: material.id });
@@ -2706,7 +2755,8 @@ export class Ledger {
     const inputs = this.db.prepare(`
       SELECT di.ordinal, di.path, di.artifact_id, di.material_id,
              di.prepared_hash AS content_hash, m.byte_size, m.blob_path,
-             a.role AS artifact_role
+             a.role AS artifact_role, di.source_root_id, di.source_project_id,
+             di.source_root_path, di.source_relative_path
       FROM derived_inputs di
       JOIN materials m ON m.id = di.material_id
       JOIN artifacts a ON a.id = di.artifact_id

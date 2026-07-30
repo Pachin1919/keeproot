@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { Catalog } from './catalog.js';
 import { Derived } from './derived.js';
 import { Guarded } from './guarded.js';
 import { Evolution } from './evolution.js';
@@ -8,14 +9,18 @@ import { Ledger, TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID } from './ledger.js';
 import { isPathInside, normalizeRoot, toPortablePath } from './paths.js';
 import { PreferenceRules } from './preference-rules.js';
 import { getArtifactRole } from './profiles.js';
+import { Registry } from './registry.js';
 import { captureBlob, sha256File } from './snapshots.js';
 import { withStateLock } from './state-lock.js';
+import { TaskContextRepository } from './storage/repositories/task-context-repository.js';
 
 const MAX_INPUTS = 50;
 const MAX_REQUEST_BYTES = 256 * 1024;
 const MAX_COMPARE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_FILES = 12;
 const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
+const MAX_CONTEXT_LINKS = 20;
+const MAX_CONTEXT_CANDIDATES = 50;
 const ACTIONS = new Set(['auto', 'create', 'append', 'delta', 'new_version', 'supersede', 'delete', 'archive']);
 const DATA_CLASSES = new Set(['generated_output', 'temporal_snapshot', 'append_only_data', 'human_writing']);
 export const DIRECT_TEXT_EXTENSIONS = new Set([
@@ -407,6 +412,9 @@ export class TaskContract {
     this._guarded = null;
     this._evolution = null;
     this._rules = null;
+    this._registry = null;
+    this._catalog = null;
+    this._taskContext = null;
   }
 
   get ledger() {
@@ -432,6 +440,234 @@ export class TaskContract {
   get rules() {
     if (!this._rules) this._rules = new PreferenceRules({ stateDir: this.stateDir, ledger: this.ledger });
     return this._rules;
+  }
+
+  get registry() {
+    if (!this._registry) this._registry = new Registry({ stateDir: this.stateDir });
+    return this._registry;
+  }
+
+  get catalog() {
+    if (!this._catalog) this._catalog = new Catalog({
+      stateDir: this.stateDir,
+      registry: this.registry,
+    });
+    return this._catalog;
+  }
+
+  get taskContext() {
+    if (!this._taskContext) {
+      this._taskContext = new TaskContextRepository({
+        db: this.ledger.db,
+        transaction: (callback) => this.ledger.transaction(callback),
+      });
+    }
+    return this._taskContext;
+  }
+
+  discoverContext({
+    projectId,
+    purpose,
+    terms = [],
+    caller = {},
+  }) {
+    if (typeof projectId !== 'string' || !projectId.trim()) {
+      throw new Error('Cross-Project context discovery requires a target Project ID.');
+    }
+    if (typeof purpose !== 'string' || !purpose.trim()) {
+      throw new Error('Cross-Project context discovery requires a purpose.');
+    }
+    if (!Array.isArray(terms) || terms.length > 12) {
+      throw new Error('Cross-Project context discovery accepts at most 12 terms.');
+    }
+    const normalizedTerms = [...new Set(
+      terms.map((item) => String(item).trim().normalize('NFC')).filter(Boolean),
+    )];
+    const links = this.registry.contextLinks(projectId)
+      .filter((item) => item.purpose === purpose.trim().toLowerCase().replace(/[\s-]+/gu, '_'));
+    if (!links.length) {
+      throw new Error(`No active Context Link matches Project ${projectId} and purpose ${purpose}.`);
+    }
+    if (links.length > MAX_CONTEXT_LINKS) {
+      throw new Error(`Cross-Project context discovery accepts at most ${MAX_CONTEXT_LINKS} active links per purpose.`);
+    }
+    const candidates = [];
+    const seen = new Set();
+    const generations = [];
+    for (const link of links) {
+      const generation = this.catalog.update({
+        projectId: link.source_project_id,
+        caller,
+      });
+      generations.push(generation);
+      const result = this.catalog.search({
+        projectId: link.source_project_id,
+        terms: normalizedTerms,
+        extensions: link.filters.extensions,
+        maxCandidates: link.filters.max_candidates,
+      });
+      for (const item of result.candidates) {
+        if (seen.has(item.entry_id)) continue;
+        seen.add(item.entry_id);
+        candidates.push({
+          ...item,
+          context_link_id: link.link_id,
+          context_purpose: link.purpose,
+        });
+      }
+    }
+    candidates.sort((left, right) => (
+      (left.score ?? Number.MAX_SAFE_INTEGER) - (right.score ?? Number.MAX_SAFE_INTEGER)
+      || right.modified_at.localeCompare(left.modified_at)
+      || left.relative_path.localeCompare(right.relative_path)
+    ));
+    const boundedCandidates = candidates.slice(0, MAX_CONTEXT_CANDIDATES);
+    const createdAt = timestamp();
+    const candidateSet = this.taskContext.createCandidateSet({
+      targetProjectId: projectId,
+      purpose: links[0].purpose,
+      terms: normalizedTerms,
+      contextLinks: links,
+      candidates: boundedCandidates,
+      createdAt,
+    });
+    return {
+      schema: 'atlas-context-candidate-set.v1',
+      status: candidates.length ? 'ready' : 'empty',
+      candidate_set_id: candidateSet.candidate_set_id,
+      target_project_id: projectId,
+      purpose: candidateSet.purpose,
+      context_links: links,
+      catalog_generations: generations.map((item) => ({
+        generation_id: item.generation_id,
+        project_id: item.project_id,
+        root_id: item.root_id,
+        changed_files: item.changed_files,
+        reused_files: item.reused_files,
+      })),
+      candidates: candidateSet.candidates.map((item) => ({
+        entry_id: item.entry_id,
+        context_link_id: item.context_link_id,
+        project_id: item.project_id,
+        root_id: item.root_id,
+        relative_path: item.relative_path,
+        project_relative_path: item.project_relative_path,
+        extension: item.extension,
+        byte_size: item.byte_size,
+        modified_at: item.modified_at,
+        content_hash: item.content_hash,
+        title: item.title,
+        headings: item.headings,
+        tags: item.tags,
+        score: item.score,
+        snippet: item.snippet,
+      })),
+      candidate_limit_excluded: Math.max(0, candidates.length - boundedCandidates.length),
+      content_files_read: generations.reduce((sum, item) => sum + item.content_files_read, 0),
+      source_changes: [],
+    };
+  }
+
+  prepareContext({
+    candidateSetId,
+    selectedEntryIds,
+    request,
+    caller = {},
+  }) {
+    if (!request || typeof request !== 'object') throw new Error('Cross-Project Task request is required.');
+    if (!Array.isArray(selectedEntryIds)) throw new Error('selectedEntryIds must be an array.');
+    const targetProject = this.registry.show(request.project_id);
+    if (!targetProject.location) {
+      throw new Error(`Target Project has no active Workspace Root location: ${request.project_id}`);
+    }
+    const candidateSet = this.taskContext.getCandidateSet(candidateSetId);
+    if (candidateSet.target_project_id !== request.project_id) {
+      throw new Error('Task Project does not match the Context Candidate Set target Project.');
+    }
+    const selectedIds = [...new Set(selectedEntryIds)];
+    if (!selectedIds.length) throw new Error('Source Set requires at least one selected Catalog entry.');
+    const candidatesById = new Map(candidateSet.candidates.map((item) => [item.entry_id, item]));
+    const activeContextLinkIds = new Set(
+      this.registry.contextLinks(request.project_id).map((item) => item.link_id),
+    );
+    for (const entryId of selectedIds) {
+      const item = candidatesById.get(entryId);
+      if (!item) throw new Error(`Catalog entry is not in the Candidate Set: ${entryId}`);
+      if (!activeContextLinkIds.has(item.context_link_id)) {
+        throw stateConflict(`Candidate Set Context Link is no longer active: ${item.context_link_id}`);
+      }
+      if (item.catalog_status !== 'active' || item.catalog_current_hash !== item.content_hash) {
+        throw stateConflict(`Candidate Set source changed after discovery: ${entryId}`);
+      }
+      const sourceRoot = this.registry.showRoot(item.root_id).root;
+      const normalized = normalizeExistingFile(
+        sourceRoot.current_path,
+        item.relative_path,
+        'Candidate Set input',
+      );
+      const observedHash = sha256File(normalized.absolute);
+      if (observedHash !== item.content_hash) {
+        this.catalog.invalidate(entryId);
+        throw stateConflict(`Candidate Set source changed after discovery: ${item.relative_path}`);
+      }
+    }
+    const sourceSet = this.taskContext.createSourceSet({
+      candidateSetId,
+      targetProjectId: request.project_id,
+      selectedEntryIds: selectedIds,
+      createdAt: timestamp(),
+    });
+    const trustedInputs = sourceSet.items.map((item, ordinal) => {
+      const normalized = normalizeExistingFile(
+        item.source_root_path,
+        item.source_relative_path,
+        'Source Set input',
+      );
+      const observedHash = sha256File(normalized.absolute);
+      if (observedHash !== item.content_hash) {
+        throw stateConflict(`Source Set input changed after Catalog discovery: ${item.source_relative_path}`);
+      }
+      return {
+        ordinal,
+        path: `${item.source_root_id}:${item.source_relative_path}`,
+        absolute: normalized.absolute,
+        stat: normalized.stat,
+        content_hash: observedHash,
+        byte_size: normalized.stat.size,
+        series: null,
+        temporal_mode: null,
+        coverage: null,
+        required: true,
+        priority: 100,
+        source_root_id: item.source_root_id,
+        source_project_id: item.source_project_id,
+        source_root_path: item.source_root_path,
+        source_relative_path: item.source_relative_path,
+        catalog_entry_id: item.catalog_entry_id,
+      };
+    });
+    return this.prepare({
+      root: targetProject.location.root_path,
+      request: {
+        ...request,
+        inputs: trustedInputs.map((item) => ({
+          path: item.path,
+          required: true,
+          priority: item.priority,
+        })),
+      },
+      caller,
+      trustedInputs,
+      sourceSet,
+    });
+  }
+
+  showContextCandidates(candidateSetId) {
+    return this.taskContext.getCandidateSet(candidateSetId);
+  }
+
+  showSourceSet(sourceSetId) {
+    return this.taskContext.getSourceSet(sourceSetId);
   }
 
   discover({ root: rootInput, projectId, roles = [], extensions = [], modifiedAfter = null, maxCandidates = 12 }) {
@@ -523,7 +759,13 @@ export class TaskContract {
     };
   }
 
-  prepare({ root: rootInput, request: rawRequest, caller = {} }) {
+  prepare({
+    root: rootInput,
+    request: rawRequest,
+    caller = {},
+    trustedInputs = null,
+    sourceSet = null,
+  }) {
     const root = normalizeRoot(rootInput);
     if (isPathInside(root, this.stateDir)) throw new Error(`Atlas state directory must be outside the Task root: ${this.stateDir}`);
     const request = normalizedRequest(rawRequest);
@@ -557,7 +799,7 @@ export class TaskContract {
       }
     }
     const seen = new Set();
-    const inputs = combinedInputRequests.map((input, ordinal) => {
+    const inputs = trustedInputs ?? combinedInputRequests.map((input, ordinal) => {
       const normalized = normalizeExistingFile(root, input.path, 'Task input');
       if (seen.has(normalized.path)) throw new Error(`Task input is duplicated: ${normalized.path}`);
       seen.add(normalized.path);
@@ -634,6 +876,13 @@ export class TaskContract {
       ordinal: item.ordinal, path: item.path, content_hash: item.content_hash,
       byte_size: item.byte_size, series: item.series, temporal_mode: item.temporal_mode,
       coverage: item.coverage, required: item.required, priority: item.priority,
+      ...(item.source_root_id ? {
+        source_root_id: item.source_root_id,
+        source_project_id: item.source_project_id,
+        source_root_path: item.source_root_path,
+        source_relative_path: item.source_relative_path,
+        catalog_entry_id: item.catalog_entry_id,
+      } : {}),
       ...(item.reason ? { reason: item.reason } : {}),
       ...(item.budget_reason ? { budget_reason: item.budget_reason } : {}),
     });
@@ -654,6 +903,10 @@ export class TaskContract {
       write,
       boundaries: {
         root,
+        write_root_id: sourceSet ? this.registry.show(project.id).location.root_id : null,
+        read_root_ids: sourceSet
+          ? [...new Set(inputs.map((item) => item.source_root_id))].sort()
+          : [],
         project_id: project.id,
         project_path: project.current_path,
         environment_policy_mode: environmentPolicyMode,
@@ -665,6 +918,10 @@ export class TaskContract {
         formal_target: write.target,
         allowed_write_paths: write.executor === 'none' ? [] : [write.target],
       },
+      ...(sourceSet ? {
+        candidate_set_id: sourceSet.candidate_set_id,
+        source_set_id: sourceSet.source_set_id,
+      } : {}),
       registration: {
         required: write.executor !== 'none',
         method: write.executor === 'guarded_update' ? 'task_complete_after_guarded' : 'task_fulfill_or_complete',
@@ -696,6 +953,9 @@ export class TaskContract {
       this.ledger.createTaskContract({
         runId, contractId, root, request, contract, contractHash, project,
         environmentRuleVersionId, inputs: capturedInputs, caller,
+        candidateSetId: sourceSet?.candidate_set_id ?? null,
+        sourceSetId: sourceSet?.source_set_id ?? null,
+        writeRootId: contract.boundaries.write_root_id,
         startedAt: timestamp(),
       });
       result = publicContract(runId, contract);
@@ -740,20 +1000,62 @@ export class TaskContract {
     if (!stale && (project.status !== 'active' || project.current_path !== detail.project_path)) {
       stale = { reason: 'project_path_changed' };
     }
+    if (!stale && detail.write_root_id) {
+      const targetLocation = this.registry.show(detail.project_id).location;
+      if (!targetLocation
+          || targetLocation.root_id !== detail.write_root_id
+          || path.resolve(targetLocation.root_path) !== path.resolve(detail.run.root_path)) {
+        stale = { reason: 'target_root_changed' };
+      }
+    }
+    if (!stale && detail.candidate_set_id) {
+      const candidateSet = this.taskContext.getCandidateSet(detail.candidate_set_id);
+      const candidateLinks = new Map(
+        candidateSet.candidates.map((item) => [item.entry_id, item.context_link_id]),
+      );
+      const activeLinkIds = new Set(
+        this.registry.contextLinks(detail.project_id).map((item) => item.link_id),
+      );
+      const revokedInput = detail.inputs
+        .filter((item) => item.selected && item.catalog_entry_id)
+        .find((item) => !activeLinkIds.has(candidateLinks.get(item.catalog_entry_id)));
+      if (revokedInput) {
+        stale = {
+          reason: 'context_link_changed',
+          path: revokedInput.path,
+          context_link_id: candidateLinks.get(revokedInput.catalog_entry_id) ?? null,
+        };
+      }
+    }
     if (!stale && !allowDerivedTarget && detail.contract.write.executor === 'derived_create'
         && fs.existsSync(path.resolve(detail.run.root_path, ...detail.contract.write.target.split('/')))) {
       stale = { reason: 'target_claimed', path: detail.contract.write.target };
     }
     if (!stale) {
       for (const input of detail.inputs.filter((item) => item.selected)) {
-        const absolute = path.resolve(detail.run.root_path, ...input.path.split('/'));
+        const inputRoot = input.source_root_path ?? detail.run.root_path;
+        const inputPath = input.source_relative_path ?? input.path;
+        if (input.source_root_id) {
+          const sourceLocation = this.registry.show(input.source_project_id).location;
+          if (!sourceLocation
+              || sourceLocation.root_id !== input.source_root_id
+              || !(inputPath === sourceLocation.relative_path
+                || inputPath.startsWith(`${sourceLocation.relative_path}/`))) {
+            stale = {
+              reason: 'source_project_location_changed',
+              path: input.path,
+            };
+            break;
+          }
+        }
+        const absolute = path.resolve(inputRoot, ...inputPath.split('/'));
         let observed = null;
         if (fs.existsSync(absolute)) {
           const stat = fs.lstatSync(absolute);
           if (stat.isFile() && !stat.isSymbolicLink()) {
             try {
               const real = fs.realpathSync.native(absolute);
-              observed = isPathInside(detail.run.root_path, real) ? sha256File(real) : null;
+              observed = isPathInside(inputRoot, real) ? sha256File(real) : null;
             } catch {
               observed = null;
             }
@@ -769,6 +1071,12 @@ export class TaskContract {
       this.ledger.markTaskStale(detail.run.id, stale, timestamp());
       if (stale.reason === 'effective_rule_context_changed') {
         throw stateConflict('Task Contract is stale because the effective rule context changed.');
+      }
+      if (stale.reason === 'context_link_changed') {
+        throw stateConflict('Task Contract is stale because its Context Link changed.');
+      }
+      if (stale.reason === 'target_root_changed') {
+        throw stateConflict('Task Contract is stale because its target Workspace Root changed.');
       }
       throw stateConflict(`Task Contract is stale because ${stale.path ?? stale.reason} changed.`);
     }
@@ -795,6 +1103,13 @@ export class TaskContract {
             const prepared = this.derived.prepare({
               root: detail.run.root_path,
               inputs: detail.inputs.filter((input) => input.selected).map((input) => input.path),
+              trustedInputs: detail.inputs.filter((input) => input.selected).map((input) => ({
+                path: input.path,
+                sourceRootId: input.source_root_id,
+                sourceProjectId: input.source_project_id,
+                sourceRootPath: input.source_root_path,
+                sourceRelativePath: input.source_relative_path,
+              })),
               target: contract.write.target,
               candidateFile: candidate,
               projectId: detail.project_id,
@@ -961,10 +1276,15 @@ export class TaskContract {
     if (this._derived) this._derived.dispose();
     if (this._guarded) this._guarded.dispose();
     if (this._evolution) this._evolution.dispose();
+    if (this._catalog) this._catalog.dispose();
+    if (this._registry) this._registry.dispose();
     if (this._ledger) this._ledger.close();
     this._derived = null;
     this._guarded = null;
     this._evolution = null;
+    this._catalog = null;
+    this._registry = null;
+    this._taskContext = null;
     this._ledger = null;
   }
 }

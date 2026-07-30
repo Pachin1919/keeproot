@@ -13,6 +13,7 @@ import {
 } from '../src/analytics-evaluation.js';
 import { Bootstrap } from '../src/bootstrap.js';
 import { BrowserCapture } from '../src/browser-capture.js';
+import { Catalog } from '../src/catalog.js';
 import { exportAnalytics } from '../src/analytics-export.js';
 import { Derived } from '../src/derived.js';
 import { Evolution } from '../src/evolution.js';
@@ -72,7 +73,7 @@ function parseCallerFlag(result, args, index) {
 }
 
 function usage() {
-  return `Atlas 0.1 — local-first file governance foundation
+  return `Atlas ${ATLAS_VERSION} — local-first file governance foundation
 
 Usage:
   atlas version [--json]
@@ -117,6 +118,12 @@ Usage:
   atlas portfolio review <inventory_id> --root-id <root_id> --type <root_type>
                          --relation <relation> --reason <text>
   atlas portfolio plan <inventory_id> --target <path>
+  atlas root adopt --path <path> --type <root_type>
+                   --content-policy <structure_only|bounded_content>
+  atlas root list | show <root_id>
+  atlas catalog update --project <project_id> [agent options]
+  atlas catalog search --project <project_id> [--term <text> ...]
+                       [--extension <.ext> ...] [--max-candidates <1..50>]
   atlas intake prepare --root <path> --candidate-file <path> --origin <origin>
                        [--kind <kind>] [--filename <name>] [--project <project_id>]
                        [--target <new_path>] [--input <related_path> ...] [--intent <text>]
@@ -131,6 +138,13 @@ Usage:
   atlas task prepare --root <path> --request-file <json> [agent options]
   atlas task discover --root <path> --project <project_id> [--role <role> ...]
                       [--extension <.ext> ...] [--modified-after <iso>] [--max-candidates <1..50>]
+  atlas task discover-context --project <project_id> --purpose <identifier>
+                              [--term <text> ...] [agent options]
+  atlas task prepare-context --candidate-set <candidate_set_id>
+                             --select <catalog_entry_id> [--select <catalog_entry_id> ...]
+                             --request-file <json> [agent options]
+  atlas task context-candidates <candidate_set_id>
+  atlas task source-set <source_set_id>
   atlas task show <task_id>
   atlas task fulfill <task_id> --candidate-file <path> [--reason <task_authorization>]
   atlas task archive-plan <task_id>
@@ -156,6 +170,12 @@ Usage:
   atlas project create --name <name> --path <relative_path> [--alias <name> ...]
   atlas project list | show <project_id> | evolve <project_id> [--name <name>] [--alias <name>] [--status <status>]
   atlas project move <project_id> --path <relative_path> [--name <name>]
+  atlas project attach-root <project_id> --root <root_id> [--path <relative_path>] --reason <text>
+  atlas project link-context <target_project_id> --source <source_project_id>
+                             --purpose <identifier> [--extension <.ext> ...]
+                             [--max-candidates <1..50>] --reason <text>
+  atlas project context-links <project_id> [--history]
+  atlas project unlink-context <link_id> --reason <text>
   atlas guarded prepare --root <path> --target <path> --candidate-file <path> [--intent <text>]
   atlas guarded preview <run_id> [--json]
   atlas guarded approve | reject <run_id> [--reason <text>]
@@ -613,6 +633,85 @@ function parseRisk(args) {
   return options;
 }
 
+function handleRoot(registry, args) {
+  const [action, ...rest] = args;
+  if (action === 'list') {
+    if (rest.length) throw new Error('root list does not accept arguments');
+    const roots = registry.listRoots();
+    emit('root.list', roots, () => {
+      if (!roots.length) console.log('No adopted Workspace Roots.');
+      else {
+        console.log('ROOT_ID\tTYPE\tCONTENT_POLICY\tPATH');
+        for (const root of roots) {
+          console.log(`${root.id}\t${root.root_type}\t${root.content_policy}\t${root.current_path}`);
+        }
+      }
+    });
+    return;
+  }
+  if (action === 'show') {
+    if (rest.length !== 1) throw new Error('root show requires one root_id');
+    const detail = registry.showRoot(rest[0]);
+    emit('root.show', detail, () => console.log(JSON.stringify(detail, null, 2)));
+    return;
+  }
+  if (action === 'adopt') {
+    const options = {};
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--path') options.rootPath = rest[++index];
+      else if (rest[index] === '--type') options.rootType = rest[++index];
+      else if (rest[index] === '--content-policy') options.contentPolicy = rest[++index];
+      else throw new Error(`Unknown root adopt argument: ${rest[index]}`);
+    }
+    if (!options.rootPath || !options.rootType || !options.contentPolicy) {
+      throw new Error('root adopt requires --path, --type, and --content-policy');
+    }
+    const receipt = registry.adoptRoot(options);
+    emit('root.adopt', receipt, () => console.log(`Adopted Workspace Root ${receipt.root_id}.`));
+    return;
+  }
+  throw new Error(`Unknown root action: ${action ?? '(missing)'}`);
+}
+
+function handleCatalog(catalog, args) {
+  const [action, ...rest] = args;
+  if (action === 'update') {
+    const options = {};
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--project') options.projectId = rest[++index];
+      else {
+        const consumed = parseCallerFlag(options, rest, index);
+        if (consumed == null) throw new Error(`Unknown catalog update argument: ${rest[index]}`);
+        index = consumed;
+      }
+    }
+    if (!options.projectId) throw new Error('catalog update requires --project');
+    const receipt = catalog.update({
+      projectId: options.projectId,
+      caller: callerFromOptions(options),
+    });
+    emit('catalog.update', receipt, () => {
+      console.log(`Cataloged ${receipt.observed_files} file(s); ${receipt.changed_files} changed; ${receipt.reused_files} reused.`);
+    });
+    return;
+  }
+  if (action === 'search') {
+    const options = { terms: [], extensions: [] };
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--project') options.projectId = rest[++index];
+      else if (rest[index] === '--term') options.terms.push(rest[++index]);
+      else if (rest[index] === '--extension') options.extensions.push(rest[++index]);
+      else if (rest[index] === '--max-candidates') options.maxCandidates = Number(rest[++index]);
+      else throw new Error(`Unknown catalog search argument: ${rest[index]}`);
+    }
+    if (!options.projectId) throw new Error('catalog search requires --project');
+    const result = catalog.search(options);
+    emit('catalog.search', result, () => console.log(JSON.stringify(result, null, 2)));
+    return;
+  }
+  throw new Error(`Unknown catalog action: ${action ?? '(missing)'}`);
+}
+
 function handleProject(registry, args) {
   const [action, ...rest] = args;
   if (action === 'list') {
@@ -633,6 +732,72 @@ function handleProject(registry, args) {
     if (rest.length !== 1) throw new Error('project show requires one project_id');
     const detail = registry.show(rest[0]);
     emit('project.show', detail, () => console.log(JSON.stringify(detail, null, 2)));
+    return;
+  }
+  if (action === 'attach-root') {
+    const projectId = rest[0];
+    if (!projectId || projectId.startsWith('--')) throw new Error('project attach-root requires a project_id');
+    const options = {};
+    for (let index = 1; index < rest.length; index += 1) {
+      if (rest[index] === '--root') options.rootId = rest[++index];
+      else if (rest[index] === '--path') options.relativePath = rest[++index];
+      else if (rest[index] === '--reason') options.reason = rest[++index];
+      else throw new Error(`Unknown project attach-root argument: ${rest[index]}`);
+    }
+    if (!options.rootId || !options.reason) {
+      throw new Error('project attach-root requires --root and --reason');
+    }
+    const receipt = registry.attachRoot(projectId, options);
+    emit('project.attach-root', receipt, () => {
+      console.log(`Attached Project ${projectId} to ${receipt.root_id}:${receipt.relative_path}.`);
+    });
+    return;
+  }
+  if (action === 'link-context') {
+    const projectId = rest[0];
+    if (!projectId || projectId.startsWith('--')) throw new Error('project link-context requires a target project_id');
+    const options = { extensions: [] };
+    for (let index = 1; index < rest.length; index += 1) {
+      if (rest[index] === '--source') options.sourceProjectId = rest[++index];
+      else if (rest[index] === '--purpose') options.purpose = rest[++index];
+      else if (rest[index] === '--extension') options.extensions.push(rest[++index]);
+      else if (rest[index] === '--max-candidates') options.maxCandidates = Number(rest[++index]);
+      else if (rest[index] === '--reason') options.reason = rest[++index];
+      else throw new Error(`Unknown project link-context argument: ${rest[index]}`);
+    }
+    if (!options.sourceProjectId || !options.purpose || !options.reason) {
+      throw new Error('project link-context requires --source, --purpose, and --reason');
+    }
+    const receipt = registry.linkContext(projectId, options);
+    emit('project.link-context', receipt, () => {
+      console.log(`Linked Project ${projectId} to context source ${receipt.source_project_id}.`);
+    });
+    return;
+  }
+  if (action === 'context-links') {
+    const projectId = rest[0];
+    if (!projectId || projectId.startsWith('--')) throw new Error('project context-links requires a project_id');
+    const history = rest.slice(1).includes('--history');
+    if (rest.slice(1).some((item) => item !== '--history')) {
+      throw new Error('project context-links accepts only --history');
+    }
+    const links = history
+      ? registry.contextLinkHistory(projectId)
+      : registry.contextLinks(projectId);
+    emit('project.context-links', links, () => console.log(JSON.stringify(links, null, 2)));
+    return;
+  }
+  if (action === 'unlink-context') {
+    const linkId = rest[0];
+    if (!linkId || linkId.startsWith('--')) throw new Error('project unlink-context requires a link_id');
+    let reason = null;
+    for (let index = 1; index < rest.length; index += 1) {
+      if (rest[index] === '--reason') reason = rest[++index];
+      else throw new Error(`Unknown project unlink-context argument: ${rest[index]}`);
+    }
+    if (!reason) throw new Error('project unlink-context requires --reason');
+    const receipt = registry.disableContextLink(linkId, { reason });
+    emit('project.unlink-context', receipt, () => console.log(`Disabled context link ${linkId}.`));
     return;
   }
   if (action === 'create') {
@@ -1281,6 +1446,74 @@ function handleStorage(storage, args) {
 
 function handleTask(task, args) {
   const [action, ...rest] = args;
+  if (action === 'discover-context') {
+    const options = { terms: [] };
+    for (let index = 0; index < rest.length; index += 1) {
+      const token = rest[index];
+      if (token === '--project') options.projectId = rest[++index];
+      else if (token === '--purpose') options.purpose = rest[++index];
+      else if (token === '--term') options.terms.push(rest[++index]);
+      else {
+        const consumed = parseCallerFlag(options, rest, index);
+        if (consumed == null) throw new Error(`Unknown task discover-context argument: ${token}`);
+        index = consumed;
+      }
+    }
+    if (!options.projectId || !options.purpose) {
+      throw new Error('task discover-context requires --project and --purpose');
+    }
+    const result = task.discoverContext({
+      projectId: options.projectId,
+      purpose: options.purpose,
+      terms: options.terms,
+      caller: callerFromOptions(options),
+    });
+    emit('task.discover-context', result, (data) => console.log(JSON.stringify(data, null, 2)));
+    return;
+  }
+  if (action === 'prepare-context') {
+    const options = { selectedEntryIds: [] };
+    for (let index = 0; index < rest.length; index += 1) {
+      const token = rest[index];
+      if (token === '--candidate-set') options.candidateSetId = rest[++index];
+      else if (token === '--select') options.selectedEntryIds.push(rest[++index]);
+      else if (token === '--request-file') options.requestFile = rest[++index];
+      else {
+        const consumed = parseCallerFlag(options, rest, index);
+        if (consumed == null) throw new Error(`Unknown task prepare-context argument: ${token}`);
+        index = consumed;
+      }
+    }
+    if (!options.candidateSetId || !options.selectedEntryIds.length || !options.requestFile) {
+      throw new Error('task prepare-context requires --candidate-set, --select, and --request-file');
+    }
+    const receipt = task.prepareContext({
+      candidateSetId: options.candidateSetId,
+      selectedEntryIds: options.selectedEntryIds,
+      request: readJsonFile(options.requestFile, 'cross-Project task request'),
+      caller: callerFromOptions(options),
+    });
+    emit('task.prepare-context', receipt, (data) => console.log(JSON.stringify(data, null, 2)));
+    return;
+  }
+  if (action === 'context-candidates') {
+    if (rest.length !== 1) throw new Error('task context-candidates requires one candidate_set_id');
+    emit(
+      'task.context-candidates',
+      task.showContextCandidates(rest[0]),
+      (data) => console.log(JSON.stringify(data, null, 2)),
+    );
+    return;
+  }
+  if (action === 'source-set') {
+    if (rest.length !== 1) throw new Error('task source-set requires one source_set_id');
+    emit(
+      'task.source-set',
+      task.showSourceSet(rest[0]),
+      (data) => console.log(JSON.stringify(data, null, 2)),
+    );
+    return;
+  }
   if (action === 'discover') {
     const options = { roles: [], extensions: [] };
     for (let index = 0; index < rest.length; index += 1) {
@@ -1522,6 +1755,7 @@ async function main() {
   const intake = new Intake({ stateDir });
   const portfolio = new Portfolio({ stateDir });
   const registry = new Registry({ stateDir });
+  const catalog = new Catalog({ stateDir, registry });
   const storage = new RuntimeStorage({ stateDir, ledger: tracker.ledger });
   const capture = new BrowserCapture({ stateDir, storage });
   const task = new TaskContract({ stateDir });
@@ -1623,6 +1857,10 @@ async function main() {
       handleCapture(capture, args);
     } else if (command === 'storage') {
       handleStorage(storage, args);
+    } else if (command === 'root') {
+      handleRoot(registry, args);
+    } else if (command === 'catalog') {
+      handleCatalog(catalog, args);
     } else if (command === 'project') {
       handleProject(registry, args);
     } else if (command === 'rule') {
@@ -1669,6 +1907,7 @@ async function main() {
     intake.dispose();
     portfolio.dispose();
     registry.dispose();
+    catalog.dispose();
     task.dispose();
     rules.dispose();
     capture.dispose();

@@ -1,4 +1,4 @@
-export const ATLAS_VERSION = '1.2.0';
+export const ATLAS_VERSION = '1.3.0';
 export const PROTOCOL_VERSION = 'atlas-cli.v1';
 
 export const CAPABILITIES = Object.freeze({
@@ -26,13 +26,22 @@ export const CAPABILITIES = Object.freeze({
       'prepare', 'preview', 'approve', 'reject', 'execute', 'rollback',
       'plan-prepare', 'plan-preview', 'plan-approve', 'plan-reject', 'plan-execute', 'plan-rollback',
     ],
-    task: ['discover', 'prepare', 'show', 'fulfill', 'archive-plan', 'complete', 'review-rule', 'rollback'],
+    task: [
+      'discover', 'prepare', 'discover-context', 'context-candidates',
+      'prepare-context', 'source-set', 'show', 'fulfill', 'archive-plan',
+      'complete', 'review-rule', 'rollback',
+    ],
     capture: ['localize', 'sample'],
     work: ['stage', 'status', 'release'],
     storage: ['status', 'plan', 'execute'],
     ledger: ['backups', 'restore'],
     analytics: ['install', 'export', 'evaluate', 'show', 'remove'],
-    registry: ['create', 'list', 'show', 'evolve', 'move', 'merge'],
+    workspace_root: ['adopt', 'list', 'show'],
+    catalog: ['update', 'search'],
+    registry: [
+      'create', 'list', 'show', 'evolve', 'move', 'merge',
+      'attach-root', 'link-context', 'context-links', 'unlink-context',
+    ],
     rules: ['list', 'show', 'active', 'history', 'context', 'propose', 'preview', 'approve', 'reject'],
     risk: ['evaluate'],
   },
@@ -43,6 +52,29 @@ export const CAPABILITIES = Object.freeze({
     'supersedes', 'delta_of', 'overlaps', 'appends_to',
   ],
   task_data_classes: ['generated_output', 'temporal_snapshot', 'append_only_data', 'human_writing'],
+  cross_project_context: {
+    status: 'callable',
+    root_identity: 'stable_root_id_with_path_history',
+    project_location: 'one_active_location_per_project',
+    context_links: 'versioned_and_reusable',
+    candidate_selection: 'local_incremental_catalog',
+    source_set: 'immutable_selected_inputs',
+    read_boundary: 'multiple_adopted_roots',
+    write_boundary: 'one_target_root',
+    multi_root_task_contract: true,
+  },
+  local_catalog: {
+    schema: 'atlas-catalog-candidates.v1',
+    indexed_extensions: ['.md', '.markdown', '.txt'],
+      search: 'sqlite_fts5_trigram_with_local_short_term_fallback',
+    incremental: true,
+    model_visible_full_body: false,
+    processor: {
+      name: 'atlas-direct-text',
+      version: '1.0.0',
+      cache_key: 'size_mtime_parser_version_with_hash_revalidation_on_selection',
+    },
+  },
   task_write_strategies: ['create', 'append', 'delta', 'new_version', 'supersede', 'archive', 'deny'],
   task_registration_records: [
     'output_artifact', 'output_material', 'input_material_lineage',
