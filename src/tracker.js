@@ -104,8 +104,8 @@ function atomicRestoreFile(targetPath, blobPath, expectedKind, expectedHash) {
 }
 
 export class RollbackConflictError extends Error {
-  constructor(conflicts) {
-    super(`Rollback stopped because ${conflicts.length} path(s) no longer match the run's end state.`);
+  constructor(conflicts, message = null) {
+    super(message ?? `Rollback stopped because ${conflicts.length} path(s) no longer match the run's end state.`);
     this.name = 'RollbackConflictError';
     this.code = 'ATLAS_ROLLBACK_CONFLICT';
     this.conflicts = conflicts;
@@ -305,7 +305,14 @@ export class Tracker {
   }
 
   rollback(runId) {
-    return withStateLock(this.stateDir, () => this.#rollback(runId));
+    return withStateLock(this.stateDir, () => {
+      try {
+        return this.#rollback(runId);
+      } catch (error) {
+        this.ledger.recordRollbackError(runId, error);
+        throw error;
+      }
+    });
   }
 
   #rollback(runId) {

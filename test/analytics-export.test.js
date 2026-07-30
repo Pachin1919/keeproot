@@ -98,6 +98,73 @@ test('analytics export publishes a versioned consistent JSONL/CSV dataset and ma
   assert.equal(repeated.content_hash, receipt.content_hash);
 });
 
+test('Tracked rollback records one explicit idempotent outcome per logical attempt', (t) => {
+  const caseRoot = path.join(tempRoot, 'analytics-recovery-outcomes');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const root = path.join(caseRoot, 'library');
+  const stateDir = path.join(caseRoot, 'state');
+  fs.mkdirSync(root, { recursive: true });
+  const target = path.join(root, 'note.md');
+  fs.writeFileSync(target, 'baseline\n', 'utf8');
+
+  const tracker = new Tracker({ stateDir });
+  t.after(() => tracker.dispose());
+
+  const completedRun = tracker.begin({
+    root,
+    allow: ['note.md'],
+    intent: 'Record one completed rollback outcome.',
+  });
+  fs.writeFileSync(target, 'first change\n', 'utf8');
+  tracker.close(completedRun.run_id);
+  tracker.rollback(completedRun.run_id);
+
+  const conflictRun = tracker.begin({
+    root,
+    allow: ['note.md'],
+    intent: 'Record one conflict-safe rollback outcome.',
+  });
+  fs.writeFileSync(target, 'second change\n', 'utf8');
+  tracker.close(conflictRun.run_id);
+  fs.writeFileSync(target, 'later legitimate change\n', 'utf8');
+  assert.throws(
+    () => tracker.rollback(conflictRun.run_id),
+    (error) => error.code === 'ATLAS_ROLLBACK_CONFLICT',
+  );
+  assert.throws(
+    () => tracker.rollback(conflictRun.run_id),
+    (error) => error.code === 'ATLAS_ROLLBACK_CONFLICT',
+  );
+
+  const source = tracker.ledger.readAnalyticsSource();
+  const outcomes = source.operationEvents
+    .filter((event) => event.event_type === 'rollback_outcome_recorded')
+    .map((event) => ({ run_id: event.run_id, ...JSON.parse(event.payload_json) }));
+  assert.deepEqual(
+    outcomes.map((item) => ({
+      run_id: item.run_id,
+      operation: item.operation,
+      outcome: item.outcome,
+      reason_code: item.reason_code,
+    })),
+    [
+      {
+        run_id: completedRun.run_id,
+        operation: 'rollback',
+        outcome: 'completed',
+        reason_code: 'restored_and_verified',
+      },
+      {
+        run_id: conflictRun.run_id,
+        operation: 'rollback',
+        outcome: 'conflict_safe_stop',
+        reason_code: 'later_file_state_conflict',
+      },
+    ],
+  );
+  assert.ok(outcomes.every((item) => /^RBK-[A-F0-9]{20}$/u.test(item.attempt_id)));
+});
+
 test('analytics export is callable through the JSON CLI protocol', () => {
   const caseRoot = path.join(tempRoot, 'analytics-export-cli');
   fs.rmSync(caseRoot, { recursive: true, force: true });

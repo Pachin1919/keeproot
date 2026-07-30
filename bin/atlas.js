@@ -135,6 +135,8 @@ Usage:
   atlas task fulfill <task_id> --candidate-file <path> [--reason <task_authorization>]
   atlas task archive-plan <task_id>
   atlas task complete <task_id> --run <derived_or_guarded_run_id>
+  atlas task review-rule <task_id> --rule-id <rule_id>
+                         --decision <accepted|corrected> --reason <text>
   atlas task rollback <task_id>
   atlas evolve prepare --root <path> --operation <create_directory|move_file|migrate_project|migrate_directory|remove_empty_directory>
                        [--source <path>] --target <path> [--project <project_id>] [--intent <text>]
@@ -1349,6 +1351,28 @@ function handleTask(task, args) {
   if (action === 'archive-plan') {
     if (rest.length !== 1) throw new Error('task archive-plan requires one task_id');
     emit('task.archive-plan', task.archivePlan(rest[0]), (data) => console.log(JSON.stringify(data, null, 2)));
+    return;
+  }
+  if (action === 'review-rule') {
+    const taskId = rest[0];
+    if (!taskId || taskId.startsWith('--')) throw new Error('task review-rule requires a task_id');
+    let ruleId = null;
+    let decision = null;
+    let reason = null;
+    for (let index = 1; index < rest.length; index += 1) {
+      if (rest[index] === '--rule-id') ruleId = rest[++index];
+      else if (rest[index] === '--decision') decision = rest[++index];
+      else if (rest[index] === '--reason') reason = rest[++index];
+      else throw new Error(`Unknown task review-rule argument: ${rest[index]}`);
+    }
+    if (!ruleId || !decision || !reason) {
+      throw new Error('task review-rule requires --rule-id, --decision, and --reason');
+    }
+    emit(
+      'task.review-rule',
+      task.reviewRule(taskId, { ruleId, decision, reason }),
+      (data) => console.log(JSON.stringify(data, null, 2)),
+    );
     return;
   }
   if (action === 'rollback') {

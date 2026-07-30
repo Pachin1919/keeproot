@@ -451,7 +451,7 @@ export class PreferenceRules {
         : missingWithoutDefault.length
           ? 'needs_agent_proposal'
           : 'advice_available';
-    const compactRules = applied.map((rule) => ({
+    const compactRule = (rule) => ({
       rule_id: rule.rule_id,
       rule_version_id: rule.rule_version_id,
       scope: rule.scope,
@@ -460,10 +460,22 @@ export class PreferenceRules {
       value: rule.value,
       summary: rule.summary,
       basis: rule.basis,
-    }));
+    });
+    const compactRules = applied.map(compactRule);
+    const compactEligibleRules = [...new Map(
+      matched
+        .filter((rule) => needs.includes(rule.kind))
+        .map((rule) => [rule.rule_id, compactRule(rule)]),
+    ).values()].sort((left, right) => (
+      left.kind.localeCompare(right.kind) || left.rule_id.localeCompare(right.rule_id)
+    ));
     const contextHash = hashJson({
       root,
       request,
+      eligible: compactEligibleRules.map((item) => ({
+        rule_id: item.rule_id,
+        rule_version_id: item.rule_version_id,
+      })),
       applied: compactRules.map((item) => ({
         rule_id: item.rule_id,
         rule_version_id: item.rule_version_id,
@@ -472,18 +484,27 @@ export class PreferenceRules {
       default_advice: defaultAdvice.map((item) => item.id),
       conflicts,
     });
-    const modelPayload = { status, applied_rules: compactRules, gaps, default_advice: defaultAdvice, conflicts };
+    const modelPayload = {
+      status,
+      eligible_rules: compactEligibleRules,
+      applied_rules: compactRules,
+      gaps,
+      default_advice: defaultAdvice,
+      conflicts,
+    };
     return {
       schema: 'atlas-effective-rule-context.v1',
       status,
       root,
       request,
       context_hash: contextHash,
+      eligible_rules: compactEligibleRules,
       applied_rules: compactRules,
       gaps,
       default_advice: defaultAdvice,
       conflicts,
       attention_budget: {
+        eligible_rules_considered: compactEligibleRules.length,
         active_rules_returned: compactRules.length,
         maximum_active_rules: 12,
         estimated_tokens: Math.ceil(Buffer.byteLength(json(modelPayload), 'utf8') / 4),

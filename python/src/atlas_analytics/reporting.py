@@ -1,16 +1,67 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from typing import Any
 
 import pandas as pd
 
 
 ANOMALY_SCHEMA = "atlas.analytics.anomaly.v1"
+OUTCOMES = ("completed", "conflict_safe_stop", "failed", "cancelled")
 
 
 def _metric_by_id(metrics: dict[str, Any], metric_id: str) -> dict[str, Any]:
     return next(item for item in metrics["metrics"] if item["metric_id"] == metric_id)
+
+
+def _latest_recovery(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    ranked = frame.copy()
+    ranked["_rank"] = ranked["outcome"].map(
+        {
+            "completed": 4,
+            "conflict_safe_stop": 3,
+            "failed": 2,
+            "cancelled": 1,
+        }
+    ).fillna(0)
+    return (
+        ranked.sort_values(
+            by=["attempt_id", "recorded_at", "_rank", "event_id"],
+            kind="stable",
+        )
+        .drop_duplicates(subset=["attempt_id"], keep="last")
+        .sort_values(by=["attempt_id"], kind="stable")
+    )
+
+
+def _latest_rule(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    return (
+        frame.sort_values(
+            by=["task_id", "evaluated_at", "recorded_at", "event_id"],
+            kind="stable",
+        )
+        .drop_duplicates(subset=["task_id"], keep="last")
+        .sort_values(by=["task_id"], kind="stable")
+    )
+
+
+def _rule_population(row: dict[str, Any]) -> tuple[str, bool]:
+    if row.get("actor") == "test" or row.get("tool") == "atlas-test":
+        return "test", False
+    if row.get("status") in {"cancelled", "aborted"}:
+        return "cancelled", False
+    if row.get("status") not in {"completed", "rolled_back"}:
+        return "incomplete", False
+    eligible = set(row.get("eligible_rule_ids") or [])
+    if not eligible:
+        return "first_scenario", False
+    applied = set(row.get("applied_rule_ids") or [])
+    return "eligible", bool(eligible.intersection(applied))
 
 
 def build_report_assets(
@@ -19,13 +70,18 @@ def build_report_assets(
     measurement_gaps: dict[str, Any],
     metrics: dict[str, Any],
 ) -> dict[str, Any]:
-    """Cross-check SQL results with Pandas and build bounded reader assets."""
+    """Cross-check all official SQL results with Pandas and build bounded assets."""
+
+    context = _metric_by_id(metrics, "context_selection_text_byte_rate")
+    recovery = _metric_by_id(metrics, "recovery_outcome_distribution")
+    rule_reuse = _metric_by_id(metrics, "rule_reuse_rate")
 
     task_frame = pd.DataFrame(facts.get("task_fact", []))
     if task_frame.empty:
         eligible = task_frame
-        pandas_numerator = 0
-        pandas_denominator = 0
+        pandas_numerator = None
+        pandas_denominator = None
+        eligible_task_ids: list[str] = []
     else:
         input_bytes = pd.to_numeric(task_frame["input_text_bytes"], errors="coerce")
         selected_bytes = pd.to_numeric(
@@ -44,18 +100,78 @@ def build_report_assets(
         eligible["selection_ratio"] = (
             eligible["selected_bytes"] / eligible["input_bytes"]
         )
-        pandas_numerator = int(eligible["selected_bytes"].sum())
-        pandas_denominator = int(eligible["input_bytes"].sum())
-
-    official = _metric_by_id(metrics, "context_selection_text_byte_rate")
+        eligible_task_ids = sorted(
+            str(item) for item in eligible["task_id"].tolist()
+        )
+        pandas_numerator = (
+            int(eligible["selected_bytes"].sum()) if len(eligible) else None
+        )
+        pandas_denominator = (
+            int(eligible["input_bytes"].sum()) if len(eligible) else None
+        )
     if (
-        pandas_numerator != official["numerator"]
-        or pandas_denominator != official["denominator"]
-        or len(eligible) != official["eligible_rows"]
+        pandas_numerator != context["numerator"]
+        or pandas_denominator != context["denominator"]
+        or eligible_task_ids != context["eligible_task_ids"]
     ):
-        raise ValueError("Pandas cross-check does not match the official SQL metric.")
+        raise ValueError("Pandas cross-check does not match the context SQL metric.")
 
-    anomalies = []
+    recovery_frame = pd.DataFrame(facts.get("recovery_fact", []))
+    latest_recovery = _latest_recovery(recovery_frame)
+    recovery_counts = (
+        {
+            outcome: int(
+                (latest_recovery["outcome"] == outcome).sum()
+            )
+            for outcome in OUTCOMES
+        }
+        if not latest_recovery.empty
+        else None
+    )
+    if recovery_counts != recovery["outcome_counts"]:
+        raise ValueError("Pandas cross-check does not match the Recovery SQL metric.")
+    if recovery_counts is not None:
+        for outcome in OUTCOMES:
+            run_ids = sorted(
+                {
+                    str(item)
+                    for item in latest_recovery.loc[
+                        latest_recovery["outcome"].eq(outcome), "run_id"
+                    ].tolist()
+                }
+            )
+            if run_ids != recovery["outcomes"][outcome]["run_ids"]:
+                raise ValueError(
+                    "Pandas cross-check does not match Recovery run membership."
+                )
+
+    rule_frame = pd.DataFrame(facts.get("rule_application_fact", []))
+    latest_rule = _latest_rule(rule_frame)
+    classified = []
+    for row in latest_rule.to_dict(orient="records"):
+        population, matched = _rule_population(row)
+        classified.append({**row, "population": population, "matched": matched})
+    pandas_denominator_ids = sorted(
+        str(item["task_id"])
+        for item in classified
+        if item["population"] == "eligible"
+    )
+    pandas_numerator_ids = sorted(
+        str(item["task_id"])
+        for item in classified
+        if item["population"] == "eligible" and item["matched"]
+    )
+    pandas_corrected_ids = sorted(
+        str(item["task_id"]) for item in classified if item.get("corrected")
+    )
+    if (
+        pandas_denominator_ids != rule_reuse["denominator_task_ids"]
+        or pandas_numerator_ids != rule_reuse["numerator_task_ids"]
+        or pandas_corrected_ids != rule_reuse["corrected_task_ids"]
+    ):
+        raise ValueError("Pandas cross-check does not match the Rule Reuse SQL metric.")
+
+    anomalies: list[dict[str, Any]] = []
     if not task_frame.empty:
         binary_frame = task_frame.copy()
         binary_frame["input_binary_bytes"] = pd.to_numeric(
@@ -95,13 +211,58 @@ def build_report_assets(
                     ),
                 }
             )
-    if not eligible.empty:
-        high_selection = eligible.loc[eligible["selection_ratio"].ge(0.9)].sort_values(
+    if not latest_recovery.empty:
+        for outcome, anomaly_type in (
+            ("conflict_safe_stop", "rollback_conflict_safe_stop"),
+            ("failed", "rollback_failed"),
+        ):
+            selected = latest_recovery.loc[
+                latest_recovery["outcome"].eq(outcome)
+            ].sort_values(by=["run_id", "attempt_id"], kind="stable")
+            for _, row in selected.iterrows():
+                if len(anomalies) >= 5:
+                    break
+                anomalies.append(
+                    {
+                        "schema": ANOMALY_SCHEMA,
+                        "anomaly_type": anomaly_type,
+                        "run_id": str(row["run_id"]),
+                        "attempt_id": str(row["attempt_id"]),
+                        "reason_code": str(row["reason_code"]),
+                        "interpretation_limit": (
+                            "A conflict-safe stop protects later work; a failed outcome needs targeted diagnosis."
+                        ),
+                    }
+                )
+    for item in classified:
+        if len(anomalies) >= 5:
+            break
+        if item.get("corrected"):
+            anomalies.append(
+                {
+                    "schema": ANOMALY_SCHEMA,
+                    "anomaly_type": "rule_application_corrected",
+                    "task_id": str(item["task_id"]),
+                    "eligible_rule_ids": sorted(
+                        item.get("eligible_rule_ids") or []
+                    ),
+                    "applied_rule_ids": sorted(
+                        item.get("applied_rule_ids") or []
+                    ),
+                    "interpretation_limit": (
+                        "A matched rule was corrected for this Task; match does not equal satisfaction."
+                    ),
+                }
+            )
+    if len(anomalies) < 5 and not eligible.empty:
+        high_selection = eligible.loc[
+            eligible["selection_ratio"].ge(0.9)
+        ].sort_values(
             by=["selection_ratio", "input_bytes", "task_id"],
             ascending=[False, False, True],
             kind="stable",
         )
-        for _, row in high_selection.head(max(0, 5 - len(anomalies))).iterrows():
+        for _, row in high_selection.head(5 - len(anomalies)).iterrows():
             anomalies.append(
                 {
                     "schema": ANOMALY_SCHEMA,
@@ -117,22 +278,39 @@ def build_report_assets(
                 }
             )
 
-    value_text = "unavailable" if official["value"] is None else f"{official['value']:.2%}"
+    context_value = (
+        "unavailable"
+        if context["value"] is None
+        else f"{context['value']:.2%}"
+    )
+    rule_value = (
+        "unavailable"
+        if rule_reuse["value"] is None
+        else f"{rule_reuse['value']:.2%}"
+    )
+    recovery_text = (
+        "unavailable"
+        if recovery["outcome_counts"] is None
+        else ", ".join(
+            f"{name}={recovery['outcome_counts'][name]}" for name in OUTCOMES
+        )
+    )
     availability = measurement_gaps["availability_counts"]
     analysis_context = "\n".join(
         [
             "# Atlas analytics interpretation context",
             "",
-            "Use the files named below as deterministic facts. Do not recount the source JSONL.",
+            "Use these bounded deterministic results. Do not recount the source JSONL.",
             "",
             f"- Quality status: {quality['status']}",
-            f"- Official metric: context_selection_text_byte_rate = {value_text}",
-            f"- Numerator / denominator: {official['numerator']} / {official['denominator']} bytes",
-            f"- Eligible tasks: {official['eligible_rows']}",
+            f"- Context Selection: {context_value}",
+            f"- Context numerator / denominator: {context['numerator']} / {context['denominator']} bytes",
+            f"- Recovery Outcome: {recovery_text}",
             (
-                "- Pure-binary tasks excluded: "
-                f"{official['exclusion_counts']['pure_binary_extraction_tasks']}"
+                "- Rule Reuse: "
+                f"{rule_value} ({rule_reuse['numerator']} / {rule_reuse['denominator']})"
             ),
+            f"- Corrected Rule Reuse Task IDs: {', '.join(rule_reuse['corrected_task_ids']) or 'none'}",
             f"- Bounded anomaly samples: {len(anomalies)}",
             (
                 "- Measurement availability: "
@@ -143,16 +321,17 @@ def build_report_assets(
             "",
             "Questions for the Agent:",
             "",
-            "1. Which bounded anomaly samples suggest a concrete Atlas product gap?",
-            "2. What is the smallest Runtime change that could reduce that gap?",
+            "1. Which bounded anomaly points to a concrete product gap?",
+            "2. What is the smallest Runtime change that addresses it?",
             "3. What evidence would distinguish improvement from a different task mix?",
             "",
             "Limits:",
             "",
             "- Selected text bytes do not prove the Agent read every byte.",
-            "- Binary inputs that require local extraction are excluded.",
+            "- Rule application does not prove user satisfaction.",
+            "- Recovery and Rule Reuse coverage starts with their explicit events.",
             "- This evaluation does not contain measured model Token usage.",
-            "- Six or fewer eligible tasks are descriptive evidence, not statistical proof.",
+            "- Small samples are descriptive evidence, not statistical proof.",
             "",
         ]
     )
@@ -163,20 +342,25 @@ def build_report_assets(
             f"Data quality: **{quality['status']}** "
             f"({quality['critical_errors']} critical errors, {quality['warnings']} warnings).",
             "",
-            "## Official metric",
+            "## Official metrics",
             "",
-            "| Metric | Numerator | Denominator | Value | Eligible rows |",
-            "| --- | ---: | ---: | ---: | ---: |",
+            "| Metric | Result | Membership |",
+            "| --- | ---: | --- |",
             (
-                "| Context selection text-byte rate | "
-                f"{official['numerator']} | {official['denominator']} | "
-                f"{value_text} | {official['eligible_rows']} |"
+                "| Context Selection text-byte rate | "
+                f"{context_value} | {context['numerator']} / {context['denominator']} bytes; "
+                f"{len(context['eligible_task_ids'])} Tasks |"
+            ),
+            (
+                "| Recovery Outcome distribution | "
+                f"{recovery_text} | {recovery['denominator']} logical attempts |"
+            ),
+            (
+                "| Rule Reuse rate | "
+                f"{rule_value} | {rule_reuse['numerator']} / {rule_reuse['denominator']} Tasks |"
             ),
             "",
-            (
-                "The SQL result was cross-checked with Pandas. "
-                "This is directly readable selected-text share, not Token usage; binary inputs are excluded."
-            ),
+            "SQL results were cross-checked with Pandas.",
             "",
             "## Measurement limits",
             "",
@@ -184,8 +368,10 @@ def build_report_assets(
                 f"- Available candidates: {availability['available']}; "
                 f"partial: {availability['partial']}; unavailable: {availability['unavailable']}."
             ),
-            f"- High-selection samples written to `anomalies.jsonl`: {len(anomalies)}.",
-            "- Interpret the samples with `analysis_context.md`; do not treat them as failures by default.",
+            f"- Bounded samples written to `anomalies.jsonl`: {len(anomalies)}.",
+            "- Context bytes are not measured Token usage.",
+            "- Rule match is not user satisfaction.",
+            "- Historical Recovery and Rule Reuse remain partial before explicit events.",
             "",
         ]
     )
@@ -193,9 +379,26 @@ def build_report_assets(
         "pandas_version": pd.__version__,
         "cross_check": {
             "status": "PASS",
-            "numerator": pandas_numerator,
-            "denominator": pandas_denominator,
-            "eligible_rows": len(eligible),
+            "metrics": {
+                "context_selection_text_byte_rate": {
+                    "numerator": pandas_numerator,
+                    "denominator": pandas_denominator,
+                    "eligible_task_ids": eligible_task_ids,
+                },
+                "recovery_outcome_distribution": {
+                    "denominator": (
+                        len(latest_recovery)
+                        if not latest_recovery.empty
+                        else None
+                    ),
+                    "outcome_counts": recovery_counts,
+                },
+                "rule_reuse_rate": {
+                    "numerator_task_ids": pandas_numerator_ids,
+                    "denominator_task_ids": pandas_denominator_ids,
+                    "corrected_task_ids": pandas_corrected_ids,
+                },
+            },
         },
         "anomalies": anomalies,
         "analysis_context": analysis_context,

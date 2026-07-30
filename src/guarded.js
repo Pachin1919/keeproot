@@ -8,6 +8,7 @@ import { evaluateRisk } from './risk.js';
 import { RuntimeStorage } from './runtime-storage.js';
 import { captureBlob, captureBuffer, sha256File } from './snapshots.js';
 import { withStateLock } from './state-lock.js';
+import { RollbackConflictError } from './tracker.js';
 
 function timestamp() {
   return new Date().toISOString();
@@ -328,7 +329,14 @@ export class Guarded {
   }
 
   rollback(runId) {
-    return withStateLock(this.stateDir, () => this.#rollback(runId));
+    return withStateLock(this.stateDir, () => {
+      try {
+        return this.#rollback(runId);
+      } catch (error) {
+        this.ledger.recordRollbackError(runId, error);
+        throw error;
+      }
+    });
   }
 
   #rollback(runId) {
@@ -341,7 +349,12 @@ export class Guarded {
     const targetPath = path.resolve(detail.run.root_path, ...detail.candidate.target_path.split('/'));
     const observedHash = currentHash(targetPath);
     if (observedHash !== detail.candidate.content_hash && observedHash !== detail.baseline.content_hash) {
-      throw new Error('Guarded rollback stopped because the target changed after execution.');
+      throw new RollbackConflictError([{
+        path: detail.candidate.target_path,
+        expected_end_hash: detail.candidate.content_hash,
+        current_hash: observedHash,
+        current_kind: observedHash === null ? 'missing' : 'file',
+      }], 'Guarded rollback stopped because the target changed after execution.');
     }
     if (observedHash === detail.candidate.content_hash) {
       atomicReplace(targetPath, detail.baseline.blob_path, detail.candidate.content_hash);

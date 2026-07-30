@@ -71,6 +71,16 @@ def build_measurement_gaps(
         if "rollback" in str(item.get("event_type") or "").lower()
         or "recovery" in str(item.get("event_type") or "").lower()
     ]
+    explicit_recovery = [
+        item
+        for item in operations
+        if item.get("event_type") == "rollback_outcome_recorded"
+    ]
+    explicit_rule_evaluations = [
+        item
+        for item in operations
+        if item.get("event_type") == "task_rule_evaluated"
+    ]
 
     metrics = [
         _metric(
@@ -95,22 +105,65 @@ def build_measurement_gaps(
         ),
         _metric(
             "recovery_outcome",
-            "partial",
-            len(recovery_events),
-            ["event_type"],
-            ["recovery_outcome_class"],
-            "Recovery events exist, but success, correct conflict stop, and true failure are not normalized.",
+            "available" if explicit_recovery else ("partial" if recovery_events else "unavailable"),
+            len(explicit_recovery or recovery_events),
+            (
+                ["operation", "outcome", "reason_code", "run_id", "attempt_id"]
+                if explicit_recovery
+                else (["event_type"] if recovery_events else [])
+            ),
+            [] if explicit_recovery else [
+                "operation",
+                "outcome",
+                "reason_code",
+                "attempt_id",
+            ],
+            (
+                "Explicit rollback outcomes are available from the event enablement point."
+                if explicit_recovery
+                else (
+                    "Legacy recovery events exist, but their outcomes cannot be normalized safely."
+                    if recovery_events
+                    else "No explicit rollback outcome event is available."
+                )
+            ),
         ),
         _metric(
             "rule_reuse_rate",
-            "partial",
-            len(preference_rules),
-            ["preference_rule", "rule_version_id"] if preference_rules else [],
-            ["eligible_rule", "rule_matched"],
             (
-                "Rule records exist, but the eligible denominator and explicit match event are missing."
-                if preference_rules
-                else "The export has no rule observations, and the eligible denominator and explicit match event are missing."
+                "available"
+                if explicit_rule_evaluations
+                else ("partial" if preference_rules else "unavailable")
+            ),
+            len(explicit_rule_evaluations or preference_rules),
+            (
+                [
+                    "task_id",
+                    "eligible_rule_ids",
+                    "applied_rule_ids",
+                    "rule_version_ids",
+                    "evaluated_at",
+                ]
+                if explicit_rule_evaluations
+                else (
+                    ["preference_rule", "rule_version_id"]
+                    if preference_rules
+                    else []
+                )
+            ),
+            [] if explicit_rule_evaluations else [
+                "eligible_rule_ids",
+                "applied_rule_ids",
+                "evaluated_at",
+            ],
+            (
+                "Explicit Task rule eligibility and application facts are available from the event enablement point."
+                if explicit_rule_evaluations
+                else (
+                    "Rule records exist, but historical Task eligibility and application cannot be inferred."
+                    if preference_rules
+                    else "No explicit Task rule evaluation event is available."
+                )
             ),
         ),
         _metric(

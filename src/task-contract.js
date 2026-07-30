@@ -707,6 +707,14 @@ export class TaskContract {
     return this.ledger.getTaskDetail(taskId);
   }
 
+  reviewRule(taskId, { ruleId, decision, reason }) {
+    return this.ledger.reviewTaskRuleApplication(taskId, {
+      ruleId,
+      decision,
+      reason,
+    });
+  }
+
   #completionResult(detail) {
     return { ...detail.completion_receipt, write_run: { run_id: detail.completion_receipt.write_run_id, mode: detail.completion_receipt.write_mode } };
   }

@@ -72,8 +72,23 @@ class ReaderTest(unittest.TestCase):
             )
             self.assertEqual(first["quality_hash"], second["quality_hash"])
             self.assertEqual(first["metrics_hash"], second["metrics_hash"])
-            self.assertEqual(first["metric_count"], 1)
+            self.assertEqual(first["metric_count"], 3)
             self.assertEqual(first["pandas_cross_check"]["status"], "PASS")
+            empty_metrics = json.loads(
+                (root / "evaluation-one" / "metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )["metrics"]
+            for metric_id in (
+                "context_selection_text_byte_rate",
+                "recovery_outcome_distribution",
+                "rule_reuse_rate",
+            ):
+                metric = next(
+                    item for item in empty_metrics if item["metric_id"] == metric_id
+                )
+                self.assertEqual(metric["availability"], "unavailable")
+                self.assertIsNone(metric["denominator"])
             self.assertEqual(
                 (root / "evaluation-one" / "anomalies.jsonl").read_text(
                     encoding="utf-8"
@@ -129,14 +144,14 @@ class ReaderTest(unittest.TestCase):
         self.assertEqual(by_id["context_selection_text"]["availability"], "available")
         self.assertEqual(by_id["policy_stop_rate"]["availability"], "partial")
         self.assertEqual(by_id["recovery_outcome"]["availability"], "partial")
-        self.assertEqual(by_id["rule_reuse_rate"]["availability"], "partial")
+        self.assertEqual(by_id["rule_reuse_rate"]["availability"], "unavailable")
         self.assertEqual(by_id["review_burden"]["availability"], "unavailable")
         self.assertEqual(by_id["user_success"]["availability"], "unavailable")
         self.assertEqual(by_id["actual_model_tokens"]["availability"], "unavailable")
         self.assertEqual(report["availability_counts"], {
             "available": 1,
-            "partial": 3,
-            "unavailable": 3,
+            "partial": 2,
+            "unavailable": 4,
         })
 
     def test_fact_views_feed_a_deterministic_quality_gate(self) -> None:
@@ -195,9 +210,14 @@ class ReaderTest(unittest.TestCase):
         quality = evaluate_quality(records, facts)
         self.assertEqual(
             facts["counts"],
-            {"task_fact": 1, "operation_fact": 1, "policy_fact": 1, "recovery_fact": 1},
+            {
+                "task_fact": 1,
+                "operation_fact": 1,
+                "policy_fact": 1,
+                "recovery_fact": 0,
+                "rule_application_fact": 0,
+            },
         )
-        self.assertEqual(facts["recovery_fact"][0]["outcome"], "success")
         self.assertEqual(quality["status"], "PASS")
         self.assertEqual(quality["critical_errors"], 0)
 
@@ -206,7 +226,7 @@ class ReaderTest(unittest.TestCase):
         self.assertEqual(failed["status"], "FAIL")
         self.assertIn("duplicate_record_id", {item["check_id"] for item in failed["checks"]})
 
-    def test_metric_contract_and_sql_produce_one_deterministic_official_metric(self) -> None:
+    def test_metric_contracts_and_sql_produce_deterministic_official_metrics(self) -> None:
         facts = {
             "task_fact": [
                 {
@@ -263,24 +283,118 @@ class ReaderTest(unittest.TestCase):
                     "selected_binary_bytes": 2400,
                     "selected_extraction_inputs": 1,
                 },
-            ]
+            ],
+            "recovery_fact": [
+                {
+                    "event_id": "EVT-R1-A",
+                    "run_id": "RUN-R1",
+                    "recorded_at": "2026-07-29T00:00:01.000Z",
+                    "operation": "rollback",
+                    "outcome": "completed",
+                    "reason_code": "restored_and_verified",
+                    "attempt_id": "RBK-ONE",
+                },
+                {
+                    "event_id": "EVT-R1-B",
+                    "run_id": "RUN-R1",
+                    "recorded_at": "2026-07-29T00:00:02.000Z",
+                    "operation": "rollback",
+                    "outcome": "completed",
+                    "reason_code": "restored_and_verified",
+                    "attempt_id": "RBK-ONE",
+                },
+                {
+                    "event_id": "EVT-R2",
+                    "run_id": "RUN-R2",
+                    "recorded_at": "2026-07-29T00:00:03.000Z",
+                    "operation": "rollback",
+                    "outcome": "conflict_safe_stop",
+                    "reason_code": "later_file_state_conflict",
+                    "attempt_id": "RBK-TWO",
+                },
+            ],
+            "rule_application_fact": [
+                {
+                    "event_id": "EVT-T1",
+                    "task_id": "TSK-1",
+                    "recorded_at": "2026-07-29T00:00:00.000Z",
+                    "evaluated_at": "2026-07-29T00:00:00.000Z",
+                    "status": "completed",
+                    "actor": "agent",
+                    "tool": "codex",
+                    "eligible_rule_ids": ["PREF-1"],
+                    "applied_rule_ids": ["PREF-1"],
+                    "rule_version_ids": ["RULE-1"],
+                    "corrected": False,
+                },
+                {
+                    "event_id": "EVT-T2",
+                    "task_id": "TSK-2",
+                    "recorded_at": "2026-07-29T00:00:00.000Z",
+                    "evaluated_at": "2026-07-29T00:00:00.000Z",
+                    "status": "completed",
+                    "actor": "agent",
+                    "tool": "codex",
+                    "eligible_rule_ids": ["PREF-1"],
+                    "applied_rule_ids": [],
+                    "rule_version_ids": ["RULE-1"],
+                    "corrected": True,
+                },
+                {
+                    "event_id": "EVT-T3",
+                    "task_id": "TSK-3",
+                    "recorded_at": "2026-07-29T00:00:00.000Z",
+                    "evaluated_at": "2026-07-29T00:00:00.000Z",
+                    "status": "completed",
+                    "actor": "agent",
+                    "tool": "codex",
+                    "eligible_rule_ids": [],
+                    "applied_rule_ids": [],
+                    "rule_version_ids": [],
+                    "corrected": False,
+                },
+            ],
         }
 
         result = compute_metrics(facts, source_content_hash="b" * 64)
-        self.assertEqual(len(result["metrics"]), 1)
+        self.assertEqual(len(result["metrics"]), 3)
         metric = result["metrics"][0]
         self.assertEqual(metric["metric_id"], "context_selection_text_byte_rate")
         self.assertEqual(metric["numerator"], 130)
         self.assertEqual(metric["denominator"], 200)
         self.assertEqual(metric["value"], 0.65)
         self.assertEqual(metric["eligible_rows"], 2)
+        self.assertEqual(metric["eligible_task_ids"], ["TSK-1", "TSK-2"])
         self.assertEqual(metric["excluded_rows"], 1)
         self.assertEqual(metric["exclusion_counts"], {
             "pure_binary_extraction_tasks": 1,
             "missing_text_measurement": 0,
             "invalid_text_bounds": 0,
+            "no_direct_text_input": 0,
         })
         self.assertRegex(metric["contract_hash"], r"^[a-f0-9]{64}$")
+        recovery = result["metrics"][1]
+        self.assertEqual(recovery["metric_id"], "recovery_outcome_distribution")
+        self.assertEqual(recovery["denominator"], 2)
+        self.assertEqual(recovery["outcome_counts"], {
+            "completed": 1,
+            "conflict_safe_stop": 1,
+            "failed": 0,
+            "cancelled": 0,
+        })
+        self.assertEqual(recovery["duplicate_events_deduplicated"], 1)
+        rule_reuse = result["metrics"][2]
+        self.assertEqual(rule_reuse["metric_id"], "rule_reuse_rate")
+        self.assertEqual(rule_reuse["numerator"], 1)
+        self.assertEqual(rule_reuse["denominator"], 2)
+        self.assertEqual(rule_reuse["value"], 0.5)
+        self.assertEqual(rule_reuse["numerator_task_ids"], ["TSK-1"])
+        self.assertEqual(rule_reuse["denominator_task_ids"], ["TSK-1", "TSK-2"])
+        self.assertEqual(rule_reuse["corrected_task_ids"], ["TSK-2"])
+        self.assertEqual(
+            rule_reuse["excluded_task_ids"]["first_scenario"],
+            ["TSK-3"],
+        )
 
 
 if __name__ == "__main__":

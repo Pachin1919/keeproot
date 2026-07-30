@@ -1213,6 +1213,11 @@ export class Ledger {
       `).run(rolledBackAt, json(receipt), runId);
       this.db.prepare("UPDATE change_sets SET status = 'rolled_back' WHERE run_id = ?").run(runId);
       this.#insertEvent(runId, 'guarded_rollback_completed', receipt, rolledBackAt);
+      this.#insertRollbackOutcome(runId, {
+        outcome: 'completed',
+        reasonCode: 'restored_and_verified',
+        details: { restored_files: receipt.restored_files ?? null },
+      }, rolledBackAt);
       return receipt;
     });
   }
@@ -1555,6 +1560,11 @@ export class Ledger {
       `).run(rolledBackAt, json(receipt), runId);
       this.db.prepare(`UPDATE change_sets SET status = 'rolled_back' WHERE run_id = ?`).run(runId);
       this.#insertEvent(runId, 'evolution_rollback_completed', receipt, rolledBackAt);
+      this.#insertRollbackOutcome(runId, {
+        outcome: 'completed',
+        reasonCode: 'restored_and_verified',
+        details: { operation: receipt.operation ?? null },
+      }, rolledBackAt);
       return receipt;
     });
   }
@@ -2030,6 +2040,15 @@ export class Ledger {
         write_strategy: contract.write.strategy,
         executor: contract.write.executor,
       }, startedAt);
+      const eligibleRules = contract.attention?.eligible_rules ?? [];
+      const appliedRules = contract.attention?.applied_rules ?? [];
+      this.#insertEvent(runId, 'task_rule_evaluated', {
+        task_id: runId,
+        eligible_rule_ids: eligibleRules.map((rule) => rule.rule_id),
+        applied_rule_ids: appliedRules.map((rule) => rule.rule_id),
+        rule_version_ids: [...new Set(eligibleRules.map((rule) => rule.rule_version_id))].sort(),
+        evaluated_at: startedAt,
+      }, startedAt);
     });
     return this.getTaskDetail(runId);
   }
@@ -2082,6 +2101,17 @@ export class Ledger {
       payload: parseJson(event.payload_json, {}),
       occurred_at: event.occurred_at,
     }));
+    const ruleApplicationReviews = this.db.prepare(`
+      SELECT id, value, details_json, created_at
+      FROM labels
+      WHERE run_id = ? AND name = 'task_rule_application_review'
+      ORDER BY created_at, rowid
+    `).all(runId).map((label) => ({
+      label_id: label.id,
+      decision: label.value,
+      ...parseJson(label.details_json, {}),
+      reviewed_at: label.created_at,
+    }));
     const completionReceipt = parseJson(row.completion_receipt_json);
     const lineage = completionReceipt?.output_material_id ? this.db.prepare(`
       SELECT md.output_material_id, md.input_material_id, md.run_id,
@@ -2123,8 +2153,64 @@ export class Ledger {
       completion_receipt: completionReceipt,
       rollback_receipt: parseJson(run.rollback_receipt_json),
       output: completionReceipt ? { receipt: completionReceipt, lineage } : null,
+      rule_application_reviews: ruleApplicationReviews,
       events,
     };
+  }
+
+  reviewTaskRuleApplication(runId, { ruleId, decision, reason }) {
+    if (!['accepted', 'corrected'].includes(decision)) {
+      throw new Error('Task rule review decision must be accepted or corrected.');
+    }
+    if (typeof reason !== 'string' || !reason.trim()) {
+      throw new Error('Task rule review requires a reason.');
+    }
+    const detail = this.getTaskDetail(runId);
+    const eligibleRules = detail.contract.attention?.eligible_rules ?? [];
+    const rule = eligibleRules.find((item) => item.rule_id === ruleId);
+    if (!rule) throw new Error(`Rule was not eligible for Task ${runId}: ${ruleId}`);
+    const applied = (detail.contract.attention?.applied_rules ?? [])
+      .some((item) => item.rule_id === ruleId);
+    const existing = detail.rule_application_reviews.find((item) => (
+      item.rule_id === ruleId
+      && item.decision === decision
+      && item.reason === reason.trim()
+    ));
+    if (existing) return {
+      task_id: runId,
+      label_id: existing.label_id,
+      rule_id: ruleId,
+      rule_version_id: rule.rule_version_id,
+      eligible: true,
+      applied,
+      decision,
+      reason: reason.trim(),
+      reviewed_at: existing.reviewed_at,
+      idempotent: true,
+    };
+    const reviewedAt = now();
+    const labelId = `LBL-${crypto.randomUUID()}`;
+    const receipt = {
+      task_id: runId,
+      label_id: labelId,
+      rule_id: ruleId,
+      rule_version_id: rule.rule_version_id,
+      eligible: true,
+      applied,
+      decision,
+      reason: reason.trim(),
+      reviewed_at: reviewedAt,
+      idempotent: false,
+    };
+    return this.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO labels(
+          id, run_id, subject_prediction_id, name, value, source, details_json, created_at
+        ) VALUES (?, ?, NULL, 'task_rule_application_review', ?, 'user', ?, ?)
+      `).run(labelId, runId, decision, json(receipt), reviewedAt);
+      this.#insertEvent(runId, 'task_rule_review_recorded', receipt, reviewedAt);
+      return receipt;
+    });
   }
 
   claimTaskFulfillment(runId, claimToken, processId, occurredAt, plannedWriteRunId = null) {
@@ -3105,6 +3191,11 @@ export class Ledger {
         UPDATE artifacts SET status = 'rolled_back', updated_at = ? WHERE id = ?
       `).run(rolledBackAt, operation.output_artifact_id);
       this.#insertEvent(runId, 'derived_rollback_completed', receipt, rolledBackAt);
+      this.#insertRollbackOutcome(runId, {
+        outcome: 'completed',
+        reasonCode: 'restored_and_verified',
+        details: { removed_files: receipt.removed_files ?? null },
+      }, rolledBackAt);
       return receipt;
     });
   }
@@ -4313,6 +4404,11 @@ export class Ledger {
         UPDATE change_sets SET status = 'rolled_back' WHERE run_id = ?
       `).run(runId);
       this.#insertEvent(runId, 'rollback_completed', receipt, rolledBackAt);
+      this.#insertRollbackOutcome(runId, {
+        outcome: 'completed',
+        reasonCode: 'restored_and_verified',
+        details: { restored_files: receipt.restored_files ?? null },
+      }, rolledBackAt);
       return receipt;
     });
   }
@@ -4352,6 +4448,41 @@ export class Ledger {
     this.#insertEvent(runId, eventType, payload, now());
   }
 
+  recordRollbackError(runId, error) {
+    const conflict = error?.code === 'ATLAS_ROLLBACK_CONFLICT'
+      || error?.code === 'ATLAS_STATE_CONFLICT';
+    let reasonCode = 'rollback_execution_error';
+    if (error?.code === 'ATLAS_STATE_CONFLICT') reasonCode = 'state_changed_after_execution';
+    else if (error?.code === 'ATLAS_ROLLBACK_CONFLICT') {
+      reasonCode = error.conflicts?.some((item) => item.kind === 'downstream_dependency')
+        ? 'downstream_dependency'
+        : 'later_file_state_conflict';
+    } else if (typeof error?.code === 'string' && error.code) {
+      reasonCode = error.code.toLowerCase();
+    }
+    return this.recordRollbackOutcome(runId, {
+      outcome: conflict ? 'conflict_safe_stop' : 'failed',
+      reasonCode,
+      details: {
+        error_code: error?.code ?? null,
+        message: error?.message ?? String(error),
+        conflicts: Array.isArray(error?.conflicts) ? error.conflicts : [],
+      },
+    });
+  }
+
+  recordRollbackOutcome(runId, {
+    outcome,
+    reasonCode,
+    details = {},
+  }, occurredAt = now()) {
+    return this.transaction(() => this.#insertRollbackOutcome(
+      runId,
+      { outcome, reasonCode, details },
+      occurredAt,
+    ));
+  }
+
   recordRollbackPath(runId, pathValue, details, occurredAt) {
     this.transaction(() => {
       this.db.prepare(`
@@ -4383,6 +4514,34 @@ export class Ledger {
       INSERT INTO operation_events(id, run_id, event_type, payload_json, occurred_at)
       VALUES (?, ?, ?, ?, ?)
     `).run(`EVT-${crypto.randomUUID()}`, runId, eventType, json(payload), occurredAt);
+  }
+
+  #insertRollbackOutcome(runId, { outcome, reasonCode, details }, occurredAt) {
+    const allowed = new Set(['completed', 'conflict_safe_stop', 'failed', 'cancelled']);
+    if (!allowed.has(outcome)) throw new Error(`Unsupported rollback outcome: ${outcome}`);
+    if (typeof reasonCode !== 'string' || !reasonCode.trim()) {
+      throw new Error('Rollback outcome requires reason_code.');
+    }
+    this.getRun(runId);
+    const attemptId = `RBK-${crypto.createHash('sha256').update(runId).digest('hex').slice(0, 20).toUpperCase()}`;
+    const eventId = `EVT-RBK-${crypto.createHash('sha256')
+      .update(`${attemptId}:${outcome}:${reasonCode}`)
+      .digest('hex')
+      .slice(0, 24)
+      .toUpperCase()}`;
+    const payload = {
+      operation: 'rollback',
+      outcome,
+      reason_code: reasonCode,
+      run_id: runId,
+      attempt_id: attemptId,
+      details,
+    };
+    this.db.prepare(`
+      INSERT OR IGNORE INTO operation_events(id, run_id, event_type, payload_json, occurred_at)
+      VALUES (?, ?, 'rollback_outcome_recorded', ?, ?)
+    `).run(eventId, runId, json(payload), occurredAt);
+    return payload;
   }
 
   getRun(runId) {

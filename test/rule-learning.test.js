@@ -213,10 +213,35 @@ test('Task applies a learned version strategy and becomes stale when the effecti
     prepared.attention.applied_rules.map((item) => item.kind),
     ['content_versioning'],
   );
+  assert.deepEqual(
+    prepared.attention.eligible_rules.map((item) => item.rule_id),
+    prepared.attention.applied_rules.map((item) => item.rule_id),
+  );
   assert.deepEqual(prepared.attention.gaps, ['naming', 'agent_output']);
   assert.deepEqual(
     prepared.attention.default_advice.map((item) => item.kind),
     ['naming', 'agent_output'],
+  );
+  const evaluated = task.show(prepared.task_id).events.find(
+    (event) => event.type === 'task_rule_evaluated',
+  );
+  assert.deepEqual(evaluated.payload, {
+    task_id: prepared.task_id,
+    eligible_rule_ids: [prepared.attention.applied_rules[0].rule_id],
+    applied_rule_ids: [prepared.attention.applied_rules[0].rule_id],
+    rule_version_ids: [prepared.attention.applied_rules[0].rule_version_id],
+    evaluated_at: evaluated.occurred_at,
+  });
+  const review = task.reviewRule(prepared.task_id, {
+    ruleId: prepared.attention.applied_rules[0].rule_id,
+    decision: 'corrected',
+    reason: 'The existing rule was eligible and applied, but the user corrected this Task.',
+  });
+  assert.equal(review.task_id, prepared.task_id);
+  assert.equal(review.decision, 'corrected');
+  assert.equal(
+    task.show(prepared.task_id).rule_application_reviews[0].rule_id,
+    prepared.attention.applied_rules[0].rule_id,
   );
 
   const replacement = rules.propose({

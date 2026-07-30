@@ -26,7 +26,7 @@ export const CAPABILITIES = Object.freeze({
       'prepare', 'preview', 'approve', 'reject', 'execute', 'rollback',
       'plan-prepare', 'plan-preview', 'plan-approve', 'plan-reject', 'plan-execute', 'plan-rollback',
     ],
-    task: ['discover', 'prepare', 'show', 'fulfill', 'archive-plan', 'complete', 'rollback'],
+    task: ['discover', 'prepare', 'show', 'fulfill', 'archive-plan', 'complete', 'review-rule', 'rollback'],
     capture: ['localize', 'sample'],
     work: ['stage', 'status', 'release'],
     storage: ['status', 'plan', 'execute'],
@@ -89,6 +89,11 @@ export const CAPABILITIES = Object.freeze({
     schema: 'atlas.analytics.evaluation.v1',
     current_status: 'ready_for_interpretation',
     python_required: true,
+    official_metrics: [
+      'context_selection_text_byte_rate',
+      'recovery_outcome_distribution',
+      'rule_reuse_rate',
+    ],
     outputs: [
       'manifest.json',
       'measurement-gaps.json',

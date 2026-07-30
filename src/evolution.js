@@ -1077,7 +1077,14 @@ export class Evolution {
   }
 
   rollback(runId) {
-    return withStateLock(this.stateDir, () => this.#rollback(runId));
+    return withStateLock(this.stateDir, () => {
+      try {
+        return this.#rollback(runId);
+      } catch (error) {
+        this.ledger.recordRollbackError(runId, error);
+        throw error;
+      }
+    });
   }
 
   #rollback(runId) {

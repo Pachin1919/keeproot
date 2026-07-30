@@ -7,6 +7,7 @@ from typing import Any, Iterable
 
 QUALITY_SCHEMA = "atlas.analytics.quality.v1"
 POLICY_DECISIONS = {"allow", "warn", "deny", "guarded", "tracked_direct", "pass"}
+RECOVERY_OUTCOMES = {"completed", "conflict_safe_stop", "failed", "cancelled"}
 
 
 def _timestamp(value: Any) -> datetime | None:
@@ -139,6 +140,35 @@ def evaluate_quality(
         for item in run_rows
         if not item.get("actor") or not item.get("tool")
     ]
+    invalid_recovery_contract = []
+    invalid_rule_evaluation_contract = []
+    task_ids = {str(item.get("task_id")) for item in facts["task_fact"]}
+    for item in items:
+        if item.get("record_type") != "operation_event":
+            continue
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        if item.get("event_type") == "rollback_outcome_recorded":
+            if (
+                payload.get("operation") != "rollback"
+                or payload.get("outcome") not in RECOVERY_OUTCOMES
+                or not isinstance(payload.get("reason_code"), str)
+                or not payload.get("reason_code")
+                or not isinstance(payload.get("attempt_id"), str)
+                or not payload.get("attempt_id")
+                or payload.get("run_id") != item.get("run_id")
+            ):
+                invalid_recovery_contract.append(str(item.get("record_id")))
+        elif item.get("event_type") == "task_rule_evaluated":
+            task_id = payload.get("task_id")
+            if (
+                not isinstance(task_id, str)
+                or task_id not in task_ids
+                or not isinstance(payload.get("eligible_rule_ids"), list)
+                or not isinstance(payload.get("applied_rule_ids"), list)
+                or not isinstance(payload.get("rule_version_ids"), list)
+                or _timestamp(payload.get("evaluated_at")) is None
+            ):
+                invalid_rule_evaluation_contract.append(str(item.get("record_id")))
 
     checks = [
         _check("duplicate_record_id", "FAIL", sorted(duplicate_ids), "Record IDs must be unique within each record type."),
@@ -150,6 +180,18 @@ def evaluate_quality(
         _check("policy_enum", "FAIL", invalid_policy, "Policy decisions must use the exported V1 vocabulary."),
         _check("caller_metadata", "WARN", missing_caller, "Run actor and tool should be recorded."),
         _check("task_project", "WARN", missing_task_project, "Task facts should identify one Project."),
+        _check(
+            "recovery_outcome_contract",
+            "FAIL",
+            invalid_recovery_contract,
+            "Explicit rollback outcomes require operation, outcome, reason_code, matching run_id, and attempt_id.",
+        ),
+        _check(
+            "task_rule_evaluation_contract",
+            "FAIL",
+            invalid_rule_evaluation_contract,
+            "Task rule evaluation requires an exported Task, explicit eligible/applied/version lists, and evaluated_at.",
+        ),
     ]
     critical_errors = sum(check["issue_count"] for check in checks if check["severity"] == "FAIL")
     warnings = sum(check["issue_count"] for check in checks if check["severity"] == "WARN")
