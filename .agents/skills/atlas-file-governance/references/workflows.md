@@ -172,6 +172,12 @@ If same-series inputs have different hashes but lack reliable coverage, expect `
 
 For binary inputs, use `read.requires_local_extraction` to select a local parser. `read.estimated_tokens` covers only directly readable text bytes; it is not a raw binary-size estimate. Do not send the binary file or a full-resolution render set into model context. Presentation comparison is text/object/layout extraction first, compact local diff second, and at most eight explicitly selected 768×432 JPEG renders only when unresolved visual evidence remains.
 
+When a provided attachment determines a directory, routing, or split design, “environment setup only” forbids premature writes but does not forbid the minimum read-only structural extraction needed for the decision. Use the appropriate content Skill. For spreadsheets, inspect worksheet names, used ranges, relevant header rows, and merged or multi-level headers before proposing folders or a split model. Atlas validates the authorized path and later governs the accepted change; it does not replace the Agent's semantic interpretation.
+
+Start with `atlas content inspect --file <EXACT_PATH> --purpose structure --json`. If `next_action.mode` is `use_local_extraction`, do not launch Office, a browser, or a screenshot workflow.
+
+For CSV/TSV or one exact XLSX Sheet whose structure is already known, use `atlas content inspect --file <EXACT_PATH> --purpose data [--sheet <XLSX_SHEET>] --json`. Treat its Pandas/SQLite counts as facts and let the Agent interpret business meaning. It returns no raw data rows; merged or multi-level headers remain an explicit warning rather than an invented flat schema.
+
 ## Reusable cross-Project context
 
 Configure the relationship once:
@@ -194,6 +200,8 @@ Reuse it in later tasks:
 # Open only selected source paths and create one Candidate outside the target Root.
 & $atlasCli task fulfill '<TASK_ID_FROM_PREPARE>' --candidate-file '<CANDIDATE_FILE>' --reason '<CURRENT_USER_TASK_AUTHORIZATION>' --json
 ```
+
+If discovery returns `ATLAS_CONTEXT_SETUP_REQUIRED`, read `error.details.missing` and execute only its `required_actions`. Do not recover with Portfolio scans, a guessed `--root`, or the old single-root Task flow.
 
 The Context Link persists; Candidate Set and Source Set are per-task facts. Atlas indexes authorized Markdown/plain-text locally and returns bounded metadata/snippets instead of full bodies. The Agent still interprets meaning and selects sources. The Task reads from multiple adopted Roots but writes to exactly one target Root. A changed selected source makes fulfillment stale.
 
@@ -275,6 +283,7 @@ Call rollback only against the run's recorded end state. If exit code is 3 or th
 ```powershell
 & $atlasCli guarded prepare --root '<AUTHORIZED_ROOT>' --target '<RELATIVE_TARGET>' --candidate-file '<ATLAS_STATE_CANDIDATE>' --intent '<INTENT>' --actor agent --agent '<AGENT>' --model '<MODEL>' --tool '<TOOL>' --client-run-id '<TASK_ID>' --json
 & $atlasCli guarded preview '<RUN_ID>' --json
+# Open candidate.review_path for user review. It is a read-only copy; the Candidate Blob remains authoritative.
 # Pause and obtain explicit user approval for this Candidate hash and Diff.
 & $atlasCli guarded apply-approved '<RUN_ID>' --reason '<CURRENT_USER_APPROVAL>' --json
 ```

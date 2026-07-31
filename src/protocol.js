@@ -1,4 +1,4 @@
-export const ATLAS_VERSION = '1.3.0';
+export const ATLAS_VERSION = '1.3.3';
 export const PROTOCOL_VERSION = 'atlas-cli.v1';
 
 export const CAPABILITIES = Object.freeze({
@@ -32,6 +32,7 @@ export const CAPABILITIES = Object.freeze({
       'complete', 'review-rule', 'rollback',
     ],
     capture: ['localize', 'sample'],
+    content: ['inspect'],
     work: ['stage', 'status', 'release'],
     storage: ['status', 'plan', 'execute'],
     ledger: ['backups', 'restore'],
@@ -46,6 +47,10 @@ export const CAPABILITIES = Object.freeze({
     risk: ['evaluate'],
   },
   guarded_operations: ['single_existing_file_update'],
+  guarded_review: {
+    path: 'state_work_read_only_copy',
+    authoritative_source: 'candidate_blob',
+  },
   derived_operations: ['classified_single_file_create'],
   derived_relation_types: [
     'derived_from', 'summarizes', 'transforms', 'merges', 'extracts_from',
@@ -54,6 +59,7 @@ export const CAPABILITIES = Object.freeze({
   task_data_classes: ['generated_output', 'temporal_snapshot', 'append_only_data', 'human_writing'],
   cross_project_context: {
     status: 'callable',
+    setup_preflight: 'structured_required_actions',
     root_identity: 'stable_root_id_with_path_history',
     project_location: 'one_active_location_per_project',
     context_links: 'versioned_and_reusable',
@@ -151,6 +157,31 @@ export const CAPABILITIES = Object.freeze({
     maximum_sample_characters: 4000,
     completeness_must_be_reported: true,
   },
+  local_content_inspection: {
+    schema: 'atlas.content-inspection.v1',
+    processor: 'optional_python_with_pandas_sqlite_for_tabular_profiles',
+    supported_extensions: [
+      '.txt', '.md', '.markdown', '.json', '.jsonl', '.xml', '.yaml', '.yml',
+      '.html', '.htm', '.css', '.js', '.ts', '.jsx', '.tsx', '.py', '.sql',
+      '.csv', '.tsv', '.xlsx', '.pptx', '.docx',
+    ],
+    exact_file_only: true,
+    network_used: false,
+    browser_used: false,
+    external_application_used: false,
+    screenshots_used: 0,
+    tabular_profile: {
+      purpose: 'data',
+      exact_sheet_required_for_xlsx: true,
+      engine: 'pandas+sqlite',
+      returns_raw_rows: false,
+    },
+    visual_fallback: {
+      maximum_images: 4,
+      maximum_resolution: '640x360',
+      only_when_purpose_is_visual: true,
+    },
+  },
   intake_kinds: [
     'unclassified', 'raw_input', 'source', 'note', 'journal', 'draft', 'intermediate',
     'report', 'canonical', 'index', 'template', 'archive', 'code', 'demo', 'asset',
@@ -191,7 +222,9 @@ function classifyMessage(message) {
 
 export function errorEnvelope(command, error) {
   const code = error?.code ?? classifyMessage(error?.message ?? String(error));
-  const details = {};
+  const details = error?.details && typeof error.details === 'object'
+    ? { ...error.details }
+    : {};
   if (Array.isArray(error?.conflicts)) details.conflicts = error.conflicts;
   return {
     protocol_version: PROTOCOL_VERSION,

@@ -14,6 +14,7 @@ import {
 import { Bootstrap } from '../src/bootstrap.js';
 import { BrowserCapture } from '../src/browser-capture.js';
 import { Catalog } from '../src/catalog.js';
+import { inspectContent } from '../src/content-inspection.js';
 import { exportAnalytics } from '../src/analytics-export.js';
 import { Derived } from '../src/derived.js';
 import { Evolution } from '../src/evolution.js';
@@ -98,6 +99,9 @@ Usage:
   atlas storage status | plan | execute [--older-than-hours <number>]
   atlas capture localize --input-file <browser_capture.json|selected_text.txt> [--ttl-hours <number>]
   atlas capture sample <work_id> [--start-character <number>] [--characters <1..4000>]
+  atlas content inspect --file <path> [--purpose <structure|content|data|visual>]
+                        [--sheet <xlsx_sheet_name>]
+                        [--max-characters <500..20000>]
   atlas work stage --file <path> --kind <candidate|proposal|intermediate> [--ttl-hours <number>]
   atlas work status [work_id] | release <work_id> [--reason <text>]
   atlas bootstrap profiles
@@ -1699,6 +1703,27 @@ function parseAnalytics(args) {
   throw new Error(`Unknown analytics action: ${action ?? '(missing)'}`);
 }
 
+function parseContent(args) {
+  const [action, ...rest] = args;
+  if (action !== 'inspect') {
+    throw new Error(`Unknown content action: ${action ?? '(missing)'}`);
+  }
+  const options = {
+    purpose: 'content',
+    sheet: null,
+    maxCharacters: 4000,
+  };
+  for (let index = 0; index < rest.length; index += 1) {
+    if (rest[index] === '--file') options.filePath = rest[++index];
+    else if (rest[index] === '--purpose') options.purpose = rest[++index];
+    else if (rest[index] === '--sheet') options.sheet = rest[++index];
+    else if (rest[index] === '--max-characters') options.maxCharacters = Number(rest[++index]);
+    else throw new Error(`Unknown content inspect argument: ${rest[index]}`);
+  }
+  if (!options.filePath) throw new Error('content inspect requires --file <path>');
+  return options;
+}
+
 function optionalPythonCapability() {
   const detail = doctorAnalyticsComponent({
     installationRoot,
@@ -1741,6 +1766,22 @@ async function main() {
     return;
   }
   stateDir = normalizeStateDir(projectRoot, stateDirInput, installationRoot);
+
+  if (command === 'content') {
+    const result = inspectContent({
+      stateDir,
+      projectRoot,
+      installationRoot,
+      ...parseContent(args),
+    });
+    emit('content.inspect', result, (detail) => {
+      console.log(
+        `Inspected ${detail.source.name} locally with ${detail.processor.name}; `
+        + `${detail.attention.screenshots_used} screenshot(s).`,
+      );
+    });
+    return;
+  }
 
   if (command === 'ledger') {
     handleLedgerMaintenance(args);

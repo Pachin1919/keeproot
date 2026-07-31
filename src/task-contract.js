@@ -51,6 +51,63 @@ function stateConflict(message) {
   return error;
 }
 
+function contextSetupRequired({
+  project,
+  purpose,
+  roots,
+  links,
+}) {
+  const missing = [];
+  if (!roots.length) missing.push('workspace_root');
+  if (!project.location) missing.push('target_project_location');
+  if (!links.length) missing.push('context_link');
+  const requiredActions = [];
+  if (missing.includes('workspace_root')) {
+    requiredActions.push({
+      action: 'root.adopt',
+      for: 'source_and_target_as_needed',
+      required_fields: ['path', 'type', 'content_policy'],
+    });
+  }
+  if (missing.includes('target_project_location')) {
+    requiredActions.push({
+      action: 'project.attach-root',
+      project_id: project.project.id,
+      required_fields: ['root_id', 'reason'],
+    });
+  }
+  if (missing.includes('context_link')) {
+    requiredActions.push({
+      action: 'project.link-context',
+      target_project_id: project.project.id,
+      required_fields: ['source_project_id', 'purpose', 'reason'],
+      source_project_requires_active_location: true,
+    });
+  }
+  const error = new Error(
+    `Cross-Project context setup is incomplete for Project ${project.project.id}: ${missing.join(', ')}.`,
+  );
+  error.code = 'ATLAS_CONTEXT_SETUP_REQUIRED';
+  error.details = {
+    schema: 'atlas-context-setup.v1',
+    status: 'context_setup_required',
+    target_project_id: project.project.id,
+    purpose,
+    missing,
+    required_actions: requiredActions,
+    known_workspace_roots: roots.map((item) => ({
+      root_id: item.id,
+      current_path: item.current_path,
+      root_type: item.root_type,
+      content_policy: item.content_policy,
+    })),
+    available_context_purposes: [
+      ...new Set(project.context_links.map((item) => item.purpose)),
+    ].sort(),
+  };
+  return error;
+}
+
 function sha256Json(value) {
   return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
@@ -483,10 +540,18 @@ export class TaskContract {
     const normalizedTerms = [...new Set(
       terms.map((item) => String(item).trim().normalize('NFC')).filter(Boolean),
     )];
-    const links = this.registry.contextLinks(projectId)
-      .filter((item) => item.purpose === purpose.trim().toLowerCase().replace(/[\s-]+/gu, '_'));
-    if (!links.length) {
-      throw new Error(`No active Context Link matches Project ${projectId} and purpose ${purpose}.`);
+    const normalizedPurpose = purpose.trim().toLowerCase().replace(/[\s-]+/gu, '_');
+    const targetProject = this.registry.show(projectId);
+    const roots = this.registry.listRoots();
+    const links = targetProject.context_links
+      .filter((item) => item.purpose === normalizedPurpose);
+    if (!targetProject.location || !links.length) {
+      throw contextSetupRequired({
+        project: targetProject,
+        purpose: normalizedPurpose,
+        roots,
+        links,
+      });
     }
     if (links.length > MAX_CONTEXT_LINKS) {
       throw new Error(`Cross-Project context discovery accepts at most ${MAX_CONTEXT_LINKS} active links per purpose.`);

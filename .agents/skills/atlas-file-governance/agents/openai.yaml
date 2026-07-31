@@ -1,7 +1,7 @@
 interface:
   display_name: "Atlas File Governance"
-  short_description: "Inspect, route, and protect local Agent file work"
-  default_prompt: "Use $atlas-file-governance to inspect the authorized root, choose the supported Atlas workflow, and complete this file task with a concise factual receipt."
+  short_description: "Govern projects, attachments, spreadsheets, writes, and recovery"
+  default_prompt: "Use $atlas-file-governance for this local project, attachment, spreadsheet, cross-project context, durable output, file change, or recovery task. Let Atlas compute bounded local facts and enforce the supported workflow; return one concise factual receipt."
 
 policy:
   allow_implicit_invocation: true

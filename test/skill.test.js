@@ -68,7 +68,16 @@ test('repository Agent Skill is a complete user-installable source and reference
   assert.ok(fs.existsSync(path.join(skillRoot, 'scripts', 'intake-attached-file.ps1')));
   assert.match(protocol, /atlas-cli\.v1/);
   assert.match(protocol, /ATLAS_ROLLBACK_CONFLICT/);
+  assert.match(protocol, /ATLAS_CONTEXT_SETUP_REQUIRED/);
   assert.match(skill, /--scan-mode structure/);
+  assert.match(skill, /Attachment-dependent structure decisions/);
+  assert.match(skill, /worksheet names/);
+  assert.match(skill, /used ranges/);
+  assert.match(skill, /merged or multi-level header structure/);
+  assert.match(skill, /does not prohibit read-only structural inspection/);
+  assert.match(skill, /atlas content inspect/);
+  assert.match(skill, /review_path/);
+  assert.match(protocol, /content inspect/);
   assert.match(workflows, /--scan-mode structure/);
   for (const command of [
     'bootstrap scan', 'bootstrap profiles', 'bootstrap recommend', 'bootstrap contract',
@@ -332,10 +341,14 @@ test('Skill command sequence completes Agent Bootstrap, Derived, Tracked Direct,
   const baselineA = fs.readFileSync(path.join(vault, 'allowed-a.md'), 'utf8');
   const baselineB = fs.readFileSync(path.join(vault, 'allowed-b.md'), 'utf8');
 
-  assert.equal(agentCli(stateDir, ['version']).version, '1.3.0');
+  const packageVersion = JSON.parse(
+    fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'),
+  ).version;
+  assert.equal(agentCli(stateDir, ['version']).version, packageVersion);
   assert.equal(agentCli(stateDir, ['doctor']).status, 'ok');
   const capabilities = agentCli(stateDir, ['capabilities']);
   assert.ok(capabilities.workflows.bootstrap.includes('scan'));
+  assert.deepEqual(capabilities.workflows.content, ['inspect']);
   assert.deepEqual(capabilities.bootstrap_scan_modes, ['structure', 'metadata']);
   assert.ok(capabilities.workflows.tracked_direct.includes('rollback'));
   assert.ok(capabilities.workflows.guarded.includes('execute'));

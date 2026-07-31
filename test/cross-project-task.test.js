@@ -80,6 +80,38 @@ function taskRequest(targetProjectId, target = 'Site/plan.md') {
   };
 }
 
+test('cross-Project discovery reports the exact setup gap before Catalog work', (t) => {
+  const caseRoot = path.join(tempRoot, 'cross-project-setup-required');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const stateDir = path.join(caseRoot, 'state');
+  const registry = new Registry({ stateDir });
+  const targetProject = registry.create({ name: 'Website', currentPath: 'Site' });
+  registry.dispose();
+  const task = new TaskContract({ stateDir });
+  t.after(() => task.dispose());
+
+  assert.throws(
+    () => task.discoverContext({
+      projectId: targetProject.project_id,
+      purpose: 'career_positioning',
+      terms: ['portfolio'],
+    }),
+    (error) => {
+      assert.equal(error.code, 'ATLAS_CONTEXT_SETUP_REQUIRED');
+      assert.equal(error.details.schema, 'atlas-context-setup.v1');
+      assert.deepEqual(
+        error.details.missing,
+        ['workspace_root', 'target_project_location', 'context_link'],
+      );
+      assert.deepEqual(
+        error.details.required_actions.map((item) => item.action),
+        ['root.adopt', 'project.attach-root', 'project.link-context'],
+      );
+      return true;
+    },
+  );
+});
+
 test('cross-Project Task reuses a persistent Context Link and produces recoverable lineage', (t) => {
   const fixture = setup('cross-project-task');
   const task = new TaskContract({ stateDir: fixture.stateDir });

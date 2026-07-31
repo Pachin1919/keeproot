@@ -24,6 +24,45 @@ function call(stateDir, args) {
   return envelope.data;
 }
 
+function callFailure(stateDir, args) {
+  const result = spawnSync(process.execPath, [cliPath, ...args, '--json'], {
+    encoding: 'utf8',
+    windowsHide: true,
+    env: {
+      ...process.env,
+      ATLAS_STATE_DIR: stateDir,
+      ATLAS_HOME: path.resolve('.'),
+    },
+  });
+  assert.equal(result.status, 1, result.stderr || result.stdout);
+  assert.equal(result.stderr, '');
+  const envelope = JSON.parse(result.stdout);
+  assert.equal(envelope.ok, false);
+  return envelope.error;
+}
+
+test('CLI returns structured cross-Project setup actions instead of a generic miss', () => {
+  const caseRoot = path.join(tempRoot, 'project-context-cli-setup-required');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const stateDir = path.join(caseRoot, 'state');
+  const targetProject = call(stateDir, [
+    'project', 'create', '--name', 'Website', '--path', 'Site',
+  ]);
+
+  const error = callFailure(stateDir, [
+    'task', 'discover-context',
+    '--project', targetProject.project_id,
+    '--purpose', 'career_positioning',
+    '--term', 'portfolio',
+  ]);
+  assert.equal(error.code, 'ATLAS_CONTEXT_SETUP_REQUIRED');
+  assert.equal(error.details.status, 'context_setup_required');
+  assert.deepEqual(
+    error.details.required_actions.map((item) => item.action),
+    ['root.adopt', 'project.attach-root', 'project.link-context'],
+  );
+});
+
 test('CLI adopts Roots, persists a Context Link, and performs bounded local Catalog search', () => {
   const caseRoot = path.join(tempRoot, 'project-context-cli');
   fs.rmSync(caseRoot, { recursive: true, force: true });

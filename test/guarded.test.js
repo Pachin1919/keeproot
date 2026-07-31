@@ -43,8 +43,29 @@ test('Guarded prepare creates a preview but cannot execute without approval', (t
   assert.equal(preview.run.status, 'prepared');
   assert.equal(preview.risk.mode, 'guarded');
   assert.match(preview.candidate.diff_text, /\+guarded candidate/);
+  assert.ok(path.resolve(preview.candidate.review_path).startsWith(path.resolve(stateDir, 'work', 'reviews')));
+  assert.equal(fs.readFileSync(preview.candidate.review_path, 'utf8'), `${baseline}guarded candidate\n`);
+  assert.equal(prepared.review_path, preview.candidate.review_path);
+  assert.equal(preview.candidate.review_authoritative, false);
   assert.equal(fs.readFileSync(target, 'utf8'), baseline);
   assert.throws(() => guarded.execute(prepared.run_id), /approval/i);
+});
+
+test('Guarded preview rebuilds a changed review copy from the authoritative Candidate Blob', (t) => {
+  const { vault, stateDir } = setup('guarded-review-copy-rebuild');
+  const guarded = openGuarded(t, stateDir);
+  const prepared = guarded.prepare({
+    root: vault,
+    target: 'allowed-a.md',
+    candidateContent: '# Reviewed candidate\n',
+  });
+  const first = guarded.preview(prepared.run_id);
+  fs.chmodSync(first.candidate.review_path, 0o666);
+  fs.writeFileSync(first.candidate.review_path, 'tampered review copy\n', 'utf8');
+
+  const second = guarded.preview(prepared.run_id);
+  assert.equal(fs.readFileSync(second.candidate.review_path, 'utf8'), '# Reviewed candidate\n');
+  assert.equal(second.candidate.content_hash, first.candidate.content_hash);
 });
 
 test('Guarded approval becomes stale when the target changes after preview', (t) => {

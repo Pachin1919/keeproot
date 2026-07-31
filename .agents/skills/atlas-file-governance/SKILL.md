@@ -1,6 +1,6 @@
 ---
 name: atlas-file-governance
-description: Use the user-installed Atlas local Runtime to inspect an authorized workspace, recognize a library, classify and place files, govern Agent outputs, issue a bounded content Task Contract, evolve reviewed paths, track edits, or recover changes. Trigger for project/workspace inspection, Atlas Bootstrap, Intake, Task Contract, Project, Evolution, Derived, Tracked Direct, Guarded, Ledger, rollback, Vault organization, PPT material routing, Website source/demo isolation, attached files, or durable Agent outputs. If the Runtime is unavailable or incompatible, return runtime_required and recommend the Atlas installer instead of improvising governance.
+description: Use the user-installed Atlas local Runtime to inspect an authorized workspace, recognize a library, classify and place files, govern Agent outputs, issue a bounded content Task Contract, inspect attached Excel/CSV/PPT/DOCX files locally, profile tabular data with Pandas and SQL, evolve reviewed paths, track edits, or recover changes. Trigger for project/workspace inspection, cross-project context, Atlas Bootstrap, Intake, Task Contract, Project, Evolution, Derived, Tracked Direct, Guarded, Ledger, rollback, Vault organization, spreadsheet structure or data-quality analysis, PPT material routing, Website source/demo isolation, attached files, or durable Agent outputs. If the Runtime is unavailable or incompatible, return runtime_required and recommend the Atlas installer instead of improvising governance.
 ---
 
 # Atlas File Governance
@@ -118,6 +118,8 @@ For recurring cross-Project work, do not scan sibling roots ad hoc and do not co
 
 Run `task discover-context --project <TARGET_PROJECT_ID> --purpose <PURPOSE> --term <TERM> ... --json`. Inspect only returned titles, paths, headings, tags, snippets, scores, and local read counts. Do not request another user decision when one candidate set is clearly within the already reviewed Context Link and current task. Use `task context-candidates <CANDIDATE_SET_ID>` after interruption instead of rescanning.
 
+Before discovery, require the target Project to have an active Root location and the requested purpose to have an active Context Link. If the Runtime returns `ATLAS_CONTEXT_SETUP_REQUIRED`, perform only the structured `required_actions` that the user has authorized; do not fall back to Portfolio scans, a guessed root, old single-root `task discover`, or ad hoc sibling reads.
+
 Submit selected entry IDs with `task prepare-context --candidate-set <ID> --select <ENTRY_ID> ... --request-file <REQUEST_JSON> --json`. Require `boundaries.read_root_ids`, one `boundaries.write_root_id`, and a non-empty `source_set_id`. Use `task source-set <SOURCE_SET_ID>` to reconcile the immutable selection. Open only the selected source paths needed by the content Skill. If a selected source changes before fulfillment, Atlas must mark the Task stale and the Agent must rediscover rather than bypassing the stop. `task fulfill` continues to use the existing Derived writer, so output Material lineage and rollback remain part of the same Task.
 
 V1.3 Context Links enforce extension and candidate-count filters. Do not submit a role filter; the direct-text Catalog does not yet have a complete role index. A disabled or superseded Context Link, a refreshed Candidate source, or a changed source/target Project Root makes the old selection stale. Rediscover under the current Link and Project locations instead of replaying the old Candidate Set or Task.
@@ -145,6 +147,21 @@ Pass the returned `capture_file` to `atlas capture localize --input-file <path> 
 Use `atlas capture sample <work_id> --start-character <n> --characters <1..4000> --json` only for the smallest excerpt needed for semantic classification or analysis. Do not loop through the whole document by default. Then pass `candidate_path` to Intake. Do not call `intake show` after a successful execute.
 
 When the current task includes an attached local file, take its supplied path as the Candidate and set `origin=human_submitted` without asking the user to repeat the path or describe the origin. The Agent—not Atlas—must interpret the user's request and read the smallest necessary attachment content, then combine that semantic judgment with Atlas file facts, active Projects, and accepted routing rules to propose `kind`, `project`, `role`, and `target`. Atlas validates and executes that structured proposal; it does not infer natural-language intent. When an Agent is about to create a durable output, the Agent proposes its purpose and Project, then obtains a validated staging/final placement through Task Contract or Intake before writing; do not invent a project source-directory path for convenience. The user-facing response should normally be one receipt stating the selected Project, stage, and destination—not a request for internal protocol fields.
+
+### Attachment-dependent structure decisions
+
+When an exact attached binary file is available and a directory, routing, or splitting decision depends on its internal semantics, perform bounded local structural extraction before proposing the structure. “Environment setup only” limits modification; it does not prohibit read-only structural inspection unless the user explicitly forbids reading the attachment.
+
+Call `atlas content inspect --file <EXACT_PATH> --purpose <structure|content|data|visual> --json` first. For an XLSX data profile, add one exact `--sheet <NAME>`. `purpose=data` returns local Pandas/SQLite statistics without raw rows. If `next_action.mode` is `use_local_extraction` or `use_local_data_profile`, do not open a browser or desktop application and do not create screenshots.
+
+For spreadsheets, inspect at minimum:
+
+- worksheet names;
+- used ranges;
+- relevant header rows;
+- merged or multi-level header structure.
+
+Use the appropriate local content Skill for extraction. Atlas governs the authorized path, placement, versions, lineage, execution, and recovery; the Agent interprets the extracted structure. Do not propose artifact-type directories from a brief alone when the exact attachment can resolve the classification. Do not scan Downloads or unrelated folders to look for an attachment whose exact path was not provided.
 
 When the current task already supplies one exact attachment, Project, absent target, intent, and execution authorization, call `scripts/intake-attached-file.ps1` instead of rebuilding the PowerShell/JSON sequence. Pass either the stable Project ID or the exact Project name/path; use `-CreateProjectIfMissing` only when the Agent has already established that missing Project identity. The script performs the Runtime handshake, exact Project reconciliation, direct Intake prepare/execute, final Hash check, and one compact receipt. Do not call `work stage` first for an attached local file: Intake captures the external Candidate itself. Stop on the script's unresolved or failed receipt rather than retrying commands by hand.
 
@@ -193,7 +210,7 @@ If the task is cancelled before any change, use `abort`. If Atlas reports that f
 
 ## Guarded
 
-Create the candidate outside the governed target, under Atlas runtime state. Run `prepare`, then inspect `preview` and present the meaningful Diff, risk, and recovery route to the user. Do not call `approve` without explicit approval for the current candidate.
+Create the candidate outside the governed target, under Atlas runtime state. Run `prepare`, then inspect `preview` and present the meaningful Diff, risk, and recovery route to the user. Open the returned `candidate.review_path` when the user needs to read the full candidate. It is a user-openable read-only copy under Atlas Work, not the authoritative Candidate; editing it does not revise the run. Do not call `approve` without explicit approval for the current candidate.
 
 After approval, call `guarded apply-approved <run_id> --reason <current_user_approval> --json` to record the approval, revalidate state, execute exactly that Candidate, and return one compact verified receipt. A changed target invalidates approval; preview or revise again. Rejecting or revising must preserve the previous Candidate ChangeSet. Rollback must stop rather than overwrite later legitimate changes.
 

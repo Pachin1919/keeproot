@@ -54,6 +54,43 @@ function currentHash(filePath) {
   return sha256File(filePath);
 }
 
+function reviewExtension(targetPath) {
+  const extension = path.extname(targetPath);
+  if (!extension || extension.length > 16 || !/^\.[a-z0-9._-]+$/iu.test(extension)) return '.txt';
+  return extension;
+}
+
+function ensureReviewCopy(stateDir, runId, candidate) {
+  if (path.basename(runId) !== runId || !/^GRD-[A-Za-z0-9-]+$/u.test(runId)) {
+    throw new Error(`Guarded review path requires a valid run ID: ${runId}`);
+  }
+  validateMaterial(candidate, 'Candidate');
+  const runDirectory = path.join(stateDir, 'work', 'reviews', runId);
+  fs.mkdirSync(runDirectory, { recursive: true });
+  const reviewPath = path.join(runDirectory, `candidate${reviewExtension(candidate.target_path)}`);
+  if (fs.existsSync(reviewPath)) {
+    const stat = fs.lstatSync(reviewPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`Guarded review path must be a regular non-symbolic-link file: ${reviewPath}`);
+    }
+    if (sha256File(reviewPath) === candidate.content_hash) return reviewPath;
+    fs.chmodSync(reviewPath, 0o666);
+    fs.rmSync(reviewPath, { force: true });
+  }
+  const temporary = path.join(runDirectory, `.candidate-${crypto.randomUUID()}.tmp`);
+  try {
+    fs.copyFileSync(candidate.blob_path, temporary, fs.constants.COPYFILE_EXCL);
+    if (sha256File(temporary) !== candidate.content_hash) {
+      throw new Error('Guarded review copy hash does not match the authoritative Candidate.');
+    }
+    fs.chmodSync(temporary, 0o444);
+    fs.renameSync(temporary, reviewPath);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+  return reviewPath;
+}
+
 function atomicReplace(targetPath, blobPath, expectedCurrentHash) {
   const directory = path.dirname(targetPath);
   const tempPath = path.join(directory, `.atlas-${crypto.randomUUID()}.tmp`);
@@ -118,7 +155,11 @@ export class Guarded {
       new RuntimeStorage({ stateDir: this.stateDir, ledger: this.ledger })
         .markCaptured(candidateFile, receipt.run_id);
     }
-    return receipt;
+    const detail = this.preview(receipt.run_id);
+    return {
+      ...receipt,
+      review_path: detail.candidate.review_path,
+    };
   }
 
   #prepare({
@@ -209,7 +250,17 @@ export class Guarded {
   }
 
   preview(runId) {
-    return this.ledger.getGuardedDetail(runId);
+    const detail = this.ledger.getGuardedDetail(runId);
+    const reviewPath = ensureReviewCopy(this.stateDir, runId, detail.candidate);
+    return {
+      ...detail,
+      candidate: {
+        ...detail.candidate,
+        review_path: reviewPath,
+        review_read_only: true,
+        review_authoritative: false,
+      },
+    };
   }
 
   approve(runId, { reason = null } = {}) {
