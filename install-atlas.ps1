@@ -7,7 +7,8 @@ param(
   [string]$CodexHome = (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex'),
   [string]$ProjectRoot,
   [string]$NodePath = 'node.exe',
-  [string[]]$LibraryRoot = @()
+  [string[]]$LibraryRoot = @(),
+  [switch]$NoStartMenuShortcut
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,4 +40,26 @@ foreach ($root in $LibraryRoot) {
 }
 
 & $nodeExecutable @arguments
-exit $LASTEXITCODE
+$runtimeExitCode = $LASTEXITCODE
+
+if ($runtimeExitCode -eq 0 -and -not $NoStartMenuShortcut) {
+  $programs = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+  $shortcutPath = Join-Path $programs 'Atlas UI.lnk'
+  if ($Command -in @('install', 'upgrade')) {
+    try {
+      $shell = New-Object -ComObject WScript.Shell
+      $shortcut = $shell.CreateShortcut($shortcutPath)
+      $shortcut.TargetPath = Join-Path $InstallRoot 'atlas-ui.cmd'
+      $shortcut.WorkingDirectory = [Environment]::GetFolderPath('UserProfile')
+      $shortcut.Description = 'Open the local Atlas Workspace UI'
+      $shortcut.WindowStyle = 7
+      $shortcut.Save()
+    } catch {
+      Write-Warning "Atlas Runtime was installed, but the Start menu shortcut could not be created: $($_.Exception.Message)"
+    }
+  } elseif ($Command -eq 'uninstall') {
+    Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
+  }
+}
+
+exit $runtimeExitCode

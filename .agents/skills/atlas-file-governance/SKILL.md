@@ -17,13 +17,13 @@ When the SessionStart Hook identifies a managed Project, use its injected Task s
 
 Codex Desktop auto-context uses a reviewed project-local `.codex/hooks.json`; the Atlas Runtime and Ledger remain user-level. Do not tell the user to type `/hooks` into chat. If the exact Project Root has no trusted Atlas hook, report that setup fact once and continue through the ordinary Skill path.
 
-When the user asks to see whether Atlas recognized the current workspace, run `atlas ui context --path <CURRENT_WORKING_DIRECTORY> --json` and return its `view_path`. The page is local state, not a durable Project Artifact; do not copy it into the user project.
+When the user asks to open Atlas or control Tasks visually, start `atlas ui --path <CURRENT_WORKING_DIRECTORY> --no-open` and return its loopback URL. The Workspace lists managed Projects and Tasks; the user opens a Task without copying its ID. The server listens only on `127.0.0.1`, can be stopped from the Workspace, and calls existing Atlas services for actions. Omit `--no-open` when the user launches Atlas directly and wants the default browser opened.
 
-When the user asks to inspect an existing Atlas Task, run `atlas ui operation --task <TASK_ID> --json` and return its `view_path`. The saved page combines existing Task, PolicyDecision, Candidate, Diff, Receipt and rollback facts. It is read-only Atlas state and must not be copied into the user project.
+`ui context --path` and `ui operation --task` create audit Snapshots, not interactive UI. Use them only when the user asks for a saved, read-only state. They remain under Atlas state and must not be copied into the user project.
 
 When the user asks whether a persistent cross-Project Task still uses current sources, add `--refresh-sources`. This refreshes only the Projects in that Task's Source Set and hashes only the selected files. Do not add it to ordinary page opens or Tasks without a Source Set.
 
-When the user wants to approve, reject, execute, or roll back from the page, start `atlas ui serve --task <TASK_ID>` and return the loopback URL. Add `--refresh-sources` only when the user asks to recheck a persistent Source Set. The server binds one Task, listens only on `127.0.0.1`, and stops with the launching process. Atlas revalidates the Task, write run, ChangeSet, Candidate/Diff Hashes and existing review before every action. Do not replace it with a button that runs an unbound CLI string.
+When the user wants to open one known Task directly, add `--task <TASK_ID>` to `atlas ui`. Add `--refresh-sources` only when the user asks to recheck a persistent Source Set. Atlas revalidates the Task, write run, ChangeSet, Candidate/Diff Hashes and existing review before every action. Execute and rollback require an explicit confirmation in the page. Do not replace the action bridge with a button that runs an unbound CLI string.
 
 ## Choose the shortest path
 

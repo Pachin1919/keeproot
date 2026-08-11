@@ -18,13 +18,21 @@ export function renderStatus(status, label = status) {
   return `<span class="status ${statusClass(status)}">${escapeHtml(label)}</span>`;
 }
 
-export function renderNav(current) {
+export function renderNav(current, { interactive = false, workspaceHref = '/' } = {}) {
+  const items = interactive
+    ? [
+        { label: 'Workspace', href: workspaceHref },
+        { label: 'Tasks', href: `${workspaceHref}#tasks` },
+      ]
+    : [{ label: 'Snapshot', href: null }];
   return `<aside class="sidebar">
     <div class="brand">Atlas</div>
     <nav aria-label="Primary">
       <ul class="nav-list">
-        ${['Workspace', 'Tasks', 'Rules', 'Sources', 'Runtime'].map((item) => (
-    `<li class="nav-item"${item === current ? ' aria-current="page"' : ''}>${item}</li>`
+        ${items.map((item) => (
+    `<li class="nav-item"${item.label === current ? ' aria-current="page"' : ''}>${item.href
+      ? `<a href="${escapeHtml(item.href)}">${escapeHtml(item.label)}</a>`
+      : escapeHtml(item.label)}</li>`
   )).join('')}
       </ul>
     </nav>

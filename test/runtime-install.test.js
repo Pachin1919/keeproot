@@ -48,6 +48,7 @@ test('Runtime installer is offline, user-scoped, idempotent, and keeps state out
   assert.equal(second.status, 'already_installed');
   assert.equal(first.network_access, false);
   assert.ok(fs.existsSync(path.join(scope.installRoot, 'atlas.cmd')));
+  assert.ok(fs.existsSync(path.join(scope.installRoot, 'atlas-ui.cmd')));
   assert.ok(fs.existsSync(path.join(scope.installRoot, 'runtime', 'bin', 'atlas.js')));
   assert.ok(fs.existsSync(path.join(scope.skillRoot, 'SKILL.md')));
   const located = locateInstalledRuntime(scope.installRoot);
@@ -160,6 +161,7 @@ test('Runtime upgrade preserves an old Ledger and uninstall preserves all user s
   const removed = uninstallRuntime({ installRoot: scope.installRoot, skillRoot: scope.skillRoot });
   assert.equal(removed.status, 'uninstalled');
   assert.equal(fs.existsSync(path.join(scope.installRoot, 'runtime')), false);
+  assert.equal(fs.existsSync(path.join(scope.installRoot, 'atlas-ui.cmd')), false);
   assert.equal(fs.existsSync(scope.skillRoot), false);
   assert.equal(fs.readFileSync(stateFile, 'utf8'), 'old-ledger-bytes');
 });

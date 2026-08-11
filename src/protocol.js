@@ -1,4 +1,4 @@
-export const ATLAS_VERSION = '1.5.0';
+export const ATLAS_VERSION = '1.5.1';
 export const PROTOCOL_VERSION = 'atlas-cli.v1';
 
 export const CAPABILITIES = Object.freeze({
@@ -21,8 +21,8 @@ export const CAPABILITIES = Object.freeze({
   },
   json_flag: '--json',
   workflows: {
-      agent: ['context', 'start', 'status', 'prepare', 'approve', 'fulfill', 'resume', 'rollback'],
-      ui: ['context', 'operation', 'serve', 'action'],
+    agent: ['context', 'start', 'status', 'prepare', 'approve', 'fulfill', 'resume', 'rollback'],
+    ui: ['start', 'context', 'operation', 'serve', 'action'],
     inspect: ['workspace'],
     portfolio: ['inventory', 'show', 'review', 'plan'],
     bootstrap: ['profiles', 'scan', 'recommend', 'contract', 'adopt', 'context', 'propose', 'status', 'show', 'review', 'initialize'],

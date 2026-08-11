@@ -30,6 +30,10 @@ h3 { font-size: 15px; margin-bottom: 10px; }
 .action-button-secondary { background: transparent; border: 1px solid var(--line); color: var(--ink); }
 .action-notice { border-left: 3px solid var(--accent); margin-top: 14px; padding-left: 10px; }
 .receipt { border-left: 3px solid var(--accent); padding-left: 14px; }
+.text-link { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.confirmation { align-items: flex-start; color: var(--muted); display: flex; gap: 8px; }
+.confirmation input { margin-top: 4px; }
+.nav-item a { color: inherit; display: block; text-decoration: none; }
 @media (prefers-reduced-motion: no-preference) {
   .nav-item, .action-button { transition: background-color 150ms ease, color 150ms ease, opacity 150ms ease, transform 150ms ease; }
   .action-button:active:not(:disabled) { transform: translateY(1px); }

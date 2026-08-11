@@ -59,6 +59,8 @@ test('locator returns runtime_required and fails closed on old protocol, non-JSO
   fs.mkdirSync(path.join(root, 'bin'), { recursive: true });
   fs.mkdirSync(manifest.skill_path, { recursive: true });
   fs.writeFileSync(path.join(root, 'bin', 'atlas.js'), '', 'utf8');
+  fs.writeFileSync(path.join(root, 'atlas.cmd'), '', 'utf8');
+  fs.writeFileSync(path.join(root, 'atlas-ui.cmd'), '', 'utf8');
   fs.writeFileSync(path.join(root, 'atlas-install.json'), JSON.stringify(manifest), 'utf8');
   const nonJson = handshakeRuntime({
     installRoot: root,

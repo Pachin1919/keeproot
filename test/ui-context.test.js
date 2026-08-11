@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { createContextView } from '../src/ui-context.js';
+import { openLocalUi } from '../src/ui-launcher.js';
 
 test('UI context writes one local HTML view for bounded Project candidates', () => {
   const stateDir = path.resolve('test', '.tmp', 'ui-context');
@@ -95,4 +96,22 @@ test('UI context writes one local HTML view for bounded Project candidates', () 
   assert.match(html, /Changed: target_subdirectory/u);
   assert.match(html, /tabular_profile/u);
   assert.doesNotMatch(html, /<JMC & Media>/u);
+});
+
+test('UI browser launcher accepts only loopback URLs and uses the platform opener', () => {
+  const calls = [];
+  const fakeChild = { unref() {} };
+  const result = openLocalUi('http://127.0.0.1:4319/', {
+    platform: 'win32',
+    spawnProcess(command, args, options) {
+      calls.push({ command, args, options });
+      return fakeChild;
+    },
+  });
+  assert.equal(result.status, 'requested');
+  assert.equal(calls[0].command, 'explorer.exe');
+  assert.deepEqual(calls[0].args, ['http://127.0.0.1:4319/']);
+  assert.throws(() => openLocalUi('https://example.com/', {
+    platform: 'win32', spawnProcess: () => fakeChild,
+  }), /only a local loopback URL/iu);
 });

@@ -67,8 +67,8 @@ function ruleHistorySummary(history, projectId) {
   };
 }
 
-function pendingTasks(registry, projectId) {
-  return (registry.ledger?.tasks?.listPendingByProject(projectId, { limit: 8 }) ?? []).map((task) => ({
+function normalizeTask(task) {
+  return {
     task_id: task.task_id,
     task_status: task.task_status,
     intent: task.intent,
@@ -81,17 +81,27 @@ function pendingTasks(registry, projectId) {
     source_freshness: task.source_set_id
       ? { status: 'not_checked', reason_code: 'explicit_refresh_required' }
       : { status: 'unavailable', reason_code: 'task_has_no_source_set' },
-  }));
+  };
+}
+
+function tasksForProject(registry, projectId) {
+  const repository = registry.ledger?.tasks;
+  const all = repository?.listForUiByProject
+    ? repository.listForUiByProject(projectId, { limit: 20 })
+    : (repository?.listPendingByProject(projectId, { limit: 8 }) ?? []);
+  return all.map(normalizeTask);
 }
 
 function projectEntry(registry, activeRules, ruleHistory, project, location, relationship) {
-  const pending = pendingTasks(registry, project.id);
+  const tasks = tasksForProject(registry, project.id);
+  const pending = tasks.filter((task) => !['completed', 'rolled_back', 'rejected', 'cancelled', 'blocked'].includes(task.task_status));
   return {
     relationship,
     project,
     location,
     task_status: pending.length ? `${pending[0].task_status} / ${pending[0].task_id}` : 'idle',
     pending_tasks: pending,
+    tasks,
     routes: rulesForProject(activeRules, project.id),
     rule_history: ruleHistorySummary(ruleHistory, project.id),
   };
@@ -123,6 +133,7 @@ export function buildContextModel({ currentPath, registry, rules, runtime = null
     ? rules.history({ root: resolution.root.current_path })
     : activeRules;
   let projects = [];
+  let overview = false;
   if (resolution.status === 'resolved') {
     projects = [projectEntry(
       registry, activeRules, ruleHistory, resolution.project, resolution.location, 'Current Project',
@@ -132,15 +143,29 @@ export function buildContextModel({ currentPath, registry, rules, runtime = null
       projectEntry(registry, activeRules, ruleHistory, project, location, 'Candidate')
     ));
   }
+  if (!projects.length && typeof registry.list === 'function' && typeof registry.show === 'function') {
+    overview = true;
+    projects = registry.list().filter((project) => project.status !== 'merged').slice(0, 24).flatMap((project) => {
+      const detail = registry.show(project.id);
+      if (!detail.location?.root_path) return [];
+      const projectRules = rules.active({ root: detail.location.root_path });
+      const history = typeof rules.history === 'function'
+        ? rules.history({ root: detail.location.root_path })
+        : projectRules;
+      return [projectEntry(registry, projectRules, history, project, detail.location, 'Managed Project')];
+    });
+  }
   return {
     schema: 'atlas-ui-context-model.v1',
     generated_at: new Date().toISOString(),
     current_path: resolvedPath,
-    resolution_status: resolution.status,
+    resolution_status: overview ? 'overview' : resolution.status,
     status_label: resolution.status === 'resolved'
       ? 'Atlas resolved the current Project.'
       : (projects.length
-        ? 'Atlas found Project candidates under this Workspace Root.'
+        ? (resolution.root
+          ? 'Atlas found Project candidates under this Workspace Root.'
+          : 'Atlas shows managed Projects because the launch directory is not registered.')
         : 'Atlas needs Root or Project Location setup.'),
     root: resolution.root ? { id: resolution.root.id, current_path: resolution.root.current_path } : null,
     projects,

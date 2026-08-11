@@ -185,6 +185,14 @@ function wrapperText(manifest) {
   ].join('\r\n');
 }
 
+function uiWrapperText() {
+  return [
+    '@echo off',
+    'call "%~dp0atlas.cmd" ui %*',
+    '',
+  ].join('\r\n');
+}
+
 export function locateInstalledRuntime(installRootInput) {
   const installRoot = path.resolve(installRootInput);
   const manifestPath = path.join(installRoot, MANIFEST_NAME);
@@ -204,7 +212,13 @@ export function locateInstalledRuntime(installRootInput) {
       expected_protocol: PROTOCOL_VERSION, received_protocol: manifest.protocol_version,
     };
   }
-  const required = [manifest.node_path, path.join(manifest.runtime_path, 'bin', 'atlas.js'), manifest.skill_path];
+  const required = [
+    manifest.node_path,
+    path.join(manifest.runtime_path, 'bin', 'atlas.js'),
+    manifest.skill_path,
+    path.join(installRoot, 'atlas.cmd'),
+    path.join(installRoot, 'atlas-ui.cmd'),
+  ];
   if (required.some((entry) => !entry || !fs.existsSync(entry))) {
     return { status: 'runtime_required', install_root: installRoot, manifest };
   }
@@ -305,8 +319,10 @@ export function installRuntime(options) {
   const runtimeTarget = path.join(installRoot, 'runtime');
   const manifestPath = path.join(installRoot, MANIFEST_NAME);
   const wrapperPath = path.join(installRoot, 'atlas.cmd');
+  const uiWrapperPath = path.join(installRoot, 'atlas-ui.cmd');
   const oldManifest = fs.existsSync(manifestPath) ? fs.readFileSync(manifestPath) : null;
   const oldWrapper = fs.existsSync(wrapperPath) ? fs.readFileSync(wrapperPath) : null;
+  const oldUiWrapper = fs.existsSync(uiWrapperPath) ? fs.readFileSync(uiWrapperPath) : null;
   let runtimeSwapped = false;
   let skillSwapped = false;
   try {
@@ -328,6 +344,7 @@ export function installRuntime(options) {
       skillSha256,
     });
     fs.writeFileSync(wrapperPath, wrapperText(manifest), 'utf8');
+    fs.writeFileSync(uiWrapperPath, uiWrapperText(), 'utf8');
     fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
     if (fs.existsSync(runtimeBackup)) safeRemove(runtimeBackup, installRoot);
     if (fs.existsSync(skillBackup)) safeRemove(skillBackup, skillParent);
@@ -337,6 +354,7 @@ export function installRuntime(options) {
       state_dir: stateDir,
       skill_root: skillRoot,
       wrapper: wrapperPath,
+      ui_wrapper: uiWrapperPath,
       atlas_version: ATLAS_VERSION,
       from_version: existingVersion,
       to_version: ATLAS_VERSION,
@@ -354,6 +372,8 @@ export function installRuntime(options) {
     else fs.rmSync(manifestPath, { force: true });
     if (oldWrapper) fs.writeFileSync(wrapperPath, oldWrapper);
     else fs.rmSync(wrapperPath, { force: true });
+    if (oldUiWrapper) fs.writeFileSync(uiWrapperPath, oldUiWrapper);
+    else fs.rmSync(uiWrapperPath, { force: true });
     throw error;
   }
 }
@@ -367,6 +387,7 @@ export function uninstallRuntime({ installRoot: installRootInput, skillRoot: ski
   if (fs.existsSync(skillRoot)) safeRemove(skillRoot, path.dirname(skillRoot));
   fs.rmSync(path.join(installRoot, MANIFEST_NAME), { force: true });
   fs.rmSync(path.join(installRoot, 'atlas.cmd'), { force: true });
+  fs.rmSync(path.join(installRoot, 'atlas-ui.cmd'), { force: true });
   return {
     status: 'uninstalled',
     install_root: installRoot,

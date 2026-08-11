@@ -105,6 +105,25 @@ function waitForReviewUrl(child) {
   });
 }
 
+function waitForAtlasUiUrl(child) {
+  return new Promise((resolve, reject) => {
+    let output = '';
+    const timer = setTimeout(() => reject(new Error(`Timed out waiting for Atlas UI. Output: ${output}`)), 5000);
+    child.stdout.on('data', (chunk) => {
+      output += chunk;
+      const match = output.match(/Atlas UI: (http:\/\/127\.0\.0\.1:\d+\/)/u);
+      if (match) {
+        clearTimeout(timer);
+        resolve(match[1]);
+      }
+    });
+    child.once('exit', (code) => {
+      clearTimeout(timer);
+      reject(new Error(`Atlas UI exited before startup with ${code}. Output: ${output}`));
+    });
+  });
+}
+
 test('Agent lifecycle prepares one review, consumes one approval token, and rolls back', () => {
   const fixture = setup('agent-lifecycle-complete');
   const prepared = call(fixture.stateDir, [
@@ -250,6 +269,7 @@ test('Local Task Review completes approve, execute, and rollback through one loo
     csrf: hiddenValue(page, 'csrf'),
     binding: hiddenValue(page, 'binding'),
     action: 'execute',
+    confirmed: 'yes',
   });
   response = await fetch(`${url}action`, { method: 'POST', body: form, redirect: 'manual' });
   assert.equal(response.status, 303);
@@ -260,10 +280,82 @@ test('Local Task Review completes approve, execute, and rollback through one loo
     csrf: hiddenValue(page, 'csrf'),
     binding: hiddenValue(page, 'binding'),
     action: 'rollback',
+    confirmed: 'yes',
   });
   response = await fetch(`${url}action`, { method: 'POST', body: form, redirect: 'manual' });
   assert.equal(response.status, 303);
   assert.equal(fs.readFileSync(fixture.target, 'utf8'), fixture.baseline);
+});
+
+test('Atlas UI opens one Workspace and completes a Task without a manually entered Task ID', async (t) => {
+  const fixture = setup('ui-workspace-loopback');
+  call(fixture.stateDir, [
+    'agent', 'prepare', fixture.taskId,
+    '--candidate-file', fixture.candidate,
+    '--reason', 'Stage the Candidate shown in the Atlas Workspace.',
+  ]);
+  const child = spawn(process.execPath, [
+    cliPath, 'ui', '--path', fixture.caseRoot, '--no-open',
+  ], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+    env: { ...process.env, ATLAS_STATE_DIR: fixture.stateDir, ATLAS_HOME: atlasHome },
+  });
+  t.after(() => {
+    if (!child.killed) child.kill('SIGTERM');
+  });
+  const url = await waitForAtlasUiUrl(child);
+
+  const workspace = await (await fetch(url)).text();
+  assert.match(workspace, /Atlas Workspace/u);
+  assert.match(workspace, new RegExp(`href="/tasks/${fixture.taskId}"`, 'u'));
+
+  const taskUrl = `${url}tasks/${fixture.taskId}`;
+  let page = await (await fetch(taskUrl)).text();
+  let form = new URLSearchParams({
+    csrf: hiddenValue(page, 'csrf'),
+    binding: hiddenValue(page, 'binding'),
+    action: 'approve',
+    reason: 'The user approved the exact Candidate displayed here.',
+  });
+  let response = await fetch(`${taskUrl}/action`, { method: 'POST', body: form, redirect: 'manual' });
+  assert.equal(response.status, 303);
+  assert.equal(response.headers.get('location'), `/tasks/${fixture.taskId}`);
+  assert.equal(fs.readFileSync(fixture.target, 'utf8'), fixture.baseline);
+
+  page = await (await fetch(taskUrl)).text();
+  form = new URLSearchParams({
+    csrf: hiddenValue(page, 'csrf'),
+    binding: hiddenValue(page, 'binding'),
+    action: 'execute',
+  });
+  response = await fetch(`${taskUrl}/action`, { method: 'POST', body: form, redirect: 'manual' });
+  assert.equal(response.status, 400);
+  assert.equal(fs.readFileSync(fixture.target, 'utf8'), fixture.baseline);
+
+  form.set('confirmed', 'yes');
+  response = await fetch(`${taskUrl}/action`, { method: 'POST', body: form, redirect: 'manual' });
+  assert.equal(response.status, 303);
+  assert.equal(fs.readFileSync(fixture.target, 'utf8'), `${fixture.baseline}2026-02-01,20\n`);
+
+  page = await (await fetch(taskUrl)).text();
+  form = new URLSearchParams({
+    csrf: hiddenValue(page, 'csrf'),
+    binding: hiddenValue(page, 'binding'),
+    action: 'rollback',
+    confirmed: 'yes',
+  });
+  response = await fetch(`${taskUrl}/action`, { method: 'POST', body: form, redirect: 'manual' });
+  assert.equal(response.status, 303);
+  assert.equal(fs.readFileSync(fixture.target, 'utf8'), fixture.baseline);
+
+  const refreshedWorkspace = await (await fetch(url)).text();
+  response = await fetch(`${url}session/stop`, {
+    method: 'POST',
+    body: new URLSearchParams({ csrf: hiddenValue(refreshedWorkspace, 'csrf') }),
+  });
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /Atlas stopped/u);
 });
 
 test('UI action bridge records rejection without changing the target', () => {

@@ -33,7 +33,8 @@ import { TaskContract } from '../src/task-contract.js';
 import { createContextView } from '../src/ui-context.js';
 import { createOperationSnapshot } from '../src/ui-operation.js';
 import { applyUiAction } from '../src/ui-action.js';
-import { startTaskReviewServer } from '../src/ui-server.js';
+import { openLocalUi } from '../src/ui-launcher.js';
+import { startAtlasUiServer, startTaskReviewServer } from '../src/ui-server.js';
 import {
   ATLAS_VERSION,
   CAPABILITIES,
@@ -143,6 +144,7 @@ Usage:
   atlas agent fulfill <task_id> --approval-token <token>
   atlas agent resume <task_id>
   atlas agent rollback <task_id>
+  atlas ui [--path <current_directory>] [--task <task_id>] [--port <port>] [--no-open] [--refresh-sources]
   atlas ui context --path <current_directory>
   atlas ui operation --task <task_id> [--refresh-sources]
   atlas ui serve --task <task_id> [--port <port>] [--refresh-sources]
@@ -2386,7 +2388,68 @@ async function main() {
     } else if (command === 'agent') {
       handleAgent(registry, rules, agentLifecycle, args);
     } else if (command === 'ui') {
-      if (args[0] === 'context') {
+      if (!args[0] || args[0].startsWith('--')) {
+        const options = {
+          currentPath: process.cwd(), taskId: null, port: 0, open: true, refreshSources: false,
+        };
+        for (let index = 0; index < args.length; index += 1) {
+          if (args[index] === '--path') options.currentPath = args[++index];
+          else if (args[index] === '--task') options.taskId = args[++index];
+          else if (args[index] === '--port') options.port = Number(args[++index]);
+          else if (args[index] === '--no-open') options.open = false;
+          else if (args[index] === '--refresh-sources') options.refreshSources = true;
+          else throw new Error(`Unknown ui argument: ${args[index]}`);
+        }
+        if (!options.currentPath || !Number.isInteger(options.port) || options.port < 0 || options.port > 65535) {
+          throw new Error('ui accepts an optional --path, --task, --port, --no-open, and --refresh-sources.');
+        }
+        const diagnostics = tracker.ledger.diagnostics();
+        const session = await startAtlasUiServer({
+          stateDir,
+          currentPath: options.currentPath,
+          initialTaskId: options.taskId,
+          registry,
+          rules,
+          runtime: {
+            atlas_version: ATLAS_VERSION,
+            node_version: process.versions.node,
+            ledger: {
+              integrity: diagnostics.integrity,
+              schema_version: diagnostics.schema_version,
+              supported_schema_version: diagnostics.supported_schema_version,
+            },
+            python: optionalPythonCapability(),
+          },
+          task,
+          guarded,
+          derived,
+          lifecycle: agentLifecycle,
+          port: options.port,
+          refreshSources: options.refreshSources,
+        });
+        let browser = { status: 'not_requested' };
+        if (options.open) {
+          try {
+            browser = openLocalUi(session.url);
+          } catch (error) {
+            browser = { status: 'failed', message: error.message };
+          }
+        }
+        emit('ui.start', {
+          schema: session.schema,
+          url: session.url,
+          workspace_url: session.workspace_url,
+          network_scope: session.network_scope,
+          browser,
+          source_changes: [],
+        }, (detail) => console.log(`Atlas UI: ${detail.url}\nClose it from the Workspace page or press Ctrl+C.`));
+        await new Promise((resolve, reject) => {
+          const stop = () => session.close().then(resolve, reject);
+          process.once('SIGINT', stop);
+          process.once('SIGTERM', stop);
+          session.closed.then(resolve, reject);
+        });
+      } else if (args[0] === 'context') {
         if (args[1] !== '--path' || !args[2] || args.length !== 3) {
           throw new Error('ui context requires --path <current_directory>');
         }
@@ -2409,7 +2472,7 @@ async function main() {
             };
           })(),
         });
-        emit('ui.context', result, (detail) => console.log(`Atlas context view: ${detail.view_path}`));
+        emit('ui.context', result, (detail) => console.log(`Atlas Workspace snapshot: ${detail.view_path}`));
       } else if (args[0] === 'operation') {
         let taskId = null;
         let refreshSources = false;
@@ -2424,7 +2487,7 @@ async function main() {
         const result = createOperationSnapshot({
           stateDir, taskId, task, guarded, derived, refreshSources,
         });
-        emit('ui.operation', result, (detail) => console.log(`Atlas operation snapshot: ${detail.operation_path}`));
+        emit('ui.operation', result, (detail) => console.log(`Atlas Task snapshot: ${detail.operation_path}`));
       } else if (args[0] === 'action') {
         const options = { taskId: null, action: null, snapshotPath: null, reason: null, approvalToken: null };
         for (let index = 1; index < args.length; index += 1) {

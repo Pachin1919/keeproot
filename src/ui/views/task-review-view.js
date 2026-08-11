@@ -75,12 +75,14 @@ function receiptPanel(model) {
 
 function actionForm(action, options) {
   const needsReason = ['approve', 'reject'].includes(action);
+  const needsConfirmation = ['execute', 'rollback'].includes(action);
   return `<form class="action-form" method="post" action="${escapeHtml(options.actionEndpoint)}">
     <input type="hidden" name="csrf" value="${escapeHtml(options.csrfToken)}">
     <input type="hidden" name="binding" value="${escapeHtml(options.bindingDigest)}">
     <input type="hidden" name="action" value="${escapeHtml(action)}">
     ${needsReason ? `<label class="label" for="reason-${escapeHtml(action)}">Reason</label>
       <input class="action-input" id="reason-${escapeHtml(action)}" name="reason" required maxlength="500" autocomplete="off">` : ''}
+    ${needsConfirmation ? `<label class="confirmation"><input type="checkbox" name="confirmed" value="yes" required> I reviewed the current state and want Atlas to ${escapeHtml(action)} this exact Task.</label>` : ''}
     <button class="action-button${action === 'reject' || action === 'rollback' ? ' action-button-secondary' : ''}" type="submit">${escapeHtml(action)}</button>
   </form>`;
 }
@@ -103,25 +105,29 @@ function actionPanel(model, options) {
 }
 
 export function renderTaskReviewView(model, options = {}) {
+  const pageTitle = options.interactive ? 'Atlas Task Review' : 'Atlas Task Snapshot';
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Atlas Task Review</title>
+  <title>${pageTitle}</title>
   <style>${uiStyles()}</style>
 </head>
 <body>
   <div class="app-shell">
-    ${renderNav('Tasks')}
+    ${renderNav(options.interactive ? 'Tasks' : 'Snapshot', {
+    interactive: Boolean(options.interactive), workspaceHref: options.workspaceHref ?? '/',
+  })}
     <div class="workspace">
       <header class="topbar">
         <div><span class="label">${escapeHtml(model.project.id)}</span><strong class="mono">${escapeHtml(model.task.id)}</strong></div>
         ${renderStatus(model.ui_state.state)}
       </header>
       <main class="page">
-        <h1>Task review</h1>
+        <h1>${options.interactive ? 'Task review' : 'Task snapshot'}</h1>
         <p class="muted">User request: ${escapeHtml(model.task.intent)}</p>
+        ${options.interactive ? `<p><a class="text-link" href="${escapeHtml(options.workspaceHref ?? '/')}">← Back to Workspace</a>${options.refreshEndpoint ? ` · <a class="text-link" href="${escapeHtml(options.refreshEndpoint)}">Refresh selected sources</a>` : ''}</p>` : ''}
         <div class="page-grid">
           <div class="main-column">
             <section class="surface"><h2>Sources used</h2>${sourceList(model.sources.selected)}${sourceFreshness(model.sources.freshness)}</section>

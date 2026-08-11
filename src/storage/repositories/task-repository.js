@@ -64,6 +64,37 @@ export class TaskRepository {
     });
   }
 
+  listForUiByProject(projectId, { limit = 20 } = {}) {
+    return this.db.prepare(`
+      SELECT tc.run_id, tc.contract_id, tc.underlying_run_id, tc.source_set_id, tc.contract_json,
+             r.status AS task_status, r.intent, r.started_at, r.closed_at, r.rolled_back_at,
+             wr.mode AS write_mode, wr.status AS write_status
+      FROM task_contracts tc
+      JOIN runs r ON r.id = tc.run_id
+      LEFT JOIN runs wr ON wr.id = tc.underlying_run_id
+      WHERE tc.project_id = ?
+      ORDER BY COALESCE(r.closed_at, r.rolled_back_at, r.started_at) DESC, r.rowid DESC
+      LIMIT ?
+    `).all(projectId, limit).map((row) => {
+      const contract = parseJson(row.contract_json, {});
+      return {
+        task_id: row.run_id,
+        contract_id: row.contract_id,
+        task_status: row.task_status,
+        intent: row.intent,
+        target: contract.write?.target ?? null,
+        strategy: contract.write?.strategy ?? null,
+        source_set_id: row.source_set_id,
+        underlying_run_id: row.underlying_run_id,
+        write_mode: row.write_mode,
+        write_status: row.write_status,
+        started_at: row.started_at,
+        closed_at: row.closed_at,
+        rolled_back_at: row.rolled_back_at,
+      };
+    });
+  }
+
   findByContractId(contractId) {
     const row = this.db.prepare(`
       SELECT run_id FROM task_contracts WHERE contract_id = ?
