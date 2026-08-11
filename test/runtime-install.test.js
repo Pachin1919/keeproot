@@ -74,6 +74,30 @@ test('Runtime locate detects a changed installed bundle', () => {
   assert.equal(located.integrity, 'failed');
 });
 
+test('Runtime integrity ignores generated Python bytecode but still verifies installed source', () => {
+  const scope = setup('runtime-python-cache');
+  installRuntime({
+    sourceRoot: projectRoot,
+    installRoot: scope.installRoot,
+    skillRoot: scope.skillRoot,
+    nodePath: process.execPath,
+  });
+  const cache = path.join(
+    scope.installRoot,
+    'runtime',
+    'python',
+    'src',
+    'atlas_content',
+    '__pycache__',
+  );
+  fs.mkdirSync(cache, { recursive: true });
+  fs.writeFileSync(path.join(cache, 'branches.cpython-314.pyc'), 'generated-bytecode', 'utf8');
+
+  const located = locateInstalledRuntime(scope.installRoot);
+  assert.equal(located.status, 'ready');
+  assert.equal(located.integrity, 'verified');
+});
+
 test('Runtime installer rejects missing or old Node before writing installation files', () => {
   const scope = setup('runtime-node-prerequisite');
   assert.equal(probeNodeRuntime(path.join(scope.root, 'missing-node.exe')).status, 'missing');

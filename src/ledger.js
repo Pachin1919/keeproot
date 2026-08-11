@@ -4,18 +4,26 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { RISK_RULE_VERSION_ID } from './risk.js';
 import {
-  applyProjectContextMigration,
-  PROJECT_CONTEXT_SCHEMA_VERSION,
-} from './storage/migrations/v19-project-context.js';
+  initializeLedgerSchema,
+  LATEST_SCHEMA_VERSION,
+} from './storage/ledger-schema.js';
+import { ProjectRepository } from './storage/repositories/project-repository.js';
+import { PolicyRepository } from './storage/repositories/policy-repository.js';
+import { DerivedRepository } from './storage/repositories/derived-repository.js';
+import { GuardedRepository } from './storage/repositories/guarded-repository.js';
+import { EvolutionRepository } from './storage/repositories/evolution-repository.js';
+import {
+  TaskRepository,
+  TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID,
+} from './storage/repositories/task-repository.js';
+
+export { TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID } from './storage/repositories/task-repository.js';
 
 const RULE_VERSION_ID = 'RULE-TRACKED-DIRECT-1';
 const BOOTSTRAP_RULE_VERSION_ID = 'RULE-BOOTSTRAP-2';
-const EVOLUTION_RULE_VERSION_ID = 'RULE-EVOLUTION-6';
 const ORGANIZATION_PLAN_RULE_VERSION_ID = 'RULE-EVOLUTION-PLAN-1';
-const TASK_RULE_VERSION_ID = 'RULE-TASK-CONTRACT-1';
-export const TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID = 'RULE-TASK-SCOPED-EXPLICIT-1';
 const PORTFOLIO_RULE_VERSION_ID = 'RULE-PORTFOLIO-1';
-export const LATEST_SCHEMA_VERSION = PROJECT_CONTEXT_SCHEMA_VERSION;
+export { LATEST_SCHEMA_VERSION } from './storage/ledger-schema.js';
 
 function json(value) {
   return JSON.stringify(value);
@@ -26,16 +34,6 @@ function parseJson(value, fallback = null) {
 
 function now() {
   return new Date().toISOString();
-}
-
-function isProcessAlive(processId) {
-  if (!Number.isInteger(processId) || processId <= 0) return false;
-  try {
-    process.kill(processId, 0);
-    return true;
-  } catch (error) {
-    return error?.code === 'EPERM';
-  }
 }
 
 function assertWritableLedgerState(stateDir, databasePath) {
@@ -81,6 +79,66 @@ export class Ledger {
       this.db.exec('PRAGMA foreign_keys = ON;');
       this.db.exec('PRAGMA journal_mode = WAL;');
       this.#initializeSchema();
+      this.projects = new ProjectRepository({
+        db: this.db,
+        transaction: (callback) => this.transaction(callback),
+      });
+      this.policies = new PolicyRepository({
+        db: this.db,
+        transaction: (callback) => this.transaction(callback),
+        getRun: (runId) => this.getRun(runId),
+        insertEvent: (runId, eventType, payload, occurredAt) => (
+          this.#insertEvent(runId, eventType, payload, occurredAt)
+        ),
+      });
+      this.tasks = new TaskRepository({
+        db: this.db,
+        transaction: (callback) => this.transaction(callback),
+        getRun: (runId) => this.getRun(runId),
+        insertEvent: (runId, eventType, payload, occurredAt) => (
+          this.#insertEvent(runId, eventType, payload, occurredAt)
+        ),
+        storeBlobPath: (blobPath) => this.#storeBlobPath(blobPath),
+      });
+      this.derived = new DerivedRepository({
+        db: this.db,
+        transaction: (callback) => this.transaction(callback),
+        getRun: (runId) => this.getRun(runId),
+        getRuleVersion: (ruleVersionId) => this.getRuleVersion(ruleVersionId),
+        insertEvent: (runId, eventType, payload, occurredAt) => (
+          this.#insertEvent(runId, eventType, payload, occurredAt)
+        ),
+        insertRollbackOutcome: (runId, outcome, occurredAt) => (
+          this.#insertRollbackOutcome(runId, outcome, occurredAt)
+        ),
+        storeBlobPath: (blobPath) => this.#storeBlobPath(blobPath),
+        resolveBlobPath: (storedPath, contentHash) => this.#resolveBlobPath(storedPath, contentHash),
+      });
+      this.guarded = new GuardedRepository({
+        db: this.db,
+        transaction: (callback) => this.transaction(callback),
+        getRun: (runId) => this.getRun(runId),
+        getRuleVersion: (ruleVersionId) => this.getRuleVersion(ruleVersionId),
+        insertEvent: (runId, eventType, payload, occurredAt) => (
+          this.#insertEvent(runId, eventType, payload, occurredAt)
+        ),
+        insertRollbackOutcome: (runId, outcome, occurredAt) => (
+          this.#insertRollbackOutcome(runId, outcome, occurredAt)
+        ),
+        storeBlobPath: (blobPath) => this.#storeBlobPath(blobPath),
+        resolveBlobPath: (storedPath, contentHash) => this.#resolveBlobPath(storedPath, contentHash),
+      });
+      this.evolution = new EvolutionRepository({
+        db: this.db,
+        transaction: (callback) => this.transaction(callback),
+        getRun: (runId) => this.getRun(runId),
+        insertEvent: (runId, eventType, payload, occurredAt) => (
+          this.#insertEvent(runId, eventType, payload, occurredAt)
+        ),
+        insertRollbackOutcome: (runId, outcome, occurredAt) => (
+          this.#insertRollbackOutcome(runId, outcome, occurredAt)
+        ),
+      });
     } catch (error) {
       this.db.close();
       throw error;
@@ -88,591 +146,7 @@ export class Ledger {
   }
 
   #initializeSchema() {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        name TEXT NOT NULL,
-        applied_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS rule_versions (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        version TEXT NOT NULL,
-        definition_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS projects (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        current_path TEXT,
-        status TEXT NOT NULL,
-        parent_project_id TEXT REFERENCES projects(id),
-        lineage_json TEXT NOT NULL DEFAULT '{}',
-        created_at TEXT NOT NULL,
-        updated_at TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS project_aliases (
-        project_id TEXT NOT NULL REFERENCES projects(id),
-        alias TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(project_id, alias)
-      );
-
-      CREATE TABLE IF NOT EXISTS project_path_history (
-        id INTEGER PRIMARY KEY,
-        project_id TEXT NOT NULL REFERENCES projects(id),
-        path TEXT NOT NULL,
-        valid_from TEXT NOT NULL,
-        valid_to TEXT,
-        reason TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS project_relations (
-        id TEXT PRIMARY KEY,
-        source_project_id TEXT NOT NULL REFERENCES projects(id),
-        relation_type TEXT NOT NULL,
-        target_project_id TEXT NOT NULL REFERENCES projects(id),
-        effective_at TEXT NOT NULL,
-        details_json TEXT NOT NULL DEFAULT '{}',
-        UNIQUE(source_project_id, relation_type, target_project_id)
-      );
-
-      CREATE TABLE IF NOT EXISTS project_sources (
-        project_id TEXT NOT NULL REFERENCES projects(id),
-        prediction_id TEXT NOT NULL UNIQUE REFERENCES predictions(id),
-        scan_run_id TEXT NOT NULL REFERENCES runs(id),
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(project_id, prediction_id)
-      );
-
-      CREATE TABLE IF NOT EXISTS runs (
-        id TEXT PRIMARY KEY,
-        mode TEXT NOT NULL,
-        status TEXT NOT NULL,
-        root_path TEXT NOT NULL,
-        intent TEXT,
-        actor TEXT NOT NULL DEFAULT 'unknown',
-        agent TEXT,
-        model TEXT,
-        tool TEXT NOT NULL DEFAULT 'atlas-cli',
-        client_run_id TEXT,
-        rule_version_id TEXT NOT NULL REFERENCES rule_versions(id),
-        started_at TEXT NOT NULL,
-        closed_at TEXT,
-        aborted_at TEXT,
-        rolled_back_at TEXT,
-        receipt_json TEXT,
-        abort_receipt_json TEXT,
-        rollback_receipt_json TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS artifacts (
-        id TEXT PRIMARY KEY,
-        origin_run_id TEXT NOT NULL REFERENCES runs(id),
-        project_id TEXT REFERENCES projects(id),
-        kind TEXT NOT NULL,
-        current_path TEXT NOT NULL,
-        root_path TEXT,
-        role TEXT,
-        status TEXT NOT NULL DEFAULT 'active',
-        created_at TEXT NOT NULL,
-        updated_at TEXT
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_artifacts_run_path
-        ON artifacts(origin_run_id, current_path);
-
-      CREATE TABLE IF NOT EXISTS materials (
-        id TEXT PRIMARY KEY,
-        artifact_id TEXT NOT NULL REFERENCES artifacts(id),
-        stage TEXT NOT NULL,
-        content_hash TEXT NOT NULL,
-        byte_size INTEGER NOT NULL,
-        blob_path TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS observations (
-        id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        kind TEXT NOT NULL,
-        subject_artifact_id TEXT REFERENCES artifacts(id),
-        payload_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS predictions (
-        id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        kind TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS labels (
-        id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        subject_prediction_id TEXT REFERENCES predictions(id),
-        name TEXT NOT NULL,
-        value TEXT NOT NULL,
-        source TEXT NOT NULL,
-        details_json TEXT NOT NULL DEFAULT '{}',
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS policy_decisions (
-        id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        rule_version_id TEXT NOT NULL REFERENCES rule_versions(id),
-        decision TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        details_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS change_sets (
-        id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
-        status TEXT NOT NULL,
-        diff_text TEXT,
-        diff_hash TEXT,
-        summary_json TEXT,
-        created_at TEXT NOT NULL,
-        closed_at TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS operation_events (
-        id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        event_type TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        occurred_at TEXT NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_events_run_time
-        ON operation_events(run_id, occurred_at);
-
-      CREATE TABLE IF NOT EXISTS run_scopes (
-        id INTEGER PRIMARY KEY,
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        scope_path TEXT NOT NULL,
-        scope_kind TEXT NOT NULL,
-        UNIQUE(run_id, scope_path, scope_kind)
-      );
-
-      CREATE TABLE IF NOT EXISTS run_file_states (
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        path TEXT NOT NULL,
-        stage TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        content_hash TEXT NOT NULL,
-        byte_size INTEGER NOT NULL,
-        material_id TEXT REFERENCES materials(id),
-        PRIMARY KEY(run_id, path, stage)
-      );
-
-      CREATE TABLE IF NOT EXISTS changes (
-        id TEXT PRIMARY KEY,
-        change_set_id TEXT NOT NULL REFERENCES change_sets(id),
-        path TEXT NOT NULL,
-        change_type TEXT NOT NULL,
-        allowed INTEGER NOT NULL,
-        before_kind TEXT,
-        before_hash TEXT,
-        before_material_id TEXT REFERENCES materials(id),
-        after_kind TEXT,
-        after_hash TEXT,
-        after_material_id TEXT REFERENCES materials(id),
-        UNIQUE(change_set_id, path)
-      );
-
-      CREATE TABLE IF NOT EXISTS environment_scans (
-        run_id TEXT PRIMARY KEY REFERENCES runs(id),
-        fingerprint TEXT NOT NULL,
-        summary_json TEXT NOT NULL,
-        output_dir TEXT,
-        initialized_at TEXT
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_environment_scans_fingerprint
-        ON environment_scans(fingerprint);
-
-      CREATE TABLE IF NOT EXISTS environment_entries (
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        path TEXT NOT NULL,
-        entry_kind TEXT NOT NULL,
-        extension TEXT,
-        byte_size INTEGER NOT NULL,
-        modified_at TEXT NOT NULL,
-        content_hash TEXT,
-        metadata_json TEXT NOT NULL,
-        PRIMARY KEY(run_id, path)
-      );
-
-      CREATE TABLE IF NOT EXISTS environment_policies (
-        id TEXT PRIMARY KEY,
-        root_path TEXT NOT NULL,
-        scan_run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
-        rule_version_id TEXT NOT NULL REFERENCES rule_versions(id),
-        policy_json TEXT NOT NULL,
-        status TEXT NOT NULL,
-        activated_at TEXT NOT NULL,
-        deactivated_at TEXT
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_environment_policies_root_status
-        ON environment_policies(root_path, status, activated_at);
-
-      CREATE TABLE IF NOT EXISTS portfolio_inventories (
-        run_id TEXT PRIMARY KEY REFERENCES runs(id),
-        fingerprint TEXT NOT NULL,
-        depth INTEGER NOT NULL,
-        excluded_json TEXT NOT NULL,
-        expanded_json TEXT NOT NULL,
-        summary_json TEXT NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_portfolio_inventories_fingerprint
-        ON portfolio_inventories(fingerprint);
-
-      CREATE TABLE IF NOT EXISTS portfolio_roots (
-        id TEXT PRIMARY KEY,
-        current_path TEXT NOT NULL COLLATE NOCASE UNIQUE,
-        status TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS portfolio_root_path_history (
-        id INTEGER PRIMARY KEY,
-        root_id TEXT NOT NULL REFERENCES portfolio_roots(id),
-        path TEXT NOT NULL,
-        valid_from TEXT NOT NULL,
-        valid_to TEXT,
-        reason TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS portfolio_inventory_roots (
-        inventory_run_id TEXT NOT NULL REFERENCES runs(id),
-        root_id TEXT NOT NULL REFERENCES portfolio_roots(id),
-        relative_path TEXT NOT NULL,
-        observation_json TEXT NOT NULL,
-        type_prediction_id TEXT NOT NULL UNIQUE REFERENCES predictions(id),
-        relation_prediction_id TEXT NOT NULL UNIQUE REFERENCES predictions(id),
-        PRIMARY KEY(inventory_run_id, root_id)
-      );
-
-      CREATE TABLE IF NOT EXISTS portfolio_plans (
-        id TEXT PRIMARY KEY,
-        inventory_run_id TEXT NOT NULL REFERENCES runs(id),
-        target_root TEXT NOT NULL,
-        plan_hash TEXT NOT NULL,
-        plan_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        UNIQUE(inventory_run_id, target_root, plan_hash)
-      );
-
-      CREATE TABLE IF NOT EXISTS bootstrap_proposals (
-        id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        source_hash TEXT NOT NULL,
-        actor TEXT NOT NULL,
-        agent TEXT,
-        model TEXT,
-        tool TEXT NOT NULL,
-        client_run_id TEXT,
-        prediction_count INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        UNIQUE(run_id, source_hash)
-      );
-
-      CREATE TABLE IF NOT EXISTS bootstrap_proposal_predictions (
-        proposal_id TEXT NOT NULL REFERENCES bootstrap_proposals(id),
-        prediction_id TEXT NOT NULL UNIQUE REFERENCES predictions(id),
-        ordinal INTEGER NOT NULL,
-        PRIMARY KEY(proposal_id, ordinal)
-      );
-
-      CREATE TABLE IF NOT EXISTS candidate_change_sets (
-        id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
-        version INTEGER NOT NULL,
-        operation TEXT NOT NULL,
-        target_path TEXT NOT NULL,
-        status TEXT NOT NULL,
-        content_hash TEXT NOT NULL,
-        diff_text TEXT NOT NULL,
-        diff_hash TEXT NOT NULL,
-        summary_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS guarded_operations (
-        run_id TEXT PRIMARY KEY REFERENCES runs(id),
-        target_path TEXT NOT NULL,
-        before_material_id TEXT NOT NULL REFERENCES materials(id),
-        candidate_material_id TEXT NOT NULL REFERENCES materials(id),
-        approved_candidate_hash TEXT,
-        approval_receipt_json TEXT,
-        rejection_receipt_json TEXT,
-        execution_receipt_json TEXT,
-        revised_from_run_id TEXT REFERENCES runs(id),
-        executed_at TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS evolution_operations (
-        run_id TEXT PRIMARY KEY REFERENCES runs(id),
-        operation_type TEXT NOT NULL,
-        source_path TEXT,
-        target_path TEXT NOT NULL,
-        project_id TEXT REFERENCES projects(id),
-        prediction_id TEXT NOT NULL REFERENCES predictions(id),
-        plan_hash TEXT NOT NULL,
-        baseline_json TEXT NOT NULL,
-        approved_plan_hash TEXT,
-        approval_receipt_json TEXT,
-        rejection_receipt_json TEXT,
-        execution_receipt_json TEXT,
-        executed_at TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS task_contracts (
-        run_id TEXT PRIMARY KEY REFERENCES runs(id),
-        contract_id TEXT NOT NULL UNIQUE,
-        project_id TEXT NOT NULL REFERENCES projects(id),
-        project_path TEXT NOT NULL,
-        environment_rule_version_id TEXT NOT NULL REFERENCES rule_versions(id),
-        contract_hash TEXT NOT NULL,
-        request_json TEXT NOT NULL,
-        contract_json TEXT NOT NULL,
-        underlying_run_id TEXT REFERENCES runs(id),
-        completion_receipt_json TEXT,
-        completed_at TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS task_inputs (
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        ordinal INTEGER NOT NULL,
-        path TEXT NOT NULL,
-        artifact_id TEXT REFERENCES artifacts(id),
-        material_id TEXT REFERENCES materials(id),
-        prepared_hash TEXT NOT NULL,
-        byte_size INTEGER NOT NULL,
-        selected INTEGER NOT NULL,
-        selection_reason TEXT,
-        series_id TEXT,
-        temporal_mode TEXT,
-        coverage_start TEXT,
-        coverage_end TEXT,
-        required INTEGER NOT NULL,
-        priority INTEGER NOT NULL,
-        PRIMARY KEY(run_id, ordinal),
-        UNIQUE(run_id, path)
-      );
-
-      CREATE TABLE IF NOT EXISTS task_fulfillment_claims (
-        task_run_id TEXT PRIMARY KEY REFERENCES task_contracts(run_id),
-        claim_token TEXT NOT NULL UNIQUE,
-        process_id INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        planned_write_run_id TEXT,
-        write_run_id TEXT REFERENCES runs(id),
-        claimed_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS routing_corrections (
-        id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
-        root_path TEXT NOT NULL,
-        scope_type TEXT NOT NULL,
-        scope_key TEXT NOT NULL,
-        origin TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        role TEXT NOT NULL,
-        target_subdirectory TEXT NOT NULL,
-        rule_version_id TEXT NOT NULL REFERENCES rule_versions(id),
-        status TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        superseded_at TEXT
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_routing_corrections_lookup
-        ON routing_corrections(root_path, origin, kind, status, scope_type, scope_key);
-
-      CREATE TABLE IF NOT EXISTS preference_rules (
-        id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
-        root_path TEXT NOT NULL,
-        scope_type TEXT NOT NULL,
-        scope_key TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        condition_hash TEXT NOT NULL,
-        condition_json TEXT NOT NULL,
-        value_json TEXT NOT NULL,
-        priority INTEGER NOT NULL,
-        rule_version_id TEXT NOT NULL REFERENCES rule_versions(id),
-        status TEXT NOT NULL,
-        summary TEXT NOT NULL,
-        basis TEXT NOT NULL,
-        evidence_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        superseded_at TEXT
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_preference_rules_lookup
-        ON preference_rules(root_path, status, kind, scope_type, scope_key, priority);
-
-      CREATE TABLE IF NOT EXISTS rule_change_proposals (
-        id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
-        root_path TEXT NOT NULL,
-        proposal_hash TEXT NOT NULL,
-        scope_type TEXT NOT NULL,
-        scope_key TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        condition_hash TEXT NOT NULL,
-        condition_json TEXT NOT NULL,
-        value_json TEXT NOT NULL,
-        summary TEXT NOT NULL,
-        basis TEXT NOT NULL,
-        evidence_json TEXT NOT NULL,
-        confidence REAL NOT NULL,
-        priority INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        base_rule_id TEXT REFERENCES preference_rules(id),
-        impact_json TEXT NOT NULL,
-        activated_rule_id TEXT REFERENCES preference_rules(id),
-        created_at TEXT NOT NULL,
-        reviewed_at TEXT
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_rule_change_proposals_hash
-        ON rule_change_proposals(root_path, proposal_hash, status);
-
-      CREATE TABLE IF NOT EXISTS organization_plans (
-        run_id TEXT PRIMARY KEY REFERENCES runs(id),
-        plan_hash TEXT NOT NULL,
-        operations_json TEXT NOT NULL,
-        approved_plan_hash TEXT,
-        approval_receipt_json TEXT,
-        execution_receipt_json TEXT,
-        rollback_receipt_json TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS organization_plan_items (
-        plan_run_id TEXT NOT NULL REFERENCES organization_plans(run_id),
-        ordinal INTEGER NOT NULL,
-        child_run_id TEXT REFERENCES runs(id),
-        status TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY(plan_run_id, ordinal)
-      );
-
-      CREATE TABLE IF NOT EXISTS rollback_progress (
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        path TEXT NOT NULL,
-        status TEXT NOT NULL,
-        details_json TEXT NOT NULL DEFAULT '{}',
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY(run_id, path)
-      );
-
-      CREATE TABLE IF NOT EXISTS derived_operations (
-        run_id TEXT PRIMARY KEY REFERENCES runs(id),
-        target_path TEXT NOT NULL,
-        project_id TEXT NOT NULL REFERENCES projects(id),
-        role TEXT NOT NULL,
-        relation_type TEXT NOT NULL,
-        output_artifact_id TEXT NOT NULL REFERENCES artifacts(id),
-        candidate_material_id TEXT NOT NULL REFERENCES materials(id),
-        output_material_id TEXT REFERENCES materials(id),
-        placement_prediction_id TEXT NOT NULL REFERENCES predictions(id),
-        approved_candidate_hash TEXT,
-        approval_receipt_json TEXT,
-        rejection_receipt_json TEXT,
-        execution_receipt_json TEXT,
-        revised_from_run_id TEXT REFERENCES runs(id),
-        executed_at TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS derived_inputs (
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        ordinal INTEGER NOT NULL,
-        path TEXT NOT NULL,
-        artifact_id TEXT NOT NULL REFERENCES artifacts(id),
-        material_id TEXT NOT NULL REFERENCES materials(id),
-        prepared_hash TEXT NOT NULL,
-        PRIMARY KEY(run_id, ordinal),
-        UNIQUE(run_id, path)
-      );
-
-      CREATE TABLE IF NOT EXISTS material_derivations (
-        output_material_id TEXT NOT NULL REFERENCES materials(id),
-        input_material_id TEXT NOT NULL REFERENCES materials(id),
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        relation_type TEXT NOT NULL,
-        ordinal INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(output_material_id, input_material_id, relation_type)
-      );
-    `);
-
-    this.transaction(() => {
-      this.#ensureColumn('runs', 'aborted_at', 'TEXT');
-      this.#ensureColumn('runs', 'abort_receipt_json', 'TEXT');
-      this.#ensureColumn('labels', 'subject_prediction_id', 'TEXT REFERENCES predictions(id)');
-      this.#ensureColumn('labels', 'details_json', "TEXT NOT NULL DEFAULT '{}'");
-      this.#ensureColumn('projects', 'updated_at', 'TEXT');
-      this.#ensureColumn('runs', 'actor', "TEXT NOT NULL DEFAULT 'unknown'");
-      this.#ensureColumn('runs', 'agent', 'TEXT');
-      this.#ensureColumn('runs', 'model', 'TEXT');
-      this.#ensureColumn('runs', 'tool', "TEXT NOT NULL DEFAULT 'atlas-cli'");
-      this.#ensureColumn('runs', 'client_run_id', 'TEXT');
-      this.#ensureColumn('artifacts', 'root_path', 'TEXT');
-      this.#ensureColumn('artifacts', 'role', 'TEXT');
-      this.#ensureColumn('artifacts', 'status', "TEXT NOT NULL DEFAULT 'active'");
-      this.#ensureColumn('artifacts', 'updated_at', 'TEXT');
-      this.#ensureColumn('derived_operations', 'revised_from_run_id', 'TEXT REFERENCES runs(id)');
-      this.#ensureColumn('task_fulfillment_claims', 'planned_write_run_id', 'TEXT');
-      this.#ensureColumn('portfolio_inventories', 'expanded_json', "TEXT NOT NULL DEFAULT '[]'");
-      this.db.exec(`
-        UPDATE artifacts
-        SET root_path = (
-          SELECT root_path FROM runs WHERE runs.id = artifacts.origin_run_id
-        )
-        WHERE root_path IS NULL;
-        UPDATE artifacts SET updated_at = created_at WHERE updated_at IS NULL;
-      `);
-      const insertMigration = this.db.prepare(`
-        INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)
-      `);
-      const appliedAt = now();
-      insertMigration.run(1, 'initial_tracked_direct_schema', appliedAt);
-      insertMigration.run(2, 'abort_lifecycle_and_schema_versioning', appliedAt);
-      insertMigration.run(3, 'bootstrap_environment_observations_and_reviews', appliedAt);
-      insertMigration.run(4, 'stable_project_registry_history_and_lineage', appliedAt);
-      insertMigration.run(5, 'guarded_candidate_approval_and_execution', appliedAt);
-      insertMigration.run(6, 'agent_caller_traceability', appliedAt);
-      insertMigration.run(7, 'migration_backup_and_resumable_rollback', appliedAt);
-      insertMigration.run(8, 'agent_environment_inference_and_derived_material_lineage', appliedAt);
-      insertMigration.run(9, 'versioned_environment_profiles_and_active_routing_policy', appliedAt);
-      insertMigration.run(10, 'derived_revision_and_artifact_role_evolution', appliedAt);
-      insertMigration.run(11, 'guarded_filesystem_evolution_changesets', appliedAt);
-      insertMigration.run(12, 'bounded_task_contracts_and_temporal_read_policy', appliedAt);
-      insertMigration.run(13, 'scoped_intake_routing_corrections', appliedAt);
-      insertMigration.run(14, 'immutable_multi_step_organization_plans', appliedAt);
-      insertMigration.run(15, 'exclusive_task_fulfillment_claims', appliedAt);
-      insertMigration.run(16, 'crash_resumable_task_fulfillment_claims', appliedAt);
-      insertMigration.run(17, 'multi_root_portfolio_inventory_review_and_plan', appliedAt);
-      insertMigration.run(18, 'scoped_effective_preference_rules', appliedAt);
-      applyProjectContextMigration(this.db, appliedAt);
-      this.db.exec(`PRAGMA user_version = ${LATEST_SCHEMA_VERSION};`);
-    });
+    initializeLedgerSchema(this.db, (callback) => this.transaction(callback));
   }
 
   #backupBeforeMigration(currentVersion) {
@@ -691,13 +165,6 @@ export class Ledger {
       fs.rmSync(tempPath, { force: true });
     }
     return backupPath;
-  }
-
-  #ensureColumn(table, column, definition) {
-    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
-    if (!columns.some((item) => item.name === column)) {
-      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
-    }
   }
 
   #storeBlobPath(blobPath) {
@@ -835,743 +302,64 @@ export class Ledger {
     return changeSetId;
   }
 
-  createGuardedRun({
-    runId,
-    root,
-    targetPath,
-    intent,
-    baseline,
-    candidate,
-    diffText,
-    diffHash,
-    risk,
-    caller = {},
-    revisedFromRunId,
-    startedAt,
-  }) {
-    const candidateChangeSetId = `CAN-${crypto.randomUUID()}`;
-    const actualChangeSetId = `CHG-${crypto.randomUUID()}`;
-    this.transaction(() => {
-      this.db.prepare(`
-        INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
-        VALUES (?, 'Deterministic V1 risk routing', '1.0.0', ?, ?)
-      `).run(RISK_RULE_VERSION_ID, json({ outputs: ['tracked_direct', 'guarded', 'deny'] }), startedAt);
-      this.db.prepare(`
-        INSERT INTO runs(
-          id, mode, status, root_path, intent, actor, agent, model, tool, client_run_id,
-          rule_version_id, started_at
-        ) VALUES (?, 'guarded', 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        runId, root, intent ?? null, caller.actor ?? 'unknown', caller.agent ?? null,
-        caller.model ?? null, caller.tool ?? 'atlas-cli', caller.client_run_id ?? null,
-        RISK_RULE_VERSION_ID, startedAt,
-      );
-      this.db.prepare(`
-        INSERT INTO change_sets(id, run_id, status, created_at)
-        VALUES (?, ?, 'awaiting_execution', ?)
-      `).run(actualChangeSetId, runId, startedAt);
-
-      const artifactId = `ART-${crypto.randomUUID()}`;
-      const beforeMaterialId = `MAT-${crypto.randomUUID()}`;
-      const candidateMaterialId = `MAT-${crypto.randomUUID()}`;
-      this.db.prepare(`
-        INSERT INTO artifacts(id, origin_run_id, kind, current_path, created_at)
-        VALUES (?, ?, 'file', ?, ?)
-      `).run(artifactId, runId, targetPath, startedAt);
-      const insertMaterial = this.db.prepare(`
-        INSERT INTO materials(id, artifact_id, stage, content_hash, byte_size, blob_path, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `);
-      insertMaterial.run(
-        beforeMaterialId,
-        artifactId,
-        'before',
-        baseline.contentHash,
-        baseline.byteSize,
-        this.#storeBlobPath(baseline.blobPath),
-        startedAt,
-      );
-      insertMaterial.run(
-        candidateMaterialId,
-        artifactId,
-        'candidate',
-        candidate.contentHash,
-        candidate.byteSize,
-        this.#storeBlobPath(candidate.blobPath),
-        startedAt,
-      );
-      this.db.prepare(`
-        INSERT INTO candidate_change_sets(
-          id, run_id, version, operation, target_path, status, content_hash,
-          diff_text, diff_hash, summary_json, created_at
-        ) VALUES (?, ?, 1, 'update', ?, 'prepared', ?, ?, ?, ?, ?)
-      `).run(
-        candidateChangeSetId,
-        runId,
-        targetPath,
-        candidate.contentHash,
-        diffText,
-        diffHash,
-        json({ changed_files: 1, operation: 'update', target_path: targetPath }),
-        startedAt,
-      );
-      this.db.prepare(`
-        INSERT INTO guarded_operations(
-          run_id, target_path, before_material_id, candidate_material_id, revised_from_run_id
-        ) VALUES (?, ?, ?, ?, ?)
-      `).run(runId, targetPath, beforeMaterialId, candidateMaterialId, revisedFromRunId ?? null);
-      this.db.prepare(`
-        INSERT INTO policy_decisions(id, run_id, rule_version_id, decision, reason, details_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        `DEC-${crypto.randomUUID()}`,
-        runId,
-        RISK_RULE_VERSION_ID,
-        risk.mode,
-        risk.reasons.join(' '),
-        json(risk),
-        startedAt,
-      );
-      this.db.prepare(`
-        INSERT INTO observations(id, run_id, kind, subject_artifact_id, payload_json, created_at)
-        VALUES (?, ?, 'guarded_target_baseline', ?, ?, ?)
-      `).run(
-        `OBS-${crypto.randomUUID()}`,
-        runId,
-        artifactId,
-        json({ path: targetPath, content_hash: baseline.contentHash }),
-        startedAt,
-      );
-      this.#insertEvent(runId, 'guarded_prepared', {
-        candidate_change_set_id: candidateChangeSetId,
-        target_path: targetPath,
-        candidate_hash: candidate.contentHash,
-        risk_mode: risk.mode,
-      }, startedAt);
-    });
-    return { candidateChangeSetId, actualChangeSetId };
+  createGuardedRun(options) {
+    return this.guarded.create(options);
   }
 
   getGuardedDetail(runId) {
-    const run = this.getRun(runId);
-    if (run.mode !== 'guarded') throw new Error(`Run is not Guarded: ${runId}`);
-    const candidate = this.db.prepare(`
-      SELECT * FROM candidate_change_sets WHERE run_id = ?
-    `).get(runId);
-    const operation = this.db.prepare(`
-      SELECT g.*, bm.content_hash AS before_hash, bm.byte_size AS before_byte_size,
-             bm.blob_path AS before_blob_path,
-             cm.content_hash AS candidate_hash, cm.byte_size AS candidate_byte_size,
-             cm.blob_path AS candidate_blob_path, cm.artifact_id AS artifact_id
-      FROM guarded_operations g
-      JOIN materials bm ON bm.id = g.before_material_id
-      JOIN materials cm ON cm.id = g.candidate_material_id
-      WHERE g.run_id = ?
-    `).get(runId);
-    if (!candidate || !operation) throw new Error(`Guarded run is incomplete: ${runId}`);
-    const decision = this.db.prepare(`
-      SELECT decision, reason, details_json, created_at
-      FROM policy_decisions WHERE run_id = ? ORDER BY rowid LIMIT 1
-    `).get(runId);
-    const policyDecisions = this.db.prepare(`
-      SELECT id, rule_version_id, decision, reason, details_json, created_at
-      FROM policy_decisions WHERE run_id = ? ORDER BY rowid
-    `).all(runId).map((row) => ({
-      id: row.id,
-      rule_version_id: row.rule_version_id,
-      decision: row.decision,
-      reason: row.reason,
-      details: parseJson(row.details_json, {}),
-      created_at: row.created_at,
-    }));
-    const labels = this.db.prepare(`
-      SELECT id, name, value, source, details_json, created_at
-      FROM labels WHERE run_id = ? ORDER BY rowid
-    `).all(runId).map((row) => ({
-      ...row,
-      details: parseJson(row.details_json, {}),
-      details_json: undefined,
-    }));
-    const events = this.db.prepare(`
-      SELECT event_type, payload_json, occurred_at
-      FROM operation_events WHERE run_id = ? ORDER BY occurred_at, rowid
-    `).all(runId).map((row) => ({
-      type: row.event_type,
-      payload: parseJson(row.payload_json, {}),
-      occurred_at: row.occurred_at,
-    }));
-    return {
-      run: {
-        id: run.id,
-        mode: run.mode,
-        status: run.status,
-        root_path: run.root_path,
-        intent: run.intent,
-        caller: {
-          actor: run.actor,
-          agent: run.agent,
-          model: run.model,
-          tool: run.tool,
-          client_run_id: run.client_run_id,
-        },
-        rule_version_id: run.rule_version_id,
-        started_at: run.started_at,
-        rolled_back_at: run.rolled_back_at,
-      },
-      candidate: {
-        id: candidate.id,
-        version: candidate.version,
-        operation: candidate.operation,
-        target_path: candidate.target_path,
-        status: candidate.status,
-        content_hash: candidate.content_hash,
-        byte_size: operation.candidate_byte_size,
-        blob_path: this.#resolveBlobPath(operation.candidate_blob_path, operation.candidate_hash),
-        diff_text: candidate.diff_text,
-        diff_hash: candidate.diff_hash,
-        summary: parseJson(candidate.summary_json, {}),
-        created_at: candidate.created_at,
-        artifact_id: operation.artifact_id,
-        material_id: operation.candidate_material_id,
-      },
-      baseline: {
-        material_id: operation.before_material_id,
-        content_hash: operation.before_hash,
-        byte_size: operation.before_byte_size,
-        blob_path: this.#resolveBlobPath(operation.before_blob_path, operation.before_hash),
-      },
-      risk: {
-        mode: decision.decision,
-        reason: decision.reason,
-        ...parseJson(decision.details_json, {}),
-        rule_version: this.getRuleVersion(run.rule_version_id),
-        decided_at: decision.created_at,
-      },
-      policy_decisions: policyDecisions,
-      approved_candidate_hash: operation.approved_candidate_hash,
-      revised_from_run_id: operation.revised_from_run_id,
-      labels,
-      events,
-      approval_receipt: parseJson(operation.approval_receipt_json),
-      rejection_receipt: parseJson(operation.rejection_receipt_json),
-      execution_receipt: parseJson(operation.execution_receipt_json),
-      rollback_receipt: parseJson(run.rollback_receipt_json),
-    };
+    return this.guarded.getDetail(runId);
   }
 
-  reviewGuarded(runId, { decision, reason, reviewedAt }) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.mode !== 'guarded') throw new Error(`Run is not Guarded: ${runId}`);
-      const operation = this.db.prepare(`
-        SELECT approved_candidate_hash, approval_receipt_json, rejection_receipt_json
-        FROM guarded_operations WHERE run_id = ?
-      `).get(runId);
-      const existing = decision === 'accepted'
-        ? parseJson(operation.approval_receipt_json)
-        : parseJson(operation.rejection_receipt_json);
-      if (existing) return existing;
-      if (run.status !== 'prepared') {
-        throw new Error(`Guarded review requires prepared status; current status is ${run.status}.`);
-      }
-      const candidate = this.db.prepare(`
-        SELECT id, content_hash FROM candidate_change_sets WHERE run_id = ?
-      `).get(runId);
-      const labelId = `LBL-${crypto.randomUUID()}`;
-      const status = decision === 'accepted' ? 'approved' : 'rejected';
-      const receipt = {
-        run_id: runId,
-        candidate_change_set_id: candidate.id,
-        decision,
-        reason,
-        status,
-        reviewed_at: reviewedAt,
-      };
-      this.db.prepare(`
-        INSERT INTO labels(id, run_id, name, value, source, details_json, created_at)
-        VALUES (?, ?, 'guarded_review', ?, 'user', ?, ?)
-      `).run(labelId, runId, decision, json({ reason }), reviewedAt);
-      this.db.prepare('UPDATE runs SET status = ? WHERE id = ?').run(status, runId);
-      this.db.prepare('UPDATE candidate_change_sets SET status = ? WHERE run_id = ?').run(status, runId);
-      if (decision === 'accepted') {
-        this.db.prepare(`
-          UPDATE guarded_operations
-          SET approved_candidate_hash = ?, approval_receipt_json = ? WHERE run_id = ?
-        `).run(candidate.content_hash, json(receipt), runId);
-      } else {
-        this.db.prepare(`
-          UPDATE guarded_operations SET rejection_receipt_json = ? WHERE run_id = ?
-        `).run(json(receipt), runId);
-      }
-      this.#insertEvent(runId, `guarded_${status}`, receipt, reviewedAt);
-      return receipt;
-    });
+  reviewGuarded(runId, options) {
+    return this.guarded.review(runId, options);
   }
 
   markGuardedStale(runId, payload, occurredAt) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.status === 'stale') return;
-      if (run.status !== 'approved') {
-        throw new Error(`Only an approved Guarded run can become stale; current status is ${run.status}.`);
-      }
-      this.db.prepare("UPDATE runs SET status = 'stale' WHERE id = ?").run(runId);
-      this.db.prepare("UPDATE candidate_change_sets SET status = 'stale' WHERE run_id = ?").run(runId);
-      this.#insertEvent(runId, 'guarded_approval_invalidated', payload, occurredAt);
-    });
+    return this.guarded.markStale(runId, payload, occurredAt);
   }
 
-  finishGuardedExecution(runId, { receipt, executedAt }) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      const operation = this.db.prepare(`
-        SELECT g.*, bm.content_hash AS before_hash, cm.content_hash AS candidate_hash
-        FROM guarded_operations g
-        JOIN materials bm ON bm.id = g.before_material_id
-        JOIN materials cm ON cm.id = g.candidate_material_id
-        WHERE g.run_id = ?
-      `).get(runId);
-      const existing = parseJson(operation.execution_receipt_json);
-      if (existing) return existing;
-      if (run.status !== 'approved') {
-        throw new Error(`Guarded execution requires approval; current status is ${run.status}.`);
-      }
-      if (operation.approved_candidate_hash !== operation.candidate_hash) {
-        throw new Error('Guarded approval no longer matches the Candidate ChangeSet.');
-      }
-      const candidate = this.db.prepare(`
-        SELECT * FROM candidate_change_sets WHERE run_id = ?
-      `).get(runId);
-      const actual = this.db.prepare('SELECT id FROM change_sets WHERE run_id = ?').get(runId);
-      this.db.prepare(`
-        INSERT INTO changes(
-          id, change_set_id, path, change_type, allowed,
-          before_kind, before_hash, before_material_id,
-          after_kind, after_hash, after_material_id
-        ) VALUES (?, ?, ?, 'modified', 1, 'file', ?, ?, 'file', ?, ?)
-      `).run(
-        `DIF-${crypto.randomUUID()}`,
-        actual.id,
-        operation.target_path,
-        operation.before_hash,
-        operation.before_material_id,
-        operation.candidate_hash,
-        operation.candidate_material_id,
-      );
-      this.db.prepare(`
-        UPDATE change_sets
-        SET status = 'executed', diff_text = ?, diff_hash = ?, summary_json = ?, closed_at = ?
-        WHERE id = ?
-      `).run(candidate.diff_text, candidate.diff_hash, candidate.summary_json, executedAt, actual.id);
-      this.db.prepare(`
-        UPDATE candidate_change_sets SET status = 'executed' WHERE run_id = ?
-      `).run(runId);
-      this.db.prepare(`
-        UPDATE guarded_operations
-        SET execution_receipt_json = ?, executed_at = ? WHERE run_id = ?
-      `).run(json(receipt), executedAt, runId);
-      this.db.prepare(`
-        UPDATE runs SET status = 'executed', closed_at = ?, receipt_json = ? WHERE id = ?
-      `).run(executedAt, json(receipt), runId);
-      this.#insertEvent(runId, 'guarded_executed_and_verified', receipt, executedAt);
-      return receipt;
-    });
+  finishGuardedExecution(runId, options) {
+    return this.guarded.finishExecution(runId, options);
   }
 
   markGuardedRevised(runId, revisedRunId, reason, revisedAt) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (!['prepared', 'approved'].includes(run.status)) {
-        throw new Error(`Only a prepared or approved Guarded run can be revised; current status is ${run.status}.`);
-      }
-      const existing = this.db.prepare(`
-        SELECT details_json FROM labels
-        WHERE run_id = ? AND name = 'guarded_revision' ORDER BY rowid DESC LIMIT 1
-      `).get(runId);
-      if (existing) return parseJson(existing.details_json, {}).revised_run_id;
-      this.db.prepare(`
-        INSERT INTO labels(id, run_id, name, value, source, details_json, created_at)
-        VALUES (?, ?, 'guarded_revision', 'corrected', 'user', ?, ?)
-      `).run(
-        `LBL-${crypto.randomUUID()}`,
-        runId,
-        json({ reason, revised_run_id: revisedRunId }),
-        revisedAt,
-      );
-      this.db.prepare("UPDATE runs SET status = 'revised' WHERE id = ?").run(runId);
-      this.db.prepare("UPDATE candidate_change_sets SET status = 'revised' WHERE run_id = ?").run(runId);
-      this.#insertEvent(runId, 'guarded_revised', { reason, revised_run_id: revisedRunId }, revisedAt);
-      return revisedRunId;
-    });
+    return this.guarded.markRevised(runId, revisedRunId, reason, revisedAt);
   }
 
   finishGuardedRollback(runId, receipt, rolledBackAt) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.rollback_receipt_json) return parseJson(run.rollback_receipt_json);
-      if (run.status !== 'executed') {
-        throw new Error(`Only an executed Guarded run can be rolled back; current status is ${run.status}.`);
-      }
-      this.db.prepare(`
-        UPDATE runs
-        SET status = 'rolled_back', rolled_back_at = ?, rollback_receipt_json = ? WHERE id = ?
-      `).run(rolledBackAt, json(receipt), runId);
-      this.db.prepare("UPDATE change_sets SET status = 'rolled_back' WHERE run_id = ?").run(runId);
-      this.#insertEvent(runId, 'guarded_rollback_completed', receipt, rolledBackAt);
-      this.#insertRollbackOutcome(runId, {
-        outcome: 'completed',
-        reasonCode: 'restored_and_verified',
-        details: { restored_files: receipt.restored_files ?? null },
-      }, rolledBackAt);
-      return receipt;
-    });
+    return this.guarded.finishRollback(runId, receipt, rolledBackAt);
   }
 
-  createEvolutionRun({
-    runId,
-    root,
-    operation,
-    sourcePath,
-    targetPath,
-    projectId,
-    intent,
-    baseline,
-    plan,
-    planHash,
-    diffText,
-    diffHash,
-    caller = {},
-    startedAt,
-  }) {
-    const candidateChangeSetId = `CAN-${crypto.randomUUID()}`;
-    const actualChangeSetId = `CHG-${crypto.randomUUID()}`;
-    const predictionId = `PRD-${crypto.randomUUID()}`;
-    this.transaction(() => {
-      this.db.prepare(`
-        INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
-        VALUES (?, 'Guarded filesystem evolution', '6.0.0', ?, ?)
-      `).run(EVOLUTION_RULE_VERSION_ID, json({
-        operations: [
-          'create_directory',
-          'move_file',
-          'migrate_project',
-          'migrate_directory',
-          'remove_empty_directory',
-        ],
-        review_required: true,
-        stale_plan_denied: true,
-        rollback_conflict_denied: true,
-      }), startedAt);
-      this.db.prepare(`
-        INSERT INTO runs(
-          id, mode, status, root_path, intent, actor, agent, model, tool, client_run_id,
-          rule_version_id, started_at
-        ) VALUES (?, 'evolution', 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        runId, root, intent ?? null, caller.actor ?? 'unknown', caller.agent ?? null,
-        caller.model ?? null, caller.tool ?? 'atlas-cli', caller.client_run_id ?? null,
-        EVOLUTION_RULE_VERSION_ID, startedAt,
-      );
-      this.db.prepare(`
-        INSERT INTO change_sets(id, run_id, status, created_at)
-        VALUES (?, ?, 'awaiting_execution', ?)
-      `).run(actualChangeSetId, runId, startedAt);
-      this.db.prepare(`
-        INSERT INTO candidate_change_sets(
-          id, run_id, version, operation, target_path, status, content_hash,
-          diff_text, diff_hash, summary_json, created_at
-        ) VALUES (?, ?, 1, ?, ?, 'prepared', ?, ?, ?, ?, ?)
-      `).run(
-        candidateChangeSetId, runId, operation, targetPath, planHash,
-        diffText, diffHash, json(plan), startedAt,
-      );
-      const prediction = {
-        kind: 'evolution_changeset_candidate',
-        summary: plan.summary,
-        confidence: 1,
-        risk: 'high',
-        affected_paths: plan.source_changes.map((change) => change.path),
-        evidence: { plan, plan_hash: planHash },
-        proposed_action: 'Execute only after explicit review of this exact filesystem ChangeSet.',
-        requires_review: true,
-        source: 'atlas-deterministic',
-      };
-      this.db.prepare(`
-        INSERT INTO predictions(id, run_id, kind, payload_json, created_at)
-        VALUES (?, ?, 'evolution_changeset_candidate', ?, ?)
-      `).run(predictionId, runId, json(prediction), startedAt);
-      this.db.prepare(`
-        INSERT INTO evolution_operations(
-          run_id, operation_type, source_path, target_path, project_id,
-          prediction_id, plan_hash, baseline_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        runId, operation, sourcePath ?? null, targetPath, projectId ?? null,
-        predictionId, planHash, json(baseline),
-      );
-      this.db.prepare(`
-        INSERT INTO observations(id, run_id, kind, payload_json, created_at)
-        VALUES (?, ?, 'evolution_baseline_captured', ?, ?)
-      `).run(`OBS-${crypto.randomUUID()}`, runId, json({
-        operation, source_path: sourcePath ?? null, target_path: targetPath,
-        source_manifest_hash: baseline.source_manifest_hash ?? null,
-        source_entries: baseline.source_entries?.length ?? 0,
-        target_state: baseline.target_state,
-      }), startedAt);
-      this.db.prepare(`
-        INSERT INTO policy_decisions(id, run_id, rule_version_id, decision, reason, details_json, created_at)
-        VALUES (?, ?, ?, 'guarded', ?, ?, ?)
-      `).run(
-        `DEC-${crypto.randomUUID()}`,
-        runId,
-        EVOLUTION_RULE_VERSION_ID,
-        'Filesystem structure changes require explicit approval and exact-state verification.',
-        json({ operation, paths: prediction.affected_paths, recovery_available: true }),
-        startedAt,
-      );
-      this.#insertEvent(runId, 'evolution_prepared', {
-        candidate_change_set_id: candidateChangeSetId,
-        prediction_id: predictionId,
-        operation,
-        plan_hash: planHash,
-      }, startedAt);
-    });
-    return { candidateChangeSetId, actualChangeSetId, predictionId };
+  createEvolutionRun(options) {
+    return this.evolution.create(options);
   }
 
   getEvolutionOperation(runId) {
-    const run = this.getRun(runId);
-    if (run.mode !== 'evolution') throw new Error(`Run is not Evolution: ${runId}`);
-    const row = this.db.prepare(`SELECT * FROM evolution_operations WHERE run_id = ?`).get(runId);
-    if (!row) throw new Error(`Evolution run is incomplete: ${runId}`);
-    return {
-      ...row,
-      baseline: parseJson(row.baseline_json, {}),
-      approval_receipt: parseJson(row.approval_receipt_json),
-      rejection_receipt: parseJson(row.rejection_receipt_json),
-      execution_receipt: parseJson(row.execution_receipt_json),
-      baseline_json: undefined,
-      approval_receipt_json: undefined,
-      rejection_receipt_json: undefined,
-      execution_receipt_json: undefined,
-    };
+    return this.evolution.getOperation(runId);
   }
 
   getEvolutionDetail(runId) {
-    const run = this.getRun(runId);
-    const operation = this.getEvolutionOperation(runId);
-    const candidate = this.db.prepare(`SELECT * FROM candidate_change_sets WHERE run_id = ?`).get(runId);
-    const predictionRow = this.db.prepare(`
-      SELECT id, kind, payload_json, created_at FROM predictions WHERE id = ?
-    `).get(operation.prediction_id);
-    const labelRow = this.db.prepare(`
-      SELECT id, value, source, details_json, created_at
-      FROM labels WHERE subject_prediction_id = ? ORDER BY rowid DESC LIMIT 1
-    `).get(operation.prediction_id);
-    const events = this.db.prepare(`
-      SELECT event_type, payload_json, occurred_at
-      FROM operation_events WHERE run_id = ? ORDER BY occurred_at, rowid
-    `).all(runId).map((row) => ({
-      type: row.event_type,
-      payload: parseJson(row.payload_json, {}),
-      occurred_at: row.occurred_at,
-    }));
-    return {
-      run: {
-        id: run.id,
-        mode: run.mode,
-        status: run.status,
-        root_path: run.root_path,
-        intent: run.intent,
-        caller: {
-          actor: run.actor, agent: run.agent, model: run.model,
-          tool: run.tool, client_run_id: run.client_run_id,
-        },
-        rule_version_id: run.rule_version_id,
-        started_at: run.started_at,
-        rolled_back_at: run.rolled_back_at,
-      },
-      operation: {
-        type: operation.operation_type,
-        source: operation.source_path,
-        target: operation.target_path,
-        project_id: operation.project_id,
-        plan_hash: operation.plan_hash,
-      },
-      plan: parseJson(candidate.summary_json, {}),
-      candidate_change_set: {
-        id: candidate.id,
-        status: candidate.status,
-        diff_text: candidate.diff_text,
-        diff_hash: candidate.diff_hash,
-        created_at: candidate.created_at,
-      },
-      prediction: {
-        id: predictionRow.id,
-        kind: predictionRow.kind,
-        ...parseJson(predictionRow.payload_json, {}),
-        created_at: predictionRow.created_at,
-        review: labelRow ? {
-          id: labelRow.id,
-          decision: labelRow.value,
-          source: labelRow.source,
-          reason: parseJson(labelRow.details_json, {}).reason ?? null,
-          reviewed_at: labelRow.created_at,
-        } : null,
-      },
-      approved_plan_hash: operation.approved_plan_hash,
-      events,
-      approval_receipt: operation.approval_receipt,
-      rejection_receipt: operation.rejection_receipt,
-      execution_receipt: operation.execution_receipt,
-      rollback_receipt: parseJson(run.rollback_receipt_json),
-    };
+    return this.evolution.getDetail(runId);
   }
 
-  reviewEvolution(runId, { decision, reason, reviewedAt }) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.mode !== 'evolution') throw new Error(`Run is not Evolution: ${runId}`);
-      const operation = this.db.prepare(`SELECT * FROM evolution_operations WHERE run_id = ?`).get(runId);
-      const existing = decision === 'accepted'
-        ? parseJson(operation.approval_receipt_json)
-        : parseJson(operation.rejection_receipt_json);
-      if (existing) return existing;
-      if (run.status !== 'prepared') {
-        throw new Error(`Evolution review requires prepared status; current status is ${run.status}.`);
-      }
-      const status = decision === 'accepted' ? 'approved' : 'rejected';
-      const receipt = {
-        run_id: runId,
-        prediction_id: operation.prediction_id,
-        plan_hash: operation.plan_hash,
-        decision,
-        reason,
-        status,
-        reviewed_at: reviewedAt,
-      };
-      this.db.prepare(`
-        INSERT INTO labels(id, run_id, subject_prediction_id, name, value, source, details_json, created_at)
-        VALUES (?, ?, ?, 'evolution_review', ?, 'user', ?, ?)
-      `).run(
-        `LBL-${crypto.randomUUID()}`, runId, operation.prediction_id,
-        decision, json({ reason }), reviewedAt,
-      );
-      this.db.prepare(`UPDATE runs SET status = ? WHERE id = ?`).run(status, runId);
-      this.db.prepare(`UPDATE candidate_change_sets SET status = ? WHERE run_id = ?`).run(status, runId);
-      if (decision === 'accepted') {
-        this.db.prepare(`
-          UPDATE evolution_operations
-          SET approved_plan_hash = ?, approval_receipt_json = ? WHERE run_id = ?
-        `).run(operation.plan_hash, json(receipt), runId);
-      } else {
-        this.db.prepare(`
-          UPDATE evolution_operations SET rejection_receipt_json = ? WHERE run_id = ?
-        `).run(json(receipt), runId);
-      }
-      this.#insertEvent(runId, `evolution_${status}`, receipt, reviewedAt);
-      return receipt;
-    });
+  reviewEvolution(runId, options) {
+    return this.evolution.review(runId, options);
   }
 
   markEvolutionStale(runId, payload, occurredAt) {
-    this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.status === 'stale') return;
-      if (run.status !== 'approved') {
-        throw new Error(`Only an approved Evolution run can become stale; current status is ${run.status}.`);
-      }
-      this.db.prepare(`UPDATE runs SET status = 'stale' WHERE id = ?`).run(runId);
-      this.db.prepare(`UPDATE candidate_change_sets SET status = 'stale' WHERE run_id = ?`).run(runId);
-      this.#insertEvent(runId, 'evolution_approval_invalidated', payload, occurredAt);
-    });
+    return this.evolution.markStale(runId, payload, occurredAt);
   }
 
   startEvolutionExecution(runId, occurredAt) {
-    const detail = this.getEvolutionDetail(runId);
-    if (detail.events.some((event) => event.type === 'evolution_execution_started')) return;
-    if (detail.run.status !== 'approved') {
-      throw new Error(`Evolution execution requires approval; current status is ${detail.run.status}.`);
-    }
-    this.recordEvent(runId, 'evolution_execution_started', {
-      plan_hash: detail.operation.plan_hash,
-    }, occurredAt);
+    return this.evolution.startExecution(runId, occurredAt);
   }
 
-  finishEvolutionExecution(runId, { receipt, executedAt }) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      const operation = this.db.prepare(`SELECT * FROM evolution_operations WHERE run_id = ?`).get(runId);
-      const existing = parseJson(operation.execution_receipt_json);
-      if (existing) return existing;
-      if (run.status !== 'approved' || operation.approved_plan_hash !== operation.plan_hash) {
-        throw new Error('Evolution execution no longer matches its approved ChangeSet.');
-      }
-      const changeSet = this.db.prepare(`SELECT id FROM change_sets WHERE run_id = ?`).get(runId);
-      const insert = this.db.prepare(`
-        INSERT INTO changes(
-          id, change_set_id, path, change_type, allowed,
-          before_kind, before_hash, after_kind, after_hash
-        ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
-      `);
-      if (operation.operation_type === 'create_directory') {
-        insert.run(
-          `DIF-${crypto.randomUUID()}`, changeSet.id, operation.target_path, 'added',
-          null, null, 'directory', receipt.after_manifest_hash,
-        );
-      } else if (operation.operation_type === 'remove_empty_directory') {
-        const baseline = parseJson(operation.baseline_json, {});
-        insert.run(
-          `DIF-${crypto.randomUUID()}`, changeSet.id, operation.source_path, 'deleted',
-          'directory', baseline.source_manifest_hash, null, null,
-        );
-      } else {
-        const kind = operation.operation_type === 'move_file' ? 'file' : 'directory';
-        insert.run(
-          `DIF-${crypto.randomUUID()}`, changeSet.id, operation.source_path, 'deleted',
-          kind, receipt.after_manifest_hash, null, null,
-        );
-        insert.run(
-          `DIF-${crypto.randomUUID()}`, changeSet.id, operation.target_path, 'added',
-          null, null, kind, receipt.after_manifest_hash,
-        );
-      }
-      const candidate = this.db.prepare(`SELECT * FROM candidate_change_sets WHERE run_id = ?`).get(runId);
-      this.db.prepare(`
-        UPDATE change_sets SET status = 'executed', diff_text = ?, diff_hash = ?,
-          summary_json = ?, closed_at = ? WHERE run_id = ?
-      `).run(candidate.diff_text, candidate.diff_hash, candidate.summary_json, executedAt, runId);
-      this.db.prepare(`UPDATE candidate_change_sets SET status = 'executed' WHERE run_id = ?`).run(runId);
-      this.db.prepare(`
-        UPDATE evolution_operations SET execution_receipt_json = ?, executed_at = ? WHERE run_id = ?
-      `).run(json(receipt), executedAt, runId);
-      this.db.prepare(`
-        UPDATE runs SET status = 'executed', closed_at = ?, receipt_json = ? WHERE id = ?
-      `).run(executedAt, json(receipt), runId);
-      this.#insertEvent(runId, 'evolution_executed_and_verified', receipt, executedAt);
-      return receipt;
-    });
+  finishEvolutionExecution(runId, options) {
+    return this.evolution.finishExecution(runId, options);
   }
 
   finishEvolutionRollback(runId, receipt, rolledBackAt) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.rollback_receipt_json) return parseJson(run.rollback_receipt_json);
-      if (run.status !== 'executed') {
-        throw new Error(`Only an executed Evolution run can be rolled back; current status is ${run.status}.`);
-      }
-      this.db.prepare(`
-        UPDATE runs SET status = 'rolled_back', rolled_back_at = ?, rollback_receipt_json = ? WHERE id = ?
-      `).run(rolledBackAt, json(receipt), runId);
-      this.db.prepare(`UPDATE change_sets SET status = 'rolled_back' WHERE run_id = ?`).run(runId);
-      this.#insertEvent(runId, 'evolution_rollback_completed', receipt, rolledBackAt);
-      this.#insertRollbackOutcome(runId, {
-        outcome: 'completed',
-        reasonCode: 'restored_and_verified',
-        details: { operation: receipt.operation ?? null },
-      }, rolledBackAt);
-      return receipt;
-    });
+    return this.evolution.finishRollback(runId, receipt, rolledBackAt);
   }
 
   createOrganizationPlan({ runId, root, intent, operations, planHash, caller = {}, createdAt }) {
@@ -1805,10 +593,7 @@ export class Ledger {
   }
 
   findTaskContract(contractId) {
-    const row = this.db.prepare(`
-      SELECT run_id FROM task_contracts WHERE contract_id = ?
-    `).get(contractId);
-    return row ? this.getTaskDetail(row.run_id) : null;
+    return this.tasks.findByContractId(contractId);
   }
 
   createTaskContract({
@@ -1827,528 +612,44 @@ export class Ledger {
     writeRootId = null,
     startedAt,
   }) {
-    this.transaction(() => {
-      this.db.prepare(`
-        INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
-        VALUES (?, 'Bounded Task Contract policy', '1.0.0', ?, ?)
-      `).run(TASK_RULE_VERSION_ID, json({
-        input_scope: 'selected_paths_only',
-        output_scope: 'exact_target_only',
-        strategies: ['create', 'append', 'delta', 'new_version', 'supersede', 'archive', 'deny'],
-        stale_input_denied: true,
-        delete_execution: 'deny',
-        archive_execution: 'reviewed_organization_plan',
-      }), startedAt);
-      if (environmentRuleVersionId === TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID) {
-        this.db.prepare(`
-          INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
-          VALUES (?, 'Task-scoped explicit environment policy', '1.0.0', ?, ?)
-        `).run(TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID, json({
-          mode: 'task_scoped_explicit',
-          prerequisites: ['registered_active_project', 'explicit_existing_inputs', 'exact_new_target'],
-          discovery: 'deny',
-          routing_inference: 'deny',
-          read_scope: 'explicit_selected_paths_only',
-          write_scope: 'exact_target_only',
-        }), startedAt);
-      }
-      this.db.prepare(`
-        INSERT INTO runs(
-          id, mode, status, root_path, intent, actor, agent, model, tool, client_run_id,
-          rule_version_id, started_at
-        ) VALUES (?, 'task', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        runId,
-        contract.status,
-        root,
-        request.intent,
-        caller.actor ?? 'unknown',
-        caller.agent ?? null,
-        caller.model ?? null,
-        caller.tool ?? 'atlas-cli',
-        caller.client_run_id ?? null,
-        TASK_RULE_VERSION_ID,
-        startedAt,
-      );
-      this.db.prepare(`
-        INSERT INTO task_contracts(
-          run_id, contract_id, project_id, project_path, environment_rule_version_id,
-          contract_hash, request_json, contract_json,
-          candidate_set_id, source_set_id, write_root_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        runId,
-        contractId,
-        project.id,
-        project.current_path,
-        environmentRuleVersionId,
-        contractHash,
-        json(request),
-        json(contract),
-        candidateSetId,
-        sourceSetId,
-        writeRootId,
-      );
-
-      const findArtifact = this.db.prepare(`
-        SELECT id FROM artifacts
-        WHERE root_path = ? AND current_path = ? AND status = 'active'
-        ORDER BY updated_at DESC, rowid DESC LIMIT 1
-      `);
-      const insertArtifact = this.db.prepare(`
-        INSERT INTO artifacts(
-          id, origin_run_id, project_id, kind, current_path, root_path, role, status,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, 'file', ?, ?, 'source', 'active', ?, ?)
-      `);
-      const findMaterial = this.db.prepare(`
-        SELECT id FROM materials WHERE artifact_id = ? AND content_hash = ?
-        ORDER BY rowid DESC LIMIT 1
-      `);
-      const insertMaterial = this.db.prepare(`
-        INSERT INTO materials(id, artifact_id, stage, content_hash, byte_size, blob_path, created_at)
-        VALUES (?, ?, 'task_input', ?, ?, ?, ?)
-      `);
-      const insertInput = this.db.prepare(`
-        INSERT INTO task_inputs(
-          run_id, ordinal, path, artifact_id, material_id, prepared_hash, byte_size,
-          selected, selection_reason, series_id, temporal_mode, coverage_start,
-          coverage_end, required, priority, source_root_id, source_project_id,
-          source_root_path, source_relative_path, catalog_entry_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      const insertObservation = this.db.prepare(`
-        INSERT INTO observations(id, run_id, kind, subject_artifact_id, payload_json, created_at)
-        VALUES (?, ?, 'task_input_observed', ?, ?, ?)
-      `);
-      for (const input of inputs) {
-        const inputRoot = input.source_root_path ?? root;
-        const inputPath = input.source_relative_path ?? input.path;
-        let artifactId = null;
-        let materialId = null;
-        if (input.selected) {
-          let artifact = findArtifact.get(inputRoot, inputPath);
-          if (!artifact) {
-            artifact = { id: `ART-${crypto.randomUUID()}` };
-            insertArtifact.run(
-              artifact.id,
-              runId,
-              input.source_project_id ?? null,
-              inputPath,
-              inputRoot,
-              startedAt,
-              startedAt,
-            );
-          }
-          artifactId = artifact.id;
-          let material = findMaterial.get(artifactId, input.content_hash);
-          if (!material) {
-            material = { id: `MAT-${crypto.randomUUID()}` };
-            insertMaterial.run(
-              material.id,
-              artifactId,
-              input.content_hash,
-              input.byte_size,
-              this.#storeBlobPath(input.capture.blobPath),
-              startedAt,
-            );
-          }
-          materialId = material.id;
-        }
-        insertInput.run(
-          runId,
-          input.ordinal,
-          input.path,
-          artifactId,
-          materialId,
-          input.content_hash,
-          input.byte_size,
-          input.selected ? 1 : 0,
-          input.selection_reason ?? null,
-          input.series ?? null,
-          input.temporal_mode ?? null,
-          input.coverage?.start ?? null,
-          input.coverage?.end ?? null,
-          input.required ? 1 : 0,
-          input.priority,
-          input.source_root_id ?? null,
-          input.source_project_id ?? null,
-          input.source_root_path ?? null,
-          input.source_relative_path ?? null,
-          input.catalog_entry_id ?? null,
-        );
-        insertObservation.run(
-          `OBS-${crypto.randomUUID()}`,
-          runId,
-          artifactId,
-          json({
-            path: input.path,
-            source_root_id: input.source_root_id ?? null,
-            source_project_id: input.source_project_id ?? null,
-            source_relative_path: input.source_relative_path ?? null,
-            content_hash: input.content_hash,
-            byte_size: input.byte_size,
-            selected: input.selected,
-            selection_reason: input.selection_reason ?? null,
-            series: input.series ?? null,
-            temporal_mode: input.temporal_mode ?? null,
-            coverage: input.coverage ?? null,
-          }),
-          startedAt,
-        );
-      }
-
-      const temporalPredictionId = `PRD-${crypto.randomUUID()}`;
-      const writePredictionId = `PRD-${crypto.randomUUID()}`;
-      this.db.prepare(`
-        INSERT INTO predictions(id, run_id, kind, payload_json, created_at)
-        VALUES (?, ?, 'task_temporal_relations', ?, ?)
-      `).run(temporalPredictionId, runId, json({
-        kind: 'task_temporal_relations',
-        summary: `${contract.temporal_relations.length} temporal or duplicate relation(s) evaluated.`,
-        confidence: contract.temporal_relations.length
-          ? Math.min(...contract.temporal_relations.map((relation) => relation.confidence))
-          : 1,
-        risk: 'low',
-        affected_paths: inputs.map((input) => input.path),
-        evidence: { relations: contract.temporal_relations },
-        proposed_action: 'Read only the selected bounded input set.',
-        requires_review: contract.status === 'needs_input',
-        source: 'atlas-deterministic',
-      }), startedAt);
-      this.db.prepare(`
-        INSERT INTO predictions(id, run_id, kind, payload_json, created_at)
-        VALUES (?, ?, 'task_write_strategy', ?, ?)
-      `).run(writePredictionId, runId, json({
-        kind: 'task_write_strategy',
-        summary: `${contract.write.strategy} ${contract.write.target}.`,
-        confidence: contract.write.decision === 'deny' ? 1 : 0.95,
-        risk: contract.write.executor === 'guarded_update' ? 'medium' : 'low',
-        affected_paths: [contract.write.target],
-        evidence: { write: contract.write, read_budget: contract.read.budget },
-        proposed_action: contract.write.executor === 'none'
-          ? 'Do not execute this unsupported or destructive write.'
-          : `Use ${contract.write.executor} under this exact Task Contract.`,
-        requires_review: contract.write.executor === 'guarded_update',
-        source: 'atlas-deterministic',
-      }), startedAt);
-      const policyDecision = contract.status === 'blocked'
-        ? 'deny'
-        : contract.status === 'needs_input' || contract.write.executor === 'guarded_update'
-          ? 'warn'
-          : 'allow';
-      this.db.prepare(`
-        INSERT INTO policy_decisions(id, run_id, rule_version_id, decision, reason, details_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        `DEC-${crypto.randomUUID()}`,
-        runId,
-        TASK_RULE_VERSION_ID,
-        policyDecision,
-        contract.write.reason,
-        json({
-          status: contract.status,
-          read_scope: contract.read.scope,
-          write_scope: contract.write.scope,
-          environment_rule_version_id: environmentRuleVersionId,
-          questions: contract.questions,
-        }),
-        startedAt,
-      );
-      this.#insertEvent(runId, 'task_contract_prepared', {
-        contract_id: contractId,
-        contract_hash: contractHash,
-        selected_inputs: contract.read.selected.length,
-        excluded_inputs: contract.read.excluded.length,
-        write_strategy: contract.write.strategy,
-        executor: contract.write.executor,
-      }, startedAt);
-      const eligibleRules = contract.attention?.eligible_rules ?? [];
-      const appliedRules = contract.attention?.applied_rules ?? [];
-      this.#insertEvent(runId, 'task_rule_evaluated', {
-        task_id: runId,
-        eligible_rule_ids: eligibleRules.map((rule) => rule.rule_id),
-        applied_rule_ids: appliedRules.map((rule) => rule.rule_id),
-        rule_version_ids: [...new Set(eligibleRules.map((rule) => rule.rule_version_id))].sort(),
-        evaluated_at: startedAt,
-      }, startedAt);
+    return this.tasks.create({
+      runId,
+      contractId,
+      root,
+      request,
+      contract,
+      contractHash,
+      project,
+      environmentRuleVersionId,
+      inputs,
+      caller,
+      candidateSetId,
+      sourceSetId,
+      writeRootId,
+      startedAt,
     });
-    return this.getTaskDetail(runId);
   }
 
   getTaskDetail(runId) {
-    const run = this.getRun(runId);
-    if (run.mode !== 'task') throw new Error(`Run is not a Task Contract: ${runId}`);
-    const row = this.db.prepare(`SELECT * FROM task_contracts WHERE run_id = ?`).get(runId);
-    if (!row) throw new Error(`Task Contract run is incomplete: ${runId}`);
-    const inputs = this.db.prepare(`
-      SELECT ordinal, path, artifact_id, material_id, prepared_hash AS content_hash,
-             byte_size, selected, selection_reason, series_id AS series,
-             temporal_mode, coverage_start, coverage_end, required, priority,
-             source_root_id, source_project_id, source_root_path,
-             source_relative_path, catalog_entry_id
-      FROM task_inputs WHERE run_id = ? ORDER BY ordinal
-    `).all(runId).map((input) => ({
-      ...input,
-      selected: Boolean(input.selected),
-      required: Boolean(input.required),
-      coverage: input.coverage_start || input.coverage_end
-        ? { start: input.coverage_start, end: input.coverage_end }
-        : null,
-      coverage_start: undefined,
-      coverage_end: undefined,
-    }));
-    const predictions = this.db.prepare(`
-      SELECT id, kind, payload_json, created_at FROM predictions
-      WHERE run_id = ? ORDER BY rowid
-    `).all(runId).map((prediction) => ({
-      id: prediction.id,
-      kind: prediction.kind,
-      ...parseJson(prediction.payload_json, {}),
-      created_at: prediction.created_at,
-    }));
-    const decisions = this.db.prepare(`
-      SELECT id, rule_version_id, decision, reason, details_json, created_at
-      FROM policy_decisions WHERE run_id = ? ORDER BY rowid
-    `).all(runId).map((decision) => ({
-      id: decision.id,
-      rule_version_id: decision.rule_version_id,
-      decision: decision.decision,
-      reason: decision.reason,
-      details: parseJson(decision.details_json, {}),
-      created_at: decision.created_at,
-    }));
-    const events = this.db.prepare(`
-      SELECT event_type, payload_json, occurred_at FROM operation_events
-      WHERE run_id = ? ORDER BY occurred_at, rowid
-    `).all(runId).map((event) => ({
-      type: event.event_type,
-      payload: parseJson(event.payload_json, {}),
-      occurred_at: event.occurred_at,
-    }));
-    const ruleApplicationReviews = this.db.prepare(`
-      SELECT id, value, details_json, created_at
-      FROM labels
-      WHERE run_id = ? AND name = 'task_rule_application_review'
-      ORDER BY created_at, rowid
-    `).all(runId).map((label) => ({
-      label_id: label.id,
-      decision: label.value,
-      ...parseJson(label.details_json, {}),
-      reviewed_at: label.created_at,
-    }));
-    const completionReceipt = parseJson(row.completion_receipt_json);
-    const lineage = completionReceipt?.output_material_id ? this.db.prepare(`
-      SELECT md.output_material_id, md.input_material_id, md.run_id,
-             md.relation_type, md.ordinal, ti.path AS input_path, md.created_at
-      FROM material_derivations md
-      JOIN task_inputs ti ON ti.run_id = ? AND ti.material_id = md.input_material_id
-      WHERE md.output_material_id = ? ORDER BY md.ordinal
-    `).all(runId, completionReceipt.output_material_id) : [];
-    return {
-      run: {
-        id: run.id,
-        mode: run.mode,
-        status: run.status,
-        root_path: run.root_path,
-        intent: run.intent,
-        caller: {
-          actor: run.actor,
-          agent: run.agent,
-          model: run.model,
-          tool: run.tool,
-          client_run_id: run.client_run_id,
-        },
-        rule_version_id: run.rule_version_id,
-        started_at: run.started_at,
-        closed_at: run.closed_at,
-        rolled_back_at: run.rolled_back_at,
-      },
-      contract_id: row.contract_id,
-      contract_hash: row.contract_hash,
-      project_id: row.project_id,
-      project_path: row.project_path,
-      environment_rule_version_id: row.environment_rule_version_id,
-      candidate_set_id: row.candidate_set_id,
-      source_set_id: row.source_set_id,
-      write_root_id: row.write_root_id,
-      request: parseJson(row.request_json, {}),
-      contract: parseJson(row.contract_json, {}),
-      inputs,
-      predictions,
-      policy_decisions: decisions,
-      underlying_run_id: row.underlying_run_id,
-      completion_receipt: completionReceipt,
-      rollback_receipt: parseJson(run.rollback_receipt_json),
-      output: completionReceipt ? { receipt: completionReceipt, lineage } : null,
-      rule_application_reviews: ruleApplicationReviews,
-      events,
-    };
+    return this.tasks.getDetail(runId);
   }
 
   reviewTaskRuleApplication(runId, { ruleId, decision, reason }) {
-    if (!['accepted', 'corrected'].includes(decision)) {
-      throw new Error('Task rule review decision must be accepted or corrected.');
-    }
-    if (typeof reason !== 'string' || !reason.trim()) {
-      throw new Error('Task rule review requires a reason.');
-    }
-    const detail = this.getTaskDetail(runId);
-    const eligibleRules = detail.contract.attention?.eligible_rules ?? [];
-    const rule = eligibleRules.find((item) => item.rule_id === ruleId);
-    if (!rule) throw new Error(`Rule was not eligible for Task ${runId}: ${ruleId}`);
-    const applied = (detail.contract.attention?.applied_rules ?? [])
-      .some((item) => item.rule_id === ruleId);
-    const existing = detail.rule_application_reviews.find((item) => (
-      item.rule_id === ruleId
-      && item.decision === decision
-      && item.reason === reason.trim()
-    ));
-    if (existing) return {
-      task_id: runId,
-      label_id: existing.label_id,
-      rule_id: ruleId,
-      rule_version_id: rule.rule_version_id,
-      eligible: true,
-      applied,
-      decision,
-      reason: reason.trim(),
-      reviewed_at: existing.reviewed_at,
-      idempotent: true,
-    };
-    const reviewedAt = now();
-    const labelId = `LBL-${crypto.randomUUID()}`;
-    const receipt = {
-      task_id: runId,
-      label_id: labelId,
-      rule_id: ruleId,
-      rule_version_id: rule.rule_version_id,
-      eligible: true,
-      applied,
-      decision,
-      reason: reason.trim(),
-      reviewed_at: reviewedAt,
-      idempotent: false,
-    };
-    return this.transaction(() => {
-      this.db.prepare(`
-        INSERT INTO labels(
-          id, run_id, subject_prediction_id, name, value, source, details_json, created_at
-        ) VALUES (?, ?, NULL, 'task_rule_application_review', ?, 'user', ?, ?)
-      `).run(labelId, runId, decision, json(receipt), reviewedAt);
-      this.#insertEvent(runId, 'task_rule_review_recorded', receipt, reviewedAt);
-      return receipt;
-    });
+    return this.tasks.reviewRuleApplication(runId, { ruleId, decision, reason });
   }
 
   claimTaskFulfillment(runId, claimToken, processId, occurredAt, plannedWriteRunId = null) {
-    return this.transaction(() => {
-      const task = this.db.prepare(`SELECT underlying_run_id FROM task_contracts WHERE run_id = ?`).get(runId);
-      if (!task) throw new Error(`Task Contract not found: ${runId}`);
-      if (task.underlying_run_id) return { status: 'staged', write_run_id: task.underlying_run_id };
-      const existing = this.db.prepare(`
-        SELECT claim_token, process_id, status, planned_write_run_id, write_run_id
-        FROM task_fulfillment_claims WHERE task_run_id = ?
-      `).get(runId);
-      if (existing) {
-        if (existing.write_run_id) return { status: 'staged', write_run_id: existing.write_run_id };
-        if (existing.planned_write_run_id && this.db.prepare('SELECT id FROM runs WHERE id = ?').get(existing.planned_write_run_id)) {
-          this.db.prepare(`UPDATE task_contracts SET underlying_run_id = ? WHERE run_id = ?`)
-            .run(existing.planned_write_run_id, runId);
-          this.db.prepare(`
-            UPDATE task_fulfillment_claims SET status = 'staged', write_run_id = ?, updated_at = ?
-            WHERE task_run_id = ?
-          `).run(existing.planned_write_run_id, occurredAt, runId);
-          this.#insertEvent(runId, 'task_write_reconciled_from_claim', {
-            write_run_id: existing.planned_write_run_id,
-          }, occurredAt);
-          return { status: 'staged', write_run_id: existing.planned_write_run_id };
-        }
-        if (existing.claim_token === claimToken && existing.status === 'active') {
-          return { status: 'acquired', planned_write_run_id: existing.planned_write_run_id };
-        }
-        if (existing.status === 'active' && !isProcessAlive(existing.process_id)) {
-          const resumedPlan = existing.planned_write_run_id ?? plannedWriteRunId;
-          this.db.prepare(`
-            UPDATE task_fulfillment_claims
-            SET claim_token = ?, process_id = ?, status = 'active', planned_write_run_id = ?, updated_at = ?
-            WHERE task_run_id = ?
-          `).run(claimToken, processId, resumedPlan, occurredAt, runId);
-          this.#insertEvent(runId, 'task_fulfillment_claim_reclaimed', {
-            abandoned_claim_token: existing.claim_token,
-            abandoned_process_id: existing.process_id,
-            replacement_claim_token: claimToken,
-            planned_write_run_id: resumedPlan,
-          }, occurredAt);
-          return { status: 'acquired', planned_write_run_id: resumedPlan };
-        } else {
-          const error = new Error(`Task Contract is already being fulfilled by process ${existing.process_id}.`);
-          error.code = 'ATLAS_STATE_CONFLICT';
-          throw error;
-        }
-      }
-      this.db.prepare(`
-        INSERT INTO task_fulfillment_claims(
-          task_run_id, claim_token, process_id, status, planned_write_run_id, claimed_at, updated_at
-        ) VALUES (?, ?, ?, 'active', ?, ?, ?)
-      `).run(runId, claimToken, processId, plannedWriteRunId, occurredAt, occurredAt);
-      this.#insertEvent(runId, 'task_fulfillment_claimed', {
-        claim_token: claimToken, process_id: processId, planned_write_run_id: plannedWriteRunId,
-      }, occurredAt);
-      return { status: 'acquired', planned_write_run_id: plannedWriteRunId };
-    });
+    return this.tasks.claimFulfillment(
+      runId, claimToken, processId, occurredAt, plannedWriteRunId,
+    );
   }
 
   releaseTaskFulfillmentClaim(runId, claimToken, occurredAt) {
-    return this.transaction(() => {
-      const claim = this.db.prepare(`
-        SELECT claim_token, write_run_id FROM task_fulfillment_claims WHERE task_run_id = ?
-      `).get(runId);
-      if (!claim || claim.claim_token !== claimToken || claim.write_run_id) return false;
-      this.db.prepare(`DELETE FROM task_fulfillment_claims WHERE task_run_id = ?`).run(runId);
-      this.#insertEvent(runId, 'task_fulfillment_claim_released', { claim_token: claimToken }, occurredAt);
-      return true;
-    });
+    return this.tasks.releaseFulfillmentClaim(runId, claimToken, occurredAt);
   }
 
   recordTaskUnderlyingRun(runId, writeRunId, occurredAt, claimToken = null) {
-    return this.transaction(() => {
-      const task = this.db.prepare(`SELECT underlying_run_id FROM task_contracts WHERE run_id = ?`).get(runId);
-      if (!task) throw new Error(`Task Contract not found: ${runId}`);
-      if (task.underlying_run_id && task.underlying_run_id !== writeRunId) {
-        const error = new Error(`Task Contract already staged another write run: ${task.underlying_run_id}`);
-        error.code = 'ATLAS_STATE_CONFLICT';
-        throw error;
-      }
-      if (!task.underlying_run_id) {
-        if (claimToken != null) {
-          const claim = this.db.prepare(`
-            SELECT claim_token, status, planned_write_run_id FROM task_fulfillment_claims WHERE task_run_id = ?
-          `).get(runId);
-          if (!claim || claim.claim_token !== claimToken || claim.status !== 'active') {
-            const error = new Error('Task fulfillment claim is missing or owned by another process.');
-            error.code = 'ATLAS_STATE_CONFLICT';
-            throw error;
-          }
-          if (claim.planned_write_run_id && claim.planned_write_run_id !== writeRunId) {
-            const error = new Error('Task fulfillment produced a write run different from its claimed run.');
-            error.code = 'ATLAS_STATE_CONFLICT';
-            throw error;
-          }
-        }
-        this.db.prepare(`UPDATE task_contracts SET underlying_run_id = ? WHERE run_id = ?`)
-          .run(writeRunId, runId);
-        if (claimToken != null) {
-          this.db.prepare(`
-            UPDATE task_fulfillment_claims
-            SET status = 'staged', write_run_id = ?, updated_at = ?
-            WHERE task_run_id = ? AND claim_token = ?
-          `).run(writeRunId, occurredAt, runId, claimToken);
-        }
-        this.#insertEvent(runId, 'task_write_staged', { write_run_id: writeRunId }, occurredAt);
-      }
-      return this.getTaskDetail(runId);
-    });
+    return this.tasks.recordUnderlyingRun(runId, writeRunId, occurredAt, claimToken);
   }
 
   getActiveArtifactContext(rootPath, currentPath) {
@@ -2385,16 +686,7 @@ export class Ledger {
   }
 
   markTaskStale(runId, payload, occurredAt) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.status === 'stale') return this.getTaskDetail(runId);
-      if (run.status !== 'ready') {
-        throw new Error(`Only a ready Task Contract can become stale; current status is ${run.status}.`);
-      }
-      this.db.prepare(`UPDATE runs SET status = 'stale' WHERE id = ?`).run(runId);
-      this.#insertEvent(runId, 'task_contract_invalidated', payload, occurredAt);
-      return this.getTaskDetail(runId);
-    });
+    return this.tasks.markStale(runId, payload, occurredAt);
   }
 
   completeTaskContract(runId, {
@@ -2406,850 +698,64 @@ export class Ledger {
     writeMode,
     completedAt,
   }) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      const task = this.db.prepare(`SELECT * FROM task_contracts WHERE run_id = ?`).get(runId);
-      const existing = parseJson(task.completion_receipt_json);
-      if (existing) return existing;
-      if (run.status !== 'ready') {
-        throw new Error(`Task completion requires ready status; current status is ${run.status}.`);
-      }
-      if (task.underlying_run_id && task.underlying_run_id !== writeRunId) {
-        const error = new Error(`Task Contract write run mismatch: ${task.underlying_run_id}`);
-        error.code = 'ATLAS_STATE_CONFLICT';
-        throw error;
-      }
-      const inputs = this.db.prepare(`
-        SELECT material_id, ordinal FROM task_inputs
-        WHERE run_id = ? AND selected = 1 ORDER BY ordinal
-      `).all(runId);
-      const insertDerivation = this.db.prepare(`
-        INSERT OR IGNORE INTO material_derivations(
-          output_material_id, input_material_id, run_id, relation_type, ordinal, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
-      `);
-      for (const input of inputs) {
-        insertDerivation.run(
-          outputMaterialId,
-          input.material_id,
-          writeRunId,
-          relationType,
-          input.ordinal,
-          completedAt,
-        );
-      }
-      const receipt = {
-        task_id: runId,
-        contract_id: task.contract_id,
-        status: 'completed',
-        write_run_id: writeRunId,
-        write_mode: writeMode,
-        target: targetPath,
-        output_artifact_id: outputArtifactId,
-        output_material_id: outputMaterialId,
-        relation_type: relationType,
-        selected_inputs: inputs.length,
-        verified: true,
-        rollback_ready: true,
-        completed_at: completedAt,
-      };
-      this.db.prepare(`
-        UPDATE task_contracts
-        SET underlying_run_id = ?, completion_receipt_json = ?, completed_at = ?
-        WHERE run_id = ?
-      `).run(writeRunId, json(receipt), completedAt, runId);
-      this.db.prepare(`
-        UPDATE runs SET status = 'completed', closed_at = ?, receipt_json = ? WHERE id = ?
-      `).run(completedAt, json(receipt), runId);
-      this.#insertEvent(runId, 'task_completed_and_verified', receipt, completedAt);
-      return receipt;
+    return this.tasks.complete(runId, {
+      writeRunId,
+      outputArtifactId,
+      outputMaterialId,
+      targetPath,
+      relationType,
+      writeMode,
+      completedAt,
     });
   }
 
   finishTaskRollback(runId, receipt, rolledBackAt) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.rollback_receipt_json) return parseJson(run.rollback_receipt_json);
-      if (run.status !== 'completed') {
-        throw new Error(`Only a completed Task Contract can be rolled back; current status is ${run.status}.`);
-      }
-      this.db.prepare(`
-        UPDATE runs SET status = 'rolled_back', rolled_back_at = ?, rollback_receipt_json = ?
-        WHERE id = ?
-      `).run(rolledBackAt, json(receipt), runId);
-      this.#insertEvent(runId, 'task_rollback_completed', receipt, rolledBackAt);
-      return receipt;
-    });
+    return this.tasks.finishRollback(runId, receipt, rolledBackAt);
   }
 
-  createDerivedRun({
-    runId,
-    root,
-    targetPath,
-    intent,
-    inputs,
-    candidate,
-    project,
-    role,
-    relationType,
-    predictionConfidence,
-    diffText,
-    diffHash,
-    risk,
-    placementPolicy,
-    revisedFromRunId = null,
-    caller = {},
-    startedAt,
-  }) {
-    const candidateChangeSetId = `CAN-${crypto.randomUUID()}`;
-    const actualChangeSetId = `CHG-${crypto.randomUUID()}`;
-    const outputArtifactId = `ART-${crypto.randomUUID()}`;
-    const candidateMaterialId = `MAT-${crypto.randomUUID()}`;
-    const placementPredictionId = `PRD-${crypto.randomUUID()}`;
-    this.transaction(() => {
-      const effectiveRuleVersionId = placementPolicy?.routing_rule_version_id
-        ?? placementPolicy?.rule_version_id
-        ?? RISK_RULE_VERSION_ID;
-      this.db.prepare(`
-        INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
-        VALUES (?, 'Deterministic V1 risk routing', '1.0.0', ?, ?)
-      `).run(RISK_RULE_VERSION_ID, json({ outputs: ['tracked_direct', 'guarded', 'deny'] }), startedAt);
-      this.db.prepare(`
-        INSERT INTO runs(
-          id, mode, status, root_path, intent, actor, agent, model, tool, client_run_id,
-          rule_version_id, started_at
-        ) VALUES (?, 'derived', 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        runId, root, intent ?? null, caller.actor ?? 'unknown', caller.agent ?? null,
-        caller.model ?? null, caller.tool ?? 'atlas-cli', caller.client_run_id ?? null,
-        effectiveRuleVersionId, startedAt,
-      );
-      this.db.prepare(`
-        INSERT INTO change_sets(id, run_id, status, created_at)
-        VALUES (?, ?, 'awaiting_execution', ?)
-      `).run(actualChangeSetId, runId, startedAt);
-      this.db.prepare(`
-        INSERT INTO artifacts(
-          id, origin_run_id, project_id, kind, current_path, root_path, role, status, created_at, updated_at
-        ) VALUES (?, ?, ?, 'file', ?, ?, ?, 'candidate', ?, ?)
-      `).run(
-        outputArtifactId, runId, project.id, targetPath, root, role, startedAt, startedAt,
-      );
-      this.db.prepare(`
-        INSERT INTO materials(id, artifact_id, stage, content_hash, byte_size, blob_path, created_at)
-        VALUES (?, ?, 'candidate', ?, ?, ?, ?)
-      `).run(
-        candidateMaterialId,
-        outputArtifactId,
-        candidate.contentHash,
-        candidate.byteSize,
-        this.#storeBlobPath(candidate.blobPath),
-        startedAt,
-      );
-      this.db.prepare(`
-        INSERT INTO candidate_change_sets(
-          id, run_id, version, operation, target_path, status, content_hash,
-          diff_text, diff_hash, summary_json, created_at
-        ) VALUES (?, ?, 1, 'create', ?, 'prepared', ?, ?, ?, ?, ?)
-      `).run(
-        candidateChangeSetId,
-        runId,
-        targetPath,
-        candidate.contentHash,
-        diffText,
-        diffHash,
-        json({
-          changed_files: 1,
-          operation: 'create',
-          target_path: targetPath,
-          project_id: project.id,
-          role,
-          input_count: inputs.length,
-          relation_type: relationType,
-        }),
-        startedAt,
-      );
-
-      const findArtifact = this.db.prepare(`
-        SELECT id FROM artifacts
-        WHERE root_path = ? AND current_path = ? AND status = 'active'
-        ORDER BY CASE WHEN role IS NULL THEN 1 ELSE 0 END, updated_at DESC, rowid DESC
-        LIMIT 1
-      `);
-      const insertArtifact = this.db.prepare(`
-        INSERT INTO artifacts(
-          id, origin_run_id, kind, current_path, root_path, role, status, created_at, updated_at
-        ) VALUES (?, ?, 'file', ?, ?, 'source', 'active', ?, ?)
-      `);
-      const findMaterial = this.db.prepare(`
-        SELECT id FROM materials WHERE artifact_id = ? AND content_hash = ?
-        ORDER BY CASE stage WHEN 'output' THEN 0 WHEN 'input' THEN 1 ELSE 2 END, rowid DESC
-        LIMIT 1
-      `);
-      const insertMaterial = this.db.prepare(`
-        INSERT INTO materials(id, artifact_id, stage, content_hash, byte_size, blob_path, created_at)
-        VALUES (?, ?, 'input', ?, ?, ?, ?)
-      `);
-      const insertInput = this.db.prepare(`
-        INSERT INTO derived_inputs(
-          run_id, ordinal, path, artifact_id, material_id, prepared_hash,
-          source_root_id, source_project_id, source_root_path, source_relative_path
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      const insertObservation = this.db.prepare(`
-        INSERT INTO observations(id, run_id, kind, subject_artifact_id, payload_json, created_at)
-        VALUES (?, ?, 'derived_input_captured', ?, ?, ?)
-      `);
-      const inputRecords = [];
-      inputs.forEach((input, ordinal) => {
-        const inputRoot = input.sourceRootPath ?? root;
-        const inputPath = input.sourceRelativePath ?? input.path;
-        let artifact = findArtifact.get(inputRoot, inputPath);
-        if (!artifact) {
-          artifact = { id: `ART-${crypto.randomUUID()}` };
-          insertArtifact.run(artifact.id, runId, inputPath, inputRoot, startedAt, startedAt);
-        }
-        let material = findMaterial.get(artifact.id, input.contentHash);
-        if (!material) {
-          material = { id: `MAT-${crypto.randomUUID()}` };
-          insertMaterial.run(
-            material.id,
-            artifact.id,
-            input.contentHash,
-            input.byteSize,
-            this.#storeBlobPath(input.blobPath),
-            startedAt,
-          );
-        }
-        insertInput.run(
-          runId,
-          ordinal,
-          input.path,
-          artifact.id,
-          material.id,
-          input.contentHash,
-          input.sourceRootId ?? null,
-          input.sourceProjectId ?? null,
-          input.sourceRootPath ?? null,
-          input.sourceRelativePath ?? null,
-        );
-        insertObservation.run(
-          `OBS-${crypto.randomUUID()}`,
-          runId,
-          artifact.id,
-          json({
-            path: input.path,
-            source_root_id: input.sourceRootId ?? null,
-            source_project_id: input.sourceProjectId ?? null,
-            source_relative_path: input.sourceRelativePath ?? null,
-            content_hash: input.contentHash,
-            material_id: material.id,
-          }),
-          startedAt,
-        );
-        inputRecords.push({ path: input.path, artifact_id: artifact.id, material_id: material.id });
-      });
-
-      const placementPrediction = {
-        kind: 'placement_candidate',
-        summary: `Create ${targetPath} as a ${role} Artifact in Project ${project.id}.`,
-        confidence: predictionConfidence,
-        risk: risk.risk === 'low' ? 'low' : 'medium',
-        affected_paths: [...inputs.map((input) => input.path), targetPath],
-        evidence: {
-          project_id: project.id,
-          project_name: project.name,
-          project_path: project.current_path,
-          target_path: targetPath,
-          role,
-          input_paths: inputs.map((input) => input.path),
-          relation_type: relationType,
-          policy: placementPolicy,
-        },
-        proposed_action: 'Create exactly the reviewed Candidate and register its input-to-output lineage.',
-        requires_review: true,
-        source: 'agent',
-        proposed_by: {
-          actor: caller.actor ?? 'unknown',
-          agent: caller.agent ?? null,
-          model: caller.model ?? null,
-          tool: caller.tool ?? 'atlas-cli',
-          client_run_id: caller.client_run_id ?? null,
-        },
-      };
-      this.db.prepare(`
-        INSERT INTO predictions(id, run_id, kind, payload_json, created_at)
-        VALUES (?, ?, 'placement_candidate', ?, ?)
-      `).run(placementPredictionId, runId, json(placementPrediction), startedAt);
-      this.db.prepare(`
-        INSERT INTO derived_operations(
-          run_id, target_path, project_id, role, relation_type,
-          output_artifact_id, candidate_material_id, placement_prediction_id, revised_from_run_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        runId,
-        targetPath,
-        project.id,
-        role,
-        relationType,
-        outputArtifactId,
-        candidateMaterialId,
-        placementPredictionId,
-        revisedFromRunId,
-      );
-      this.db.prepare(`
-        INSERT INTO policy_decisions(id, run_id, rule_version_id, decision, reason, details_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        `DEC-${crypto.randomUUID()}`,
-        runId,
-        effectiveRuleVersionId,
-        risk.mode,
-        placementPolicy?.decision === 'warn'
-          ? `${risk.reasons.join(' ')} Placement warning: ${placementPolicy.reason}`
-          : risk.reasons.join(' '),
-        json({ ...risk, placement_policy: placementPolicy, risk_rule_version_id: RISK_RULE_VERSION_ID }),
-        startedAt,
-      );
-      this.#insertEvent(runId, 'derived_prepared', {
-        candidate_change_set_id: candidateChangeSetId,
-        placement_prediction_id: placementPredictionId,
-        target_path: targetPath,
-        project_id: project.id,
-        role,
-        relation_type: relationType,
-        inputs: inputRecords,
-        candidate_hash: candidate.contentHash,
-      }, startedAt);
-    });
-    return {
-      candidateChangeSetId,
-      actualChangeSetId,
-      outputArtifactId,
-      candidateMaterialId,
-      placementPredictionId,
-    };
+  createDerivedRun(options) {
+    return this.derived.createDerivedRun(options);
   }
 
   getDerivedDetail(runId) {
-    const run = this.getRun(runId);
-    if (run.mode !== 'derived') throw new Error(`Run is not Derived: ${runId}`);
-    const candidate = this.db.prepare(`
-      SELECT * FROM candidate_change_sets WHERE run_id = ?
-    `).get(runId);
-    const operation = this.db.prepare(`
-      SELECT d.*, p.name AS project_name, p.current_path AS project_path,
-             cm.content_hash AS candidate_hash, cm.byte_size AS candidate_byte_size,
-             cm.blob_path AS candidate_blob_path,
-             om.content_hash AS output_hash, om.byte_size AS output_byte_size,
-             om.blob_path AS output_blob_path,
-             oa.role AS output_current_role, oa.status AS output_artifact_status
-      FROM derived_operations d
-      JOIN projects p ON p.id = d.project_id
-      JOIN artifacts oa ON oa.id = d.output_artifact_id
-      JOIN materials cm ON cm.id = d.candidate_material_id
-      LEFT JOIN materials om ON om.id = d.output_material_id
-      WHERE d.run_id = ?
-    `).get(runId);
-    if (!candidate || !operation) throw new Error(`Derived run is incomplete: ${runId}`);
-    const inputs = this.db.prepare(`
-      SELECT di.ordinal, di.path, di.artifact_id, di.material_id,
-             di.prepared_hash AS content_hash, m.byte_size, m.blob_path,
-             a.role AS artifact_role, di.source_root_id, di.source_project_id,
-             di.source_root_path, di.source_relative_path
-      FROM derived_inputs di
-      JOIN materials m ON m.id = di.material_id
-      JOIN artifacts a ON a.id = di.artifact_id
-      WHERE di.run_id = ? ORDER BY di.ordinal
-    `).all(runId).map((item) => ({
-      ...item,
-      blob_path: this.#resolveBlobPath(item.blob_path, item.content_hash),
-    }));
-    const predictionRow = this.db.prepare(`
-      SELECT id, kind, payload_json, created_at FROM predictions WHERE id = ?
-    `).get(operation.placement_prediction_id);
-    const reviewRow = this.db.prepare(`
-      SELECT id, value, source, details_json, created_at
-      FROM labels WHERE subject_prediction_id = ? ORDER BY rowid DESC LIMIT 1
-    `).get(operation.placement_prediction_id);
-    const placementPrediction = {
-      id: predictionRow.id,
-      kind: predictionRow.kind,
-      ...parseJson(predictionRow.payload_json, {}),
-      created_at: predictionRow.created_at,
-      review: reviewRow ? {
-        id: reviewRow.id,
-        decision: reviewRow.value,
-        source: reviewRow.source,
-        reason: parseJson(reviewRow.details_json, {}).reason ?? null,
-        reviewed_at: reviewRow.created_at,
-      } : null,
-    };
-    const decision = this.db.prepare(`
-      SELECT decision, reason, details_json, created_at
-      FROM policy_decisions WHERE run_id = ? ORDER BY rowid LIMIT 1
-    `).get(runId);
-    const derivedPolicyDecisions = this.db.prepare(`
-      SELECT id, rule_version_id, decision, reason, details_json, created_at
-      FROM policy_decisions WHERE run_id = ? ORDER BY rowid
-    `).all(runId).map((row) => ({
-      id: row.id,
-      rule_version_id: row.rule_version_id,
-      decision: row.decision,
-      reason: row.reason,
-      details: parseJson(row.details_json, {}),
-      created_at: row.created_at,
-    }));
-    const events = this.db.prepare(`
-      SELECT event_type, payload_json, occurred_at
-      FROM operation_events WHERE run_id = ? ORDER BY occurred_at, rowid
-    `).all(runId).map((row) => ({
-      type: row.event_type,
-      payload: parseJson(row.payload_json, {}),
-      occurred_at: row.occurred_at,
-    }));
-    const lineage = operation.output_material_id ? this.db.prepare(`
-      SELECT output_material_id, input_material_id, run_id, relation_type, ordinal, created_at
-      FROM material_derivations WHERE output_material_id = ? ORDER BY ordinal
-    `).all(operation.output_material_id) : [];
-    return {
-      run: {
-        id: run.id,
-        mode: run.mode,
-        status: run.status,
-        root_path: run.root_path,
-        intent: run.intent,
-        caller: {
-          actor: run.actor,
-          agent: run.agent,
-          model: run.model,
-          tool: run.tool,
-          client_run_id: run.client_run_id,
-        },
-        rule_version_id: run.rule_version_id,
-        started_at: run.started_at,
-        rolled_back_at: run.rolled_back_at,
-      },
-      placement: {
-        project_id: operation.project_id,
-        project_name: operation.project_name,
-        project_path: operation.project_path,
-        target_path: operation.target_path,
-        role: operation.role,
-        relation_type: operation.relation_type,
-        policy: placementPrediction.evidence?.policy ?? null,
-        revised_from_run_id: operation.revised_from_run_id,
-      },
-      placement_prediction: placementPrediction,
-      candidate: {
-        id: candidate.id,
-        version: candidate.version,
-        operation: candidate.operation,
-        target_path: candidate.target_path,
-        status: candidate.status,
-        content_hash: operation.candidate_hash,
-        byte_size: operation.candidate_byte_size,
-        blob_path: this.#resolveBlobPath(operation.candidate_blob_path, operation.candidate_hash),
-        diff_text: candidate.diff_text,
-        diff_hash: candidate.diff_hash,
-        summary: parseJson(candidate.summary_json, {}),
-        created_at: candidate.created_at,
-      },
-      inputs,
-      output: operation.output_material_id ? {
-        artifact_id: operation.output_artifact_id,
-        material_id: operation.output_material_id,
-        project_id: operation.project_id,
-        role: operation.output_current_role,
-        original_role: operation.role,
-        artifact_status: operation.output_artifact_status,
-        target_path: operation.target_path,
-        content_hash: operation.output_hash,
-        byte_size: operation.output_byte_size,
-        blob_path: this.#resolveBlobPath(operation.output_blob_path, operation.output_hash),
-      } : null,
-      lineage,
-      risk: {
-        mode: decision.decision,
-        reason: decision.reason,
-        ...parseJson(decision.details_json, {}),
-        rule_version: this.getRuleVersion(run.rule_version_id),
-        decided_at: decision.created_at,
-      },
-      policy_decisions: derivedPolicyDecisions,
-      approved_candidate_hash: operation.approved_candidate_hash,
-      events,
-      approval_receipt: parseJson(operation.approval_receipt_json),
-      rejection_receipt: parseJson(operation.rejection_receipt_json),
-      execution_receipt: parseJson(operation.execution_receipt_json),
-      rollback_receipt: parseJson(run.rollback_receipt_json),
-    };
+    return this.derived.getDerivedDetail(runId);
   }
 
-  reviewDerived(runId, { decision, reason, reviewedAt }) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.mode !== 'derived') throw new Error(`Run is not Derived: ${runId}`);
-      const operation = this.db.prepare(`
-        SELECT placement_prediction_id, approved_candidate_hash,
-               approval_receipt_json, rejection_receipt_json
-        FROM derived_operations WHERE run_id = ?
-      `).get(runId);
-      const existing = decision === 'accepted'
-        ? parseJson(operation.approval_receipt_json)
-        : parseJson(operation.rejection_receipt_json);
-      if (existing) return existing;
-      if (run.status !== 'prepared') {
-        throw new Error(`Derived review requires prepared status; current status is ${run.status}.`);
-      }
-      const candidate = this.db.prepare(`
-        SELECT id, content_hash FROM candidate_change_sets WHERE run_id = ?
-      `).get(runId);
-      const status = decision === 'accepted' ? 'approved' : 'rejected';
-      const receipt = {
-        run_id: runId,
-        candidate_change_set_id: candidate.id,
-        placement_prediction_id: operation.placement_prediction_id,
-        decision,
-        reason,
-        status,
-        reviewed_at: reviewedAt,
-      };
-      this.db.prepare(`
-        INSERT INTO labels(
-          id, run_id, subject_prediction_id, name, value, source, details_json, created_at
-        ) VALUES (?, ?, ?, 'derived_placement_review', ?, 'user', ?, ?)
-      `).run(
-        `LBL-${crypto.randomUUID()}`,
-        runId,
-        operation.placement_prediction_id,
-        decision,
-        json({ reason }),
-        reviewedAt,
-      );
-      this.db.prepare('UPDATE runs SET status = ? WHERE id = ?').run(status, runId);
-      this.db.prepare('UPDATE candidate_change_sets SET status = ? WHERE run_id = ?').run(status, runId);
-      if (decision === 'accepted') {
-        this.db.prepare(`
-          UPDATE derived_operations
-          SET approved_candidate_hash = ?, approval_receipt_json = ? WHERE run_id = ?
-        `).run(candidate.content_hash, json(receipt), runId);
-      } else {
-        this.db.prepare(`
-          UPDATE derived_operations SET rejection_receipt_json = ? WHERE run_id = ?
-        `).run(json(receipt), runId);
-      }
-      this.#insertEvent(runId, `derived_${status}`, receipt, reviewedAt);
-      return receipt;
-    });
+  reviewDerived(runId, review) {
+    return this.derived.reviewDerived(runId, review);
   }
 
   markDerivedRevised(runId, revisedRunId, reason, revisedAt) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (!['prepared', 'approved', 'rejected', 'stale'].includes(run.status)) {
-        throw new Error(`Derived run cannot be revised from status ${run.status}.`);
-      }
-      const existing = this.db.prepare(`
-        SELECT details_json FROM labels
-        WHERE run_id = ? AND name = 'derived_revision' ORDER BY rowid DESC LIMIT 1
-      `).get(runId);
-      if (existing) return parseJson(existing.details_json, {}).revised_run_id;
-      this.db.prepare(`
-        INSERT INTO labels(id, run_id, name, value, source, details_json, created_at)
-        VALUES (?, ?, 'derived_revision', 'corrected', 'user', ?, ?)
-      `).run(
-        `LBL-${crypto.randomUUID()}`,
-        runId,
-        json({ reason, revised_run_id: revisedRunId }),
-        revisedAt,
-      );
-      this.db.prepare("UPDATE runs SET status = 'revised' WHERE id = ?").run(runId);
-      this.db.prepare("UPDATE candidate_change_sets SET status = 'revised' WHERE run_id = ?").run(runId);
-      this.#insertEvent(runId, 'derived_revised', { reason, revised_run_id: revisedRunId }, revisedAt);
-      return revisedRunId;
-    });
+    return this.derived.markDerivedRevised(runId, revisedRunId, reason, revisedAt);
   }
 
-  promoteDerivedArtifact(runId, { fromRole, toRole, reason, promotedAt }) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.status !== 'executed') {
-        throw new Error(`Derived role promotion requires executed status; current status is ${run.status}.`);
-      }
-      const operation = this.db.prepare(`
-        SELECT d.output_artifact_id, d.output_material_id, a.role AS current_role, a.current_path
-        FROM derived_operations d JOIN artifacts a ON a.id = d.output_artifact_id
-        WHERE d.run_id = ?
-      `).get(runId);
-      if (!operation?.output_material_id) throw new Error(`Derived output is incomplete: ${runId}`);
-      if (operation.current_role === toRole) {
-        const existing = this.db.prepare(`
-          SELECT payload_json FROM operation_events
-          WHERE run_id = ? AND event_type = 'derived_role_promoted'
-          ORDER BY rowid DESC LIMIT 1
-        `).get(runId);
-        if (existing) return parseJson(existing.payload_json, {});
-        return {
-          run_id: runId,
-          artifact_id: operation.output_artifact_id,
-          material_id: operation.output_material_id,
-          path: operation.current_path,
-          from_role: fromRole,
-          to_role: toRole,
-          status: 'unchanged',
-          content_changed: false,
-          reason,
-        };
-      }
-      if (operation.current_role !== fromRole) {
-        throw new Error(`Derived Artifact role changed from ${fromRole} to ${operation.current_role}; review current state.`);
-      }
-      const predictionId = `PRD-${crypto.randomUUID()}`;
-      const labelId = `LBL-${crypto.randomUUID()}`;
-      const decisionId = `DEC-${crypto.randomUUID()}`;
-      const prediction = {
-        kind: 'role_transition_candidate',
-        summary: `Promote ${operation.current_path} from ${fromRole} to ${toRole}.`,
-        confidence: 1,
-        risk: 'low',
-        affected_paths: [operation.current_path],
-        evidence: {
-          artifact_id: operation.output_artifact_id,
-          material_id: operation.output_material_id,
-          from_role: fromRole,
-          to_role: toRole,
-          content_changed: false,
-        },
-        proposed_action: 'Change only the Artifact role while preserving its path, Material, and lineage.',
-        requires_review: true,
-        source: 'user_command',
-      };
-      this.db.prepare(`
-        INSERT INTO predictions(id, run_id, kind, payload_json, created_at)
-        VALUES (?, ?, 'role_transition_candidate', ?, ?)
-      `).run(predictionId, runId, json(prediction), promotedAt);
-      this.db.prepare(`
-        INSERT INTO labels(id, run_id, subject_prediction_id, name, value, source, details_json, created_at)
-        VALUES (?, ?, ?, 'derived_role_review', 'accepted', 'user', ?, ?)
-      `).run(labelId, runId, predictionId, json({ reason }), promotedAt);
-      this.db.prepare(`
-        INSERT INTO policy_decisions(id, run_id, rule_version_id, decision, reason, details_json, created_at)
-        VALUES (?, ?, ?, 'allow', ?, ?, ?)
-      `).run(
-        decisionId,
-        runId,
-        run.rule_version_id,
-        `The requested role transition ${fromRole} → ${toRole} is allowed by the V1 role ontology.`,
-        json({ from_role: fromRole, to_role: toRole, content_changed: false }),
-        promotedAt,
-      );
-      this.db.prepare(`
-        UPDATE artifacts SET role = ?, updated_at = ? WHERE id = ?
-      `).run(toRole, promotedAt, operation.output_artifact_id);
-      const receipt = {
-        run_id: runId,
-        artifact_id: operation.output_artifact_id,
-        material_id: operation.output_material_id,
-        path: operation.current_path,
-        from_role: fromRole,
-        to_role: toRole,
-        content_changed: false,
-        prediction_id: predictionId,
-        label_id: labelId,
-        policy_decision_id: decisionId,
-        reason,
-        promoted_at: promotedAt,
-      };
-      this.#insertEvent(runId, 'derived_role_promoted', receipt, promotedAt);
-      return receipt;
-    });
+  promoteDerivedArtifact(runId, promotion) {
+    return this.derived.promoteDerivedArtifact(runId, promotion);
   }
 
   getDerivedConsumers(runId) {
-    const operation = this.db.prepare(`
-      SELECT output_material_id FROM derived_operations WHERE run_id = ?
-    `).get(runId);
-    if (!operation?.output_material_id) return [];
-    return this.db.prepare(`
-      SELECT DISTINCT di.run_id, r.status, r.started_at
-      FROM derived_inputs di JOIN runs r ON r.id = di.run_id
-      WHERE di.material_id = ? AND di.run_id <> ?
-        AND r.status NOT IN ('rolled_back', 'rejected', 'revised')
-      ORDER BY r.started_at, di.run_id
-    `).all(operation.output_material_id, runId);
+    return this.derived.getDerivedConsumers(runId);
   }
 
   markDerivedStale(runId, payload, occurredAt) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.status === 'stale') return;
-      if (run.status !== 'approved') {
-        throw new Error(`Only an approved Derived run can become stale; current status is ${run.status}.`);
-      }
-      this.db.prepare("UPDATE runs SET status = 'stale' WHERE id = ?").run(runId);
-      this.db.prepare("UPDATE candidate_change_sets SET status = 'stale' WHERE run_id = ?").run(runId);
-      this.#insertEvent(runId, 'derived_approval_invalidated', payload, occurredAt);
-    });
+    return this.derived.markDerivedStale(runId, payload, occurredAt);
   }
 
   startDerivedExecution(runId, occurredAt) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.status !== 'approved') {
-        throw new Error(`Derived execution requires approval; current status is ${run.status}.`);
-      }
-      const existing = this.db.prepare(`
-        SELECT occurred_at FROM operation_events
-        WHERE run_id = ? AND event_type = 'derived_execution_started'
-        ORDER BY rowid DESC LIMIT 1
-      `).get(runId);
-      if (existing) return { run_id: runId, status: 'execution_started', started_at: existing.occurred_at };
-      const receipt = { run_id: runId, status: 'execution_started', started_at: occurredAt };
-      this.#insertEvent(runId, 'derived_execution_started', receipt, occurredAt);
-      return receipt;
-    });
+    return this.derived.startDerivedExecution(runId, occurredAt);
   }
 
-  finishDerivedExecution(runId, { receipt, executedAt }) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      const operation = this.db.prepare(`
-        SELECT d.*, cm.content_hash AS candidate_hash, cm.byte_size AS candidate_byte_size,
-               cm.blob_path AS candidate_blob_path
-        FROM derived_operations d
-        JOIN materials cm ON cm.id = d.candidate_material_id
-        WHERE d.run_id = ?
-      `).get(runId);
-      const existing = parseJson(operation.execution_receipt_json);
-      if (existing) return existing;
-      if (run.status !== 'approved') {
-        throw new Error(`Derived execution requires approval; current status is ${run.status}.`);
-      }
-      if (operation.approved_candidate_hash !== operation.candidate_hash) {
-        throw new Error('Derived approval no longer matches the Candidate ChangeSet.');
-      }
-      const candidate = this.db.prepare(`
-        SELECT * FROM candidate_change_sets WHERE run_id = ?
-      `).get(runId);
-      const actual = this.db.prepare('SELECT id FROM change_sets WHERE run_id = ?').get(runId);
-      const outputMaterialId = `MAT-${crypto.randomUUID()}`;
-      this.db.prepare(`
-        INSERT INTO materials(id, artifact_id, stage, content_hash, byte_size, blob_path, created_at)
-        VALUES (?, ?, 'output', ?, ?, ?, ?)
-      `).run(
-        outputMaterialId,
-        operation.output_artifact_id,
-        operation.candidate_hash,
-        operation.candidate_byte_size,
-        operation.candidate_blob_path,
-        executedAt,
-      );
-      const inputs = this.db.prepare(`
-        SELECT material_id, ordinal FROM derived_inputs WHERE run_id = ? ORDER BY ordinal
-      `).all(runId);
-      const insertDerivation = this.db.prepare(`
-        INSERT INTO material_derivations(
-          output_material_id, input_material_id, run_id, relation_type, ordinal, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
-      `);
-      for (const input of inputs) {
-        insertDerivation.run(
-          outputMaterialId,
-          input.material_id,
-          runId,
-          operation.relation_type,
-          input.ordinal,
-          executedAt,
-        );
-      }
-      this.db.prepare(`
-        INSERT INTO changes(
-          id, change_set_id, path, change_type, allowed,
-          before_kind, before_hash, before_material_id,
-          after_kind, after_hash, after_material_id
-        ) VALUES (?, ?, ?, 'added', 1, NULL, NULL, NULL, 'file', ?, ?)
-      `).run(
-        `DIF-${crypto.randomUUID()}`,
-        actual.id,
-        operation.target_path,
-        operation.candidate_hash,
-        outputMaterialId,
-      );
-      this.db.prepare(`
-        UPDATE change_sets
-        SET status = 'executed', diff_text = ?, diff_hash = ?, summary_json = ?, closed_at = ?
-        WHERE id = ?
-      `).run(candidate.diff_text, candidate.diff_hash, candidate.summary_json, executedAt, actual.id);
-      this.db.prepare(`
-        UPDATE candidate_change_sets SET status = 'executed' WHERE run_id = ?
-      `).run(runId);
-      const finalReceipt = {
-        ...receipt,
-        artifact_id: operation.output_artifact_id,
-        material_id: outputMaterialId,
-      };
-      this.db.prepare(`
-        UPDATE derived_operations
-        SET output_material_id = ?, execution_receipt_json = ?, executed_at = ? WHERE run_id = ?
-      `).run(outputMaterialId, json(finalReceipt), executedAt, runId);
-      this.db.prepare(`
-        UPDATE artifacts SET status = 'active', updated_at = ? WHERE id = ?
-      `).run(executedAt, operation.output_artifact_id);
-      this.db.prepare(`
-        UPDATE runs SET status = 'executed', closed_at = ?, receipt_json = ? WHERE id = ?
-      `).run(executedAt, json(finalReceipt), runId);
-      this.#insertEvent(runId, 'derived_created_and_verified', finalReceipt, executedAt);
-      return finalReceipt;
-    });
+  finishDerivedExecution(runId, execution) {
+    return this.derived.finishDerivedExecution(runId, execution);
   }
 
   startDerivedRollback(runId, occurredAt) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.status !== 'executed') {
-        throw new Error(`Only an executed Derived run can be rolled back; current status is ${run.status}.`);
-      }
-      const existing = this.db.prepare(`
-        SELECT occurred_at FROM operation_events
-        WHERE run_id = ? AND event_type = 'derived_rollback_started'
-        ORDER BY rowid DESC LIMIT 1
-      `).get(runId);
-      if (existing) return { run_id: runId, status: 'rollback_started', started_at: existing.occurred_at };
-      const receipt = { run_id: runId, status: 'rollback_started', started_at: occurredAt };
-      this.#insertEvent(runId, 'derived_rollback_started', receipt, occurredAt);
-      return receipt;
-    });
+    return this.derived.startDerivedRollback(runId, occurredAt);
   }
 
   finishDerivedRollback(runId, receipt, rolledBackAt) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.rollback_receipt_json) return parseJson(run.rollback_receipt_json);
-      if (run.status !== 'executed') {
-        throw new Error(`Only an executed Derived run can be rolled back; current status is ${run.status}.`);
-      }
-      const operation = this.db.prepare(`
-        SELECT output_artifact_id FROM derived_operations WHERE run_id = ?
-      `).get(runId);
-      this.db.prepare(`
-        UPDATE runs
-        SET status = 'rolled_back', rolled_back_at = ?, rollback_receipt_json = ? WHERE id = ?
-      `).run(rolledBackAt, json(receipt), runId);
-      this.db.prepare("UPDATE change_sets SET status = 'rolled_back' WHERE run_id = ?").run(runId);
-      this.db.prepare(`
-        UPDATE artifacts SET status = 'rolled_back', updated_at = ? WHERE id = ?
-      `).run(rolledBackAt, operation.output_artifact_id);
-      this.#insertEvent(runId, 'derived_rollback_completed', receipt, rolledBackAt);
-      this.#insertRollbackOutcome(runId, {
-        outcome: 'completed',
-        reasonCode: 'restored_and_verified',
-        details: { removed_files: receipt.removed_files ?? null },
-      }, rolledBackAt);
-      return receipt;
-    });
+    return this.derived.finishDerivedRollback(runId, receipt, rolledBackAt);
   }
-
   findPortfolioInventory(root, fingerprint) {
     return this.db.prepare(`
       SELECT r.id, r.receipt_json
@@ -3710,182 +1216,35 @@ export class Ledger {
   }
 
   createProject({ projectId, name, currentPath, aliases, status, parentProjectId, splitFrom, createdAt }) {
-    return this.transaction(() => {
-      if (this.db.prepare(`
-        SELECT id FROM projects WHERE current_path = ? AND status = 'active'
-      `).get(currentPath)) {
-        throw new Error(`An active Project already uses path: ${currentPath}`);
-      }
-      if (parentProjectId) this.getProject(parentProjectId);
-      for (const sourceId of splitFrom) this.getProject(sourceId);
-      this.db.prepare(`
-        INSERT INTO projects(
-          id, name, current_path, status, parent_project_id, lineage_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        projectId,
-        name,
-        currentPath,
-        status,
-        parentProjectId ?? null,
-        json({ split_from: splitFrom }),
-        createdAt,
-        createdAt,
-      );
-      this.db.prepare(`
-        INSERT INTO project_path_history(project_id, path, valid_from) VALUES (?, ?, ?)
-      `).run(projectId, currentPath, createdAt);
-      const insertAlias = this.db.prepare(`
-        INSERT OR IGNORE INTO project_aliases(project_id, alias, created_at) VALUES (?, ?, ?)
-      `);
-      for (const alias of aliases) insertAlias.run(projectId, alias, createdAt);
-      if (parentProjectId) {
-        this.#insertProjectRelation(projectId, 'parent', parentProjectId, createdAt, {});
-      }
-      for (const sourceId of splitFrom) {
-        this.#insertProjectRelation(projectId, 'split_from', sourceId, createdAt, {});
-      }
-      return this.getProjectDetail(projectId);
+    return this.projects.create({
+      projectId, name, currentPath, aliases, status, parentProjectId, splitFrom, createdAt,
     });
   }
 
   updateProject(projectId, { name, currentPath, aliases, status, reason, updatedAt }) {
-    return this.transaction(() => {
-      const project = this.getProject(projectId);
-      if (currentPath !== project.current_path) {
-        const collision = this.db.prepare(`
-          SELECT id FROM projects WHERE current_path = ? AND status = 'active' AND id <> ?
-        `).get(currentPath, projectId);
-        if (collision) throw new Error(`An active Project already uses path: ${currentPath}`);
-        this.db.prepare(`
-          UPDATE project_path_history SET valid_to = ?, reason = ?
-          WHERE project_id = ? AND valid_to IS NULL
-        `).run(updatedAt, reason ?? null, projectId);
-        this.db.prepare(`
-          INSERT INTO project_path_history(project_id, path, valid_from, reason)
-          VALUES (?, ?, ?, ?)
-        `).run(projectId, currentPath, updatedAt, reason ?? null);
-      }
-      this.db.prepare(`
-        UPDATE projects
-        SET name = ?, current_path = ?, status = ?, updated_at = ?
-        WHERE id = ?
-      `).run(name, currentPath, status, updatedAt, projectId);
-      const insertAlias = this.db.prepare(`
-        INSERT OR IGNORE INTO project_aliases(project_id, alias, created_at) VALUES (?, ?, ?)
-      `);
-      for (const alias of aliases) insertAlias.run(projectId, alias, updatedAt);
-      return this.getProjectDetail(projectId);
+    return this.projects.update(projectId, {
+      name, currentPath, aliases, status, reason, updatedAt,
     });
   }
 
   mergeProjects(sourceIds, targetId, effectiveAt) {
-    return this.transaction(() => {
-      this.getProject(targetId);
-      for (const sourceId of sourceIds) {
-        if (sourceId === targetId) throw new Error('A Project cannot be merged into itself.');
-        this.getProject(sourceId);
-        this.db.prepare(`
-          UPDATE projects SET status = 'merged', updated_at = ? WHERE id = ?
-        `).run(effectiveAt, sourceId);
-        this.#insertProjectRelation(sourceId, 'merged_into', targetId, effectiveAt, {});
-      }
-      return sourceIds.map((sourceId) => this.getProjectDetail(sourceId));
-    });
-  }
-
-  #insertProjectRelation(sourceId, relationType, targetId, effectiveAt, details) {
-    this.db.prepare(`
-      INSERT OR IGNORE INTO project_relations(
-        id, source_project_id, relation_type, target_project_id, effective_at, details_json
-      ) VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
-      `REL-${crypto.randomUUID()}`,
-      sourceId,
-      relationType,
-      targetId,
-      effectiveAt,
-      json(details),
-    );
+    return this.projects.merge(sourceIds, targetId, effectiveAt);
   }
 
   getProject(projectId) {
-    const project = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
-    if (!project) throw new Error(`Project not found: ${projectId}`);
-    return project;
+    return this.projects.get(projectId);
   }
 
   getProjectDetail(projectId) {
-    const project = this.getProject(projectId);
-    const aliases = this.db.prepare(`
-      SELECT alias FROM project_aliases WHERE project_id = ? ORDER BY rowid
-    `).all(projectId).map((row) => row.alias);
-    const paths = this.db.prepare(`
-      SELECT path, valid_from, valid_to, reason
-      FROM project_path_history WHERE project_id = ? ORDER BY id
-    `).all(projectId);
-    const relations = this.db.prepare(`
-      SELECT relation_type, target_project_id, effective_at, details_json
-      FROM project_relations WHERE source_project_id = ? ORDER BY rowid
-    `).all(projectId).map((row) => ({
-      ...row,
-      details: parseJson(row.details_json, {}),
-      details_json: undefined,
-    }));
-    return { project, aliases, paths, relations };
+    return this.projects.getDetail(projectId);
   }
 
   listProjects() {
-    return this.db.prepare(`
-      SELECT id, name, current_path, status, parent_project_id, created_at, updated_at
-      FROM projects ORDER BY created_at, id
-    `).all();
+    return this.projects.list();
   }
 
   ensureProjectFromBootstrapPrediction(predictionId, createdAt) {
-    return this.transaction(() => {
-      const existing = this.db.prepare(`
-        SELECT project_id FROM project_sources WHERE prediction_id = ?
-      `).get(predictionId);
-      if (existing) return this.getProjectDetail(existing.project_id);
-      const prediction = this.db.prepare(`
-        SELECT id, run_id, kind, payload_json FROM predictions WHERE id = ?
-      `).get(predictionId);
-      if (!prediction || prediction.kind !== 'project_candidate') {
-        throw new Error(`Bootstrap Project Prediction not found: ${predictionId}`);
-      }
-      const review = this.db.prepare(`
-        SELECT value FROM labels
-        WHERE subject_prediction_id = ? ORDER BY rowid DESC LIMIT 1
-      `).get(predictionId);
-      if (review?.value !== 'accepted') {
-        throw new Error(`Project Prediction must be accepted before Registry initialization: ${predictionId}`);
-      }
-      const payload = parseJson(prediction.payload_json, {});
-      const currentPath = payload.evidence?.directory;
-      if (!currentPath) throw new Error(`Project Prediction has no directory evidence: ${predictionId}`);
-      let project = this.db.prepare(`
-        SELECT id FROM projects WHERE current_path = ? AND status = 'active'
-      `).get(currentPath);
-      if (!project) {
-        const id = `PRJ-${crypto.randomUUID()}`;
-        this.db.prepare(`
-          INSERT INTO projects(
-            id, name, current_path, status, lineage_json, created_at, updated_at
-          ) VALUES (?, ?, ?, 'active', ?, ?, ?)
-        `).run(id, path.posix.basename(currentPath), currentPath, json({ bootstrap_prediction_id: predictionId }), createdAt, createdAt);
-        this.db.prepare(`
-          INSERT INTO project_path_history(project_id, path, valid_from, reason)
-          VALUES (?, ?, ?, 'Accepted Bootstrap Prediction')
-        `).run(id, currentPath, createdAt);
-        project = { id };
-      }
-      this.db.prepare(`
-        INSERT INTO project_sources(project_id, prediction_id, scan_run_id, created_at)
-        VALUES (?, ?, ?, ?)
-      `).run(project.id, predictionId, prediction.run_id, createdAt);
-      return this.getProjectDetail(project.id);
-    });
+    return this.projects.ensureFromBootstrapPrediction(predictionId, createdAt);
   }
 
   findBootstrapScan(root, fingerprint) {
@@ -3899,246 +1258,33 @@ export class Ledger {
   }
 
   activateEnvironmentPolicy({ runId, root, policy, activatedAt }) {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run.mode !== 'bootstrap') throw new Error(`Run is not a Bootstrap scan: ${runId}`);
-      const existing = this.db.prepare(`
-        SELECT id, root_path, scan_run_id, rule_version_id, policy_json, status, activated_at, deactivated_at
-        FROM environment_policies WHERE scan_run_id = ?
-      `).get(runId);
-      if (existing) {
-        const existingPolicy = parseJson(existing.policy_json, {});
-        return {
-          ...existing,
-          profile_id: existingPolicy.profile_id ?? null,
-          profile_version: existingPolicy.profile_version ?? null,
-          policy: existingPolicy,
-          policy_json: undefined,
-        };
-      }
-      const normalizedRoot = path.resolve(root);
-      if (normalizedRoot !== path.resolve(run.root_path)) {
-        throw new Error('Environment policy root must match its Bootstrap scan root.');
-      }
-      const definition = structuredClone(policy);
-      const definitionJson = json(definition);
-      const ruleVersionId = `RULE-ENV-${crypto.createHash('sha256').update(definitionJson).digest('hex').slice(0, 16).toUpperCase()}`;
-      const policyId = `POL-${crypto.randomUUID()}`;
-      this.db.prepare(`
-        INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(
-        ruleVersionId,
-        `Environment routing policy: ${definition.profile_id ?? 'reviewed-bootstrap'}`,
-        definition.profile_version ?? '1.0.0',
-        definitionJson,
-        activatedAt,
-      );
-      this.db.prepare(`
-        UPDATE environment_policies
-        SET status = 'superseded', deactivated_at = ?
-        WHERE root_path = ? AND status = 'active'
-      `).run(activatedAt, normalizedRoot);
-      this.db.prepare(`
-        INSERT INTO environment_policies(
-          id, root_path, scan_run_id, rule_version_id, policy_json, status, activated_at
-        ) VALUES (?, ?, ?, ?, ?, 'active', ?)
-      `).run(policyId, normalizedRoot, runId, ruleVersionId, definitionJson, activatedAt);
-      const receipt = {
-        id: policyId,
-        root_path: normalizedRoot,
-        scan_run_id: runId,
-        rule_version_id: ruleVersionId,
-        profile_id: definition.profile_id ?? null,
-        profile_version: definition.profile_version ?? null,
-        policy: definition,
-        status: 'active',
-        activated_at: activatedAt,
-        deactivated_at: null,
-      };
-      this.#insertEvent(runId, 'environment_policy_activated', {
-        policy_id: policyId,
-        rule_version_id: ruleVersionId,
-        profile_id: definition.profile_id ?? null,
-        profile_version: definition.profile_version ?? null,
-      }, activatedAt);
-      return receipt;
-    });
+    return this.policies.activateEnvironment({ runId, root, policy, activatedAt });
   }
 
   getActiveEnvironmentPolicy(root) {
-    const row = this.db.prepare(`
-      SELECT id, root_path, scan_run_id, rule_version_id, policy_json, status, activated_at, deactivated_at
-      FROM environment_policies
-      WHERE root_path = ? AND status = 'active'
-      ORDER BY activated_at DESC, rowid DESC LIMIT 1
-    `).get(path.resolve(root));
-    if (!row) return null;
-    const policy = parseJson(row.policy_json, {});
-    return {
-      ...row,
-      profile_id: policy.profile_id ?? null,
-      profile_version: policy.profile_version ?? null,
-      library_contract: policy.library_contract ?? null,
-      policy,
-      policy_json: undefined,
-    };
+    return this.policies.getActiveEnvironment(root);
   }
 
   getEnvironmentPolicyForScan(runId) {
-    const row = this.db.prepare(`
-      SELECT id, root_path, scan_run_id, rule_version_id, policy_json, status, activated_at, deactivated_at
-      FROM environment_policies WHERE scan_run_id = ?
-    `).get(runId);
-    if (!row) return null;
-    const policy = parseJson(row.policy_json, {});
-    return {
-      ...row,
-      profile_id: policy.profile_id ?? null,
-      profile_version: policy.profile_version ?? null,
-      library_contract: policy.library_contract ?? null,
-      policy,
-      policy_json: undefined,
-    };
+    return this.policies.getEnvironmentForScan(runId);
   }
 
   createRoutingCorrection({
     root, scopeType, scopeKey, origin, kind, role, targetSubdirectory,
     reason, caller = {}, createdAt = now(),
   }) {
-    const definition = {
-      schema: 'atlas-routing-correction.v1',
-      root_path: path.resolve(root),
-      scope: scopeType,
-      scope_key: scopeKey,
-      origin,
-      kind,
-      role,
-      target_subdirectory: targetSubdirectory,
-    };
-    const definitionJson = json(definition);
-    const definitionHash = crypto.createHash('sha256').update(definitionJson).digest('hex');
-    const ruleVersionId = `RULE-ROUTE-${definitionHash.slice(0, 16).toUpperCase()}`;
-    const existing = this.db.prepare(`
-      SELECT * FROM routing_corrections
-      WHERE root_path = ? AND scope_type = ? AND scope_key = ?
-        AND origin = ? AND kind = ? AND status = 'active'
-    `).get(definition.root_path, scopeType, scopeKey, origin, kind);
-    if (existing && existing.rule_version_id === ruleVersionId) {
-      return {
-        correction_id: existing.id,
-        run_id: existing.run_id,
-        rule_version_id: existing.rule_version_id,
-        scope: existing.scope_type,
-        scope_key: existing.scope_key,
-        origin: existing.origin,
-        kind: existing.kind,
-        role: existing.role,
-        target_subdirectory: existing.target_subdirectory,
-        status: existing.status,
-        reused: true,
-      };
-    }
-    const runId = `RUL-${createdAt.replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`;
-    const correctionId = `COR-${crypto.randomUUID()}`;
-    const predictionId = `PRD-${crypto.randomUUID()}`;
-    const receipt = {
-      correction_id: correctionId,
-      run_id: runId,
-      rule_version_id: ruleVersionId,
-      scope: scopeType,
-      scope_key: scopeKey,
-      origin,
-      kind,
-      role,
-      target_subdirectory: targetSubdirectory,
-      status: 'active',
-      reused: false,
-    };
-    this.transaction(() => {
-      this.db.prepare(`
-        INSERT OR IGNORE INTO rule_versions(id, name, version, definition_json, created_at)
-        VALUES (?, 'Reviewed Intake routing correction', '1.0.0', ?, ?)
-      `).run(ruleVersionId, definitionJson, createdAt);
-      this.db.prepare(`
-        UPDATE routing_corrections SET status = 'superseded', superseded_at = ?
-        WHERE root_path = ? AND scope_type = ? AND scope_key = ?
-          AND origin = ? AND kind = ? AND status = 'active'
-      `).run(createdAt, definition.root_path, scopeType, scopeKey, origin, kind);
-      this.db.prepare(`
-        INSERT INTO runs(
-          id, mode, status, root_path, intent, actor, agent, model, tool, client_run_id,
-          rule_version_id, started_at, closed_at, receipt_json
-        ) VALUES (?, 'rule_correction', 'closed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        runId, definition.root_path, reason,
-        caller.actor ?? 'unknown', caller.agent ?? null, caller.model ?? null,
-        caller.tool ?? 'atlas-cli', caller.client_run_id ?? null,
-        ruleVersionId, createdAt, createdAt, json(receipt),
-      );
-      this.db.prepare(`
-        INSERT INTO predictions(id, run_id, kind, payload_json, created_at)
-        VALUES (?, ?, 'routing_rule_correction', ?, ?)
-      `).run(predictionId, runId, definitionJson, createdAt);
-      this.db.prepare(`
-        INSERT INTO labels(
-          id, run_id, subject_prediction_id, name, value, source, details_json, created_at
-        ) VALUES (?, ?, ?, 'routing_rule_correction', 'corrected', 'user', ?, ?)
-      `).run(`LBL-${crypto.randomUUID()}`, runId, predictionId, json({ reason, scope: scopeType }), createdAt);
-      this.db.prepare(`
-        INSERT INTO policy_decisions(
-          id, run_id, rule_version_id, decision, reason, details_json, created_at
-        ) VALUES (?, ?, ?, 'allow', ?, ?, ?)
-      `).run(
-        `POL-${crypto.randomUUID()}`, runId, ruleVersionId,
-        `Reviewed routing correction: ${reason}`, json({ scope: scopeType, scope_key: scopeKey }), createdAt,
-      );
-      this.db.prepare(`
-        INSERT INTO routing_corrections(
-          id, run_id, root_path, scope_type, scope_key, origin, kind, role,
-          target_subdirectory, rule_version_id, status, reason, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
-      `).run(
-        correctionId, runId, definition.root_path, scopeType, scopeKey, origin, kind,
-        role, targetSubdirectory, ruleVersionId, reason, createdAt,
-      );
-      this.#insertEvent(runId, 'routing_correction_activated', receipt, createdAt);
+    return this.policies.createRoutingCorrection({
+      root, scopeType, scopeKey, origin, kind, role, targetSubdirectory,
+      reason, caller, createdAt,
     });
-    return receipt;
   }
 
   findRoutingCorrection({ root, origin, kind, candidateHash = null, projectId = null }) {
-    const rows = this.db.prepare(`
-      SELECT * FROM routing_corrections
-      WHERE root_path = ? AND origin = ? AND kind = ? AND status = 'active'
-      ORDER BY created_at DESC, rowid DESC
-    `).all(path.resolve(root), origin, kind);
-    const selected = rows.find((row) => row.scope_type === 'artifact' && row.scope_key === `sha256:${candidateHash}`)
-      ?? rows.find((row) => row.scope_type === 'project' && row.scope_key === projectId)
-      ?? rows.find((row) => row.scope_type === 'global' && row.scope_key === '*')
-      ?? null;
-    if (!selected) return null;
-    return {
-      correction_id: selected.id,
-      run_id: selected.run_id,
-      rule_version_id: selected.rule_version_id,
-      scope: selected.scope_type,
-      scope_key: selected.scope_key,
-      origin: selected.origin,
-      kind: selected.kind,
-      role: selected.role,
-      target_subdirectory: selected.target_subdirectory,
-      status: selected.status,
-      reason: selected.reason,
-    };
+    return this.policies.findRoutingCorrection({ root, origin, kind, candidateHash, projectId });
   }
 
   listRoutingCorrections(root) {
-    return this.db.prepare(`
-      SELECT id AS correction_id, run_id, rule_version_id, scope_type AS scope,
-             scope_key, origin, kind, role, target_subdirectory, status, reason, created_at, superseded_at
-      FROM routing_corrections WHERE root_path = ? ORDER BY created_at, rowid
-    `).all(path.resolve(root));
+    return this.policies.listRoutingCorrections(root);
   }
 
   findLatestBootstrapScanForRoot(root) {

@@ -13,6 +13,7 @@ const OPERATIONS = new Set([
   'move_file',
   'migrate_project',
   'migrate_directory',
+  'migrate_cross_root',
   'remove_empty_directory',
 ]);
 const MAX_MANIFEST_ENTRIES = 100_000;
@@ -170,6 +171,19 @@ function normalizeSource(root, input, expectedKind) {
   const real = fs.realpathSync.native(lexical);
   if (!isPathInside(root, real)) throw new Error(`Evolution source resolves outside the root: ${input}`);
   return { absolute: real, relative: toPortablePath(path.relative(root, real)) };
+}
+
+function manifestByteSize(manifest) {
+  return manifest.entries.reduce((total, entry) => total + (entry.byte_size ?? 0), 0);
+}
+
+function availableBytes(directory) {
+  try {
+    const stats = fs.statfsSync(directory, { bigint: true });
+    return stats.bavail * stats.bsize;
+  } catch {
+    return null;
+  }
 }
 
 function directoryManifest(directory) {
@@ -419,6 +433,51 @@ function inspectMigratableDirectory(root, directory, manifest) {
   };
 }
 
+function inspectAncestorControlReferences(root, source) {
+  const references = [];
+  const filesRead = [];
+  const sourceRelative = toPortablePath(path.relative(root, source));
+  const needles = [...new Set([
+    source.toLowerCase(),
+    source.replaceAll('\\', '/').toLowerCase(),
+    sourceRelative.toLowerCase(),
+    sourceRelative.replaceAll('/', '\\').toLowerCase(),
+  ])].filter(Boolean);
+  let cursor = path.dirname(source);
+  while (isPathInside(root, cursor)) {
+    for (const name of CONTROL_FILE_NAMES) {
+      const candidate = path.join(cursor, name);
+      if (!fs.existsSync(candidate)) continue;
+      const stat = fs.lstatSync(candidate);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_CONTROL_FILE_BYTES) continue;
+      const text = fs.readFileSync(candidate, 'utf8');
+      filesRead.push({
+        path: toPortablePath(path.relative(root, candidate)),
+        byte_size: stat.size,
+      });
+      const normalized = text.replaceAll('\\\\', '\\').toLowerCase();
+      const matched = needles.filter((needle) => normalized.includes(needle));
+      if (!matched.length) continue;
+      const basename = path.basename(candidate).toLowerCase();
+      references.push({
+        path: toPortablePath(path.relative(root, candidate)),
+        functional: basename === 'agents.md' || FUNCTIONAL_REFERENCE_EXTENSIONS.has(path.extname(candidate).toLowerCase()),
+        matched_forms: matched,
+      });
+    }
+    if (cursor.toLowerCase() === root.toLowerCase()) break;
+    cursor = path.dirname(cursor);
+  }
+  return {
+    files_read: filesRead,
+    references,
+    blockers: references.some((item) => item.functional)
+      ? ['external_control_file_references_source_path'] : [],
+    warnings: references.some((item) => !item.functional)
+      ? ['external_documentation_references_source_path'] : [],
+  };
+}
+
 function migratableManifestAt(absolute) {
   if (!fs.existsSync(absolute)) return { kind: 'absent', entries: [], hash: null };
   const stat = fs.lstatSync(absolute);
@@ -434,6 +493,59 @@ function manifestForOperation(absolute, operation, expectedKind) {
   return operation === 'migrate_directory'
     ? migratableManifestAt(absolute)
     : manifestAt(absolute, expectedKind);
+}
+
+function technicalStagePath(target, runId, phase) {
+  return path.join(path.dirname(target), `.${path.basename(target)}.atlas-${runId}-${phase}.tmp`);
+}
+
+function removeRegularEntry(absolute, kind) {
+  if (kind === 'directory') fs.rmSync(absolute, { recursive: true });
+  else fs.unlinkSync(absolute);
+}
+
+function copyRegularEntry(source, target, kind) {
+  if (kind === 'directory') {
+    fs.cpSync(source, target, {
+      recursive: true,
+      errorOnExist: true,
+      force: false,
+      preserveTimestamps: true,
+    });
+  } else {
+    fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
+  }
+}
+
+function copyVerifiedToAbsentTarget({ source, target, kind, manifestHash, runId, phase }) {
+  const targetState = manifestAt(target, kind);
+  const stage = technicalStagePath(target, runId, phase);
+  if (sameManifest(targetState, kind, manifestHash)) {
+    if (fs.existsSync(stage)) fs.rmSync(stage, { recursive: true, force: true });
+    return;
+  }
+  if (targetState.kind !== 'absent') {
+    throw stateConflict('Cross-Root migration target was claimed or changed.');
+  }
+  let stageState = manifestAt(stage, kind);
+  if (!sameManifest(stageState, kind, manifestHash)) {
+    if (stageState.kind !== 'absent') fs.rmSync(stage, { recursive: true, force: true });
+    try {
+      copyRegularEntry(source, stage, kind);
+    } catch (error) {
+      if (fs.existsSync(stage)) fs.rmSync(stage, { recursive: true, force: true });
+      throw error;
+    }
+    stageState = manifestAt(stage, kind);
+  }
+  if (!sameManifest(stageState, kind, manifestHash)) {
+    if (fs.existsSync(stage)) fs.rmSync(stage, { recursive: true, force: true });
+    throw new Error('Cross-Root migration staging verification failed.');
+  }
+  fs.renameSync(stage, target);
+  if (!sameManifest(manifestAt(target, kind), kind, manifestHash)) {
+    throw new Error('Cross-Root migration target verification failed.');
+  }
 }
 
 function internalReparseEntries(entries) {
@@ -518,6 +630,7 @@ function diffFor(operation, source, target) {
   if (operation === 'remove_empty_directory') return `remove empty directory ${source}\n`;
   const subject = operation === 'move_file' ? 'file'
     : operation === 'migrate_directory' ? 'directory'
+      : operation === 'migrate_cross_root' ? 'cross-root entry'
       : 'project';
   return `move ${subject} ${source} -> ${target}\n`;
 }
@@ -796,6 +909,7 @@ export class Evolution {
 
   prepare({
     root: rootInput,
+    targetRoot: targetRootInput = null,
     operation,
     source = null,
     target,
@@ -804,8 +918,25 @@ export class Evolution {
     caller = {},
   }) {
     const root = normalizeRoot(rootInput);
+    const targetRoot = operation === 'migrate_cross_root'
+      ? normalizeRoot(targetRootInput)
+      : root;
     if (isPathInside(root, this.stateDir)) {
       throw new Error(`Atlas state directory must be outside the Evolution root: ${this.stateDir}`);
+    }
+    if (operation === 'migrate_cross_root') {
+      if (projectId) {
+        throw new Error('Cross-Root migration does not update Project Location; omit --project and reconcile the verified target with project relocate afterward.');
+      }
+      if (root.toLowerCase() === targetRoot.toLowerCase()) {
+        throw new Error('Cross-Root migration requires two different Roots.');
+      }
+      if (isPathInside(root, targetRoot) || isPathInside(targetRoot, root)) {
+        throw new Error('Cross-Root migration does not support nested Roots.');
+      }
+      if (isPathInside(targetRoot, this.stateDir)) {
+        throw new Error(`Atlas state directory must be outside the Evolution target Root: ${this.stateDir}`);
+      }
     }
     if (!OPERATIONS.has(operation)) {
       throw new Error(`Evolution operation must be one of: ${[...OPERATIONS].join(', ')}.`);
@@ -821,7 +952,7 @@ export class Evolution {
           relative: normalizedSource.relative,
         };
       } else {
-        normalizedTarget = normalizeTarget(root, target);
+        normalizedTarget = normalizeTarget(targetRoot, target);
       }
       if (operation === 'move_file') {
         normalizedSource = normalizeSource(root, source, 'file');
@@ -835,6 +966,8 @@ export class Evolution {
         if (source && normalizeSource(root, source, 'directory').relative !== normalizedSource.relative) {
           throw new Error('Project migration source does not match the Registry current path.');
         }
+      } else if (operation === 'migrate_cross_root') {
+        normalizedSource = normalizeSource(root, source, null);
       }
       if (normalizedSource) {
         if (operation !== 'remove_empty_directory'
@@ -850,7 +983,8 @@ export class Evolution {
         ? manifestForOperation(
             normalizedSource.absolute,
             operation,
-            operation === 'move_file' ? 'file' : 'directory',
+            operation === 'move_file' ? 'file'
+              : operation === 'migrate_cross_root' ? null : 'directory',
           )
         : null;
       if (normalizedSource && sourceManifest.kind === 'unsupported') {
@@ -860,14 +994,45 @@ export class Evolution {
         && (sourceManifest.kind !== 'directory' || sourceManifest.entries.length !== 1)) {
         throw new Error('Evolution remove_empty_directory source must be empty.');
       }
-      const inspection = operation === 'migrate_directory'
+      let inspection = (operation === 'migrate_directory'
+        || (operation === 'migrate_cross_root' && sourceManifest.kind === 'directory'))
         ? inspectMigratableDirectory(root, normalizedSource.absolute, sourceManifest)
         : null;
+      if (operation === 'migrate_cross_root') {
+        const external = inspectAncestorControlReferences(root, normalizedSource.absolute);
+        inspection = {
+          ...(inspection ?? {
+            classification: { type: sourceManifest.kind === 'file' ? 'file' : 'directory_workspace', evidence: [] },
+            control_files: [],
+            content_files_read: 0,
+            content_bytes_read: 0,
+            path_references: [],
+            generated_caches: [],
+            package_manager_environment: { pnpm_store_path: null, active_store_inside_source: null },
+            reparse_points: { total: 0, internal: 0, external: 0, items: [] },
+            blockers: [],
+            warnings: [],
+            recommendation: 'review_and_migrate',
+          }),
+          external_control_references: external,
+          blockers: [...new Set([...(inspection?.blockers ?? []), ...external.blockers])],
+          warnings: [...new Set([...(inspection?.warnings ?? []), ...external.warnings])],
+        };
+      }
+      const requiredBytes = operation === 'migrate_cross_root' ? manifestByteSize(sourceManifest) : null;
+      const freeBytes = operation === 'migrate_cross_root' ? availableBytes(path.dirname(normalizedTarget.absolute)) : null;
+      if (requiredBytes != null && freeBytes != null && BigInt(requiredBytes) > freeBytes) {
+        throw new Error('Cross-Root migration target does not have enough free space for the reviewed source.');
+      }
       const baseline = {
         source_manifest_hash: sourceManifest?.hash ?? null,
         source_kind: sourceManifest?.kind ?? null,
         source_entries: sourceManifest?.entries ?? [],
         target_state: operation === 'remove_empty_directory' ? 'not_applicable' : 'absent',
+        source_root_path: root,
+        target_root_path: targetRoot,
+        required_copy_bytes: requiredBytes,
+        available_target_bytes: freeBytes == null ? null : freeBytes.toString(),
         project: project ? {
           id: project.id,
           name: project.name,
@@ -880,8 +1045,16 @@ export class Evolution {
         : operation === 'remove_empty_directory'
           ? [{ path: normalizedSource.relative, change: 'remove_empty_directory' }]
           : [
-            { path: normalizedSource.relative, change: 'remove_original_path' },
-            { path: normalizedTarget.relative, change: 'create_moved_path' },
+            {
+              path: operation === 'migrate_cross_root'
+                ? `${root}::${normalizedSource.relative}` : normalizedSource.relative,
+              change: 'remove_original_path',
+            },
+            {
+              path: operation === 'migrate_cross_root'
+                ? `${targetRoot}::${normalizedTarget.relative}` : normalizedTarget.relative,
+              change: 'create_moved_path',
+            },
           ];
       const plan = {
         schema: 'atlas-evolution-plan.v1',
@@ -893,6 +1066,13 @@ export class Evolution {
             : `Move ${normalizedSource.relative} to ${normalizedTarget.relative}.`,
         source: normalizedSource?.relative ?? null,
         target: operation === 'remove_empty_directory' ? null : normalizedTarget.relative,
+        ...(operation === 'migrate_cross_root' ? {
+          source_root: root,
+          target_root: targetRoot,
+          transfer_method: 'copy_verify_remove',
+          required_copy_bytes: requiredBytes,
+          available_target_bytes: freeBytes == null ? null : freeBytes.toString(),
+        } : {}),
         project_id: projectId,
         source_manifest: sourceManifest ? publicManifest(sourceManifest) : null,
         ...(inspection ? {
@@ -909,7 +1089,11 @@ export class Evolution {
             : 'Move back only if source remains absent and target still matches the prepared manifest.',
       };
       const planHash = hashJson(plan);
-      const diffText = diffFor(operation, normalizedSource?.relative, normalizedTarget.relative);
+      const diffText = diffFor(
+        operation,
+        operation === 'migrate_cross_root' ? `${root}::${normalizedSource.relative}` : normalizedSource?.relative,
+        operation === 'migrate_cross_root' ? `${targetRoot}::${normalizedTarget.relative}` : normalizedTarget.relative,
+      );
       const diffHash = crypto.createHash('sha256').update(diffText).digest('hex');
       const runId = makeRunId();
       const startedAt = timestamp();
@@ -981,11 +1165,14 @@ export class Evolution {
     }
     const record = this.ledger.getEvolutionOperation(runId);
     const root = detail.run.root_path;
+    const sourceRoot = record.baseline.source_root_path ?? root;
+    const targetRoot = record.baseline.target_root_path ?? root;
     const sourcePath = record.source_path
-      ? path.resolve(root, ...record.source_path.split('/'))
+      ? path.resolve(sourceRoot, ...record.source_path.split('/'))
       : null;
-    const targetPath = path.resolve(root, ...record.target_path.split('/'));
-    const expectedKind = record.operation_type === 'move_file' ? 'file' : 'directory';
+    const targetPath = path.resolve(targetRoot, ...record.target_path.split('/'));
+    const expectedKind = record.operation_type === 'move_file' ? 'file'
+      : record.operation_type === 'migrate_cross_root' ? record.baseline.source_kind : 'directory';
     const sourceState = sourcePath
       ? manifestForOperation(sourcePath, record.operation_type, expectedKind)
       : null;
@@ -1004,6 +1191,9 @@ export class Evolution {
         ? sourceState.kind === 'absent'
         : sourceState.kind === 'absent'
           && sameManifest(targetState, expectedKind, record.baseline.source_manifest_hash);
+    const crossRootCopyReady = record.operation_type === 'migrate_cross_root'
+      && sameManifest(sourceState, expectedKind, record.baseline.source_manifest_hash)
+      && sameManifest(targetState, expectedKind, record.baseline.source_manifest_hash);
     if (record.operation_type === 'migrate_project') {
       const project = this.ledger.getProject(record.project_id);
       const allowedRegistryPaths = started && afterMatches
@@ -1013,7 +1203,7 @@ export class Evolution {
         throw stateConflict('Project Registry changed after prepare; filesystem migration cannot continue.');
       }
     }
-    if (!beforeMatches && !(started && afterMatches)) {
+    if (!beforeMatches && !(started && (afterMatches || crossRootCopyReady))) {
       this.ledger.markEvolutionStale(runId, {
         reason: targetState.kind !== 'absent' ? 'target_claimed_or_changed' : 'source_changed_after_prepare',
         source_observed_hash: sourceState?.hash ?? null,
@@ -1021,12 +1211,31 @@ export class Evolution {
       }, timestamp());
       throw stateConflict('Evolution source changed after prepare or target was claimed; approval is stale.');
     }
-    if (beforeMatches) {
-      this.ledger.startEvolutionExecution(runId, timestamp());
+    if (beforeMatches || (started && crossRootCopyReady)) {
+      if (!started) this.ledger.startEvolutionExecution(runId, timestamp());
       if (record.operation_type === 'create_directory') fs.mkdirSync(targetPath);
       else if (record.operation_type === 'remove_empty_directory') fs.rmdirSync(sourcePath);
       else if (record.operation_type === 'migrate_directory') {
         renameMigratableDirectory(sourcePath, targetPath, record.baseline.source_entries);
+      }
+      else if (record.operation_type === 'migrate_cross_root') {
+        if (!crossRootCopyReady) {
+          copyVerifiedToAbsentTarget({
+            source: sourcePath,
+            target: targetPath,
+            kind: expectedKind,
+            manifestHash: record.baseline.source_manifest_hash,
+            runId,
+            phase: 'execute',
+          });
+        }
+        const currentSource = manifestAt(sourcePath, expectedKind);
+        const currentTarget = manifestAt(targetPath, expectedKind);
+        if (!sameManifest(currentSource, expectedKind, record.baseline.source_manifest_hash)
+          || !sameManifest(currentTarget, expectedKind, record.baseline.source_manifest_hash)) {
+          throw stateConflict('Cross-Root migration changed during copy verification.');
+        }
+        removeRegularEntry(sourcePath, expectedKind);
       }
       else fs.renameSync(sourcePath, targetPath);
     }
@@ -1064,6 +1273,11 @@ export class Evolution {
         operation: record.operation_type,
         source: record.source_path,
         target: record.operation_type === 'remove_empty_directory' ? null : record.target_path,
+        ...(record.operation_type === 'migrate_cross_root' ? {
+          source_root: sourceRoot,
+          target_root: targetRoot,
+          transfer_method: 'copy_verify_remove',
+        } : {}),
         project_id: record.project_id,
         changed_paths: ['create_directory', 'remove_empty_directory'].includes(record.operation_type) ? 1 : 2,
         before_manifest_hash: record.baseline.source_manifest_hash,
@@ -1095,11 +1309,14 @@ export class Evolution {
     }
     const record = this.ledger.getEvolutionOperation(runId);
     const root = detail.run.root_path;
+    const sourceRoot = record.baseline.source_root_path ?? root;
+    const targetRoot = record.baseline.target_root_path ?? root;
     const sourcePath = record.source_path
-      ? path.resolve(root, ...record.source_path.split('/'))
+      ? path.resolve(sourceRoot, ...record.source_path.split('/'))
       : null;
-    const targetPath = path.resolve(root, ...record.target_path.split('/'));
-    const expectedKind = record.operation_type === 'move_file' ? 'file' : 'directory';
+    const targetPath = path.resolve(targetRoot, ...record.target_path.split('/'));
+    const expectedKind = record.operation_type === 'move_file' ? 'file'
+      : record.operation_type === 'migrate_cross_root' ? record.baseline.source_kind : 'directory';
     const sourceState = sourcePath
       ? manifestForOperation(sourcePath, record.operation_type, expectedKind)
       : null;
@@ -1118,6 +1335,9 @@ export class Evolution {
           && sourceState.entries.length === 1
         : sameManifest(sourceState, expectedKind, record.baseline.source_manifest_hash)
           && targetState.kind === 'absent';
+    const crossRootRestoreReady = record.operation_type === 'migrate_cross_root'
+      && sameManifest(sourceState, expectedKind, record.baseline.source_manifest_hash)
+      && sameManifest(targetState, expectedKind, record.baseline.source_manifest_hash);
     if (record.operation_type === 'migrate_project') {
       const project = this.ledger.getProject(record.project_id);
       const allowedRegistryPaths = started && baselineMatches
@@ -1127,7 +1347,7 @@ export class Evolution {
         throw stateConflict('Project Registry changed after execution; filesystem rollback cannot continue.');
       }
     }
-    if (!endMatches && !(started && baselineMatches)) {
+    if (!endMatches && !(started && (baselineMatches || crossRootRestoreReady))) {
       throw new RollbackConflictError([{
         path: record.operation_type === 'remove_empty_directory' ? record.source_path : record.target_path,
         expected_end_hash: record.execution_receipt.after_manifest_hash,
@@ -1135,14 +1355,38 @@ export class Evolution {
         current_kind: record.operation_type === 'remove_empty_directory' ? sourceState.kind : targetState.kind,
       }]);
     }
-    if (endMatches) {
-      this.ledger.recordEvent(runId, 'evolution_rollback_started', {
+    if (endMatches || (started && crossRootRestoreReady)) {
+      if (!started) this.ledger.recordEvent(runId, 'evolution_rollback_started', {
         source: record.source_path, target: record.target_path,
       });
       if (record.operation_type === 'create_directory') fs.rmdirSync(targetPath);
       else if (record.operation_type === 'remove_empty_directory') fs.mkdirSync(sourcePath);
       else if (record.operation_type === 'migrate_directory') {
         renameMigratableDirectory(targetPath, sourcePath, record.baseline.source_entries);
+      }
+      else if (record.operation_type === 'migrate_cross_root') {
+        if (!crossRootRestoreReady) {
+          copyVerifiedToAbsentTarget({
+            source: targetPath,
+            target: sourcePath,
+            kind: expectedKind,
+            manifestHash: record.baseline.source_manifest_hash,
+            runId,
+            phase: 'rollback',
+          });
+        }
+        const restoredSource = manifestAt(sourcePath, expectedKind);
+        const currentTarget = manifestAt(targetPath, expectedKind);
+        if (!sameManifest(restoredSource, expectedKind, record.baseline.source_manifest_hash)
+          || !sameManifest(currentTarget, expectedKind, record.baseline.source_manifest_hash)) {
+          throw new RollbackConflictError([{
+            path: record.target_path,
+            expected_end_hash: record.baseline.source_manifest_hash,
+            current_hash: currentTarget.hash,
+            current_kind: currentTarget.kind,
+          }]);
+        }
+        removeRegularEntry(targetPath, expectedKind);
       }
       else fs.renameSync(targetPath, sourcePath);
     }
@@ -1179,6 +1423,11 @@ export class Evolution {
       operation: record.operation_type,
       restored_source: record.source_path,
       removed_target: record.operation_type === 'remove_empty_directory' ? null : record.target_path,
+      ...(record.operation_type === 'migrate_cross_root' ? {
+        source_root: sourceRoot,
+        target_root: targetRoot,
+        transfer_method: 'copy_verify_remove',
+      } : {}),
       project_id: record.project_id,
       verified: true,
       rolled_back_at: rolledBackAt,

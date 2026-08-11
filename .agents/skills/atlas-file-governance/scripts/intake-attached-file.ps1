@@ -33,6 +33,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $script:AtlasCalls = 0
+$script:RequestPath = $null
 $utf8 = [Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = $utf8
 [Console]::OutputEncoding = $utf8
@@ -109,16 +110,7 @@ try {
   $script:NodeArgs = @($located.node_args)
   $script:CliPath = $located.cli_path
 
-  $version = Invoke-AtlasJson @('version', '--json') -TimeoutMilliseconds 15000
-  $capabilities = Invoke-AtlasJson @('capabilities', '--json') -TimeoutMilliseconds 15000
-  $doctor = Invoke-AtlasJson @('doctor', '--json') -TimeoutMilliseconds 15000
-  if ($doctor.data.status -ne 'ok') {
-    throw "Atlas Doctor did not return status ok: $($doctor.data.status)"
-  }
-  if ((-not ($capabilities.data.workflows.intake -contains 'prepare')) -or
-      (-not ($capabilities.data.workflows.intake -contains 'execute'))) {
-    throw 'Installed Atlas Runtime does not support the required Intake workflow.'
-  }
+  $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $InstallRoot 'atlas-install.json') | ConvertFrom-Json
 
   $projectCreated = $false
   if (-not $ProjectId) {
@@ -148,15 +140,30 @@ try {
     }
   }
 
-  $sourceHash = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant()
-  $prepareArgs = @(
-    'intake', 'prepare',
+  $requestDirectory = Join-Path $env:ATLAS_STATE_DIR 'tmp'
+  [IO.Directory]::CreateDirectory($requestDirectory) | Out-Null
+  $script:RequestPath = Join-Path $requestDirectory "$ClientRunId.json"
+  $request = [ordered]@{
+    items = @([ordered]@{
+      candidateFile = $candidate
+      origin = $Origin
+      kind = $(if ($Kind) { $Kind } else { $null })
+      projectId = $ProjectId
+      target = $Target
+      intent = $Intent
+    })
+  }
+  [IO.File]::WriteAllText(
+    $script:RequestPath,
+    ($request | ConvertTo-Json -Depth 6 -Compress),
+    $utf8
+  )
+
+  $batch = Invoke-AtlasJson @(
+    'intake', 'batch-execute',
     '--root', $rootPath,
-    '--candidate-file', $candidate,
-    '--origin', $Origin,
-    '--project', $ProjectId,
-    '--target', $Target,
-    '--intent', $Intent,
+    '--request-file', $script:RequestPath,
+    '--reason', $Reason,
     '--actor', 'agent',
     '--agent', $Agent,
     '--model', $Model,
@@ -164,40 +171,31 @@ try {
     '--client-run-id', $ClientRunId,
     '--json'
   )
-  if ($Kind) {
-    $prepareArgs = @(
-      $prepareArgs[0..7]
-      '--kind', $Kind
-      $prepareArgs[8..($prepareArgs.Count - 1)]
-    )
-  }
-  $prepared = Invoke-AtlasJson $prepareArgs
-  $plan = $prepared.data
+  $receipt = $batch.data
 
-  if ($plan.status -ne 'prepared' -or $plan.auto_execute -ne $true -or [double]$plan.confidence -lt 0.9) {
+  if ($receipt.status -ne 'executed' -or $receipt.summary.executed -ne 1) {
+    $item = @($receipt.items)[0]
     Write-CompactJson ([ordered]@{
       schema = 'atlas-skill-intake-file.v1'
       ok = $true
-      status = $plan.status
+      status = $receipt.status
       executed = $false
-      reason = $plan.reason
-      project = $plan.project
-      classification = $plan.classification
-      target = $plan.target
-      confidence = $plan.confidence
-      questions = $plan.questions
+      reason = $item.reason
+      project = $item.project
+      target = $item.target
+      questions = $receipt.questions
       atlas_calls = $script:AtlasCalls
+      runtime_processes = $receipt.runtime_processes
+      elapsed_ms = $receipt.elapsed_ms
       content_body_reads = 0
+      model_visible_body_bytes = 0
     })
     exit 0
   }
 
-  $executed = Invoke-AtlasJson @(
-    'intake', 'execute', $plan.run_id,
-    '--reason', $Reason,
-    '--json'
-  )
-  $targetRelative = $plan.target
+  $item = @($receipt.items)[0]
+  $sourceHash = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant()
+  $targetRelative = $item.target
   $targetPath = [IO.Path]::GetFullPath((Join-Path $rootPath $targetRelative))
   if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf)) {
     throw "Atlas reported execution but the target is absent: $targetPath"
@@ -214,21 +212,24 @@ try {
     executed = $true
     project = [ordered]@{
       id = $ProjectId
-      name = $plan.project.name
-      path = $plan.project.path
+      name = $item.project.name
+      path = $item.project.path
       created = $projectCreated
     }
-    classification = $plan.classification
-    run_id = $plan.run_id
+    classification = $item.classification
+    run_id = $item.run_id
     target = $targetRelative
     bytes = (Get-Item -LiteralPath $targetPath).Length
     sha256 = $targetHash
     hash_match = $true
-    verified = $executed.data.verified
-    rollback_ready = $executed.data.rollback_ready
-    atlas_version = $version.data.version
+    verified = $item.verified
+    rollback_ready = $item.rollback_ready
+    atlas_version = $manifest.atlas_version
     atlas_calls = $script:AtlasCalls
+    runtime_processes = $receipt.runtime_processes
+    elapsed_ms = $receipt.elapsed_ms
     content_body_reads = 0
+    model_visible_body_bytes = 0
     ppt_body_reads = 0
   })
 } catch {
@@ -239,6 +240,11 @@ try {
     error = $_.Exception.Message
     atlas_calls = $script:AtlasCalls
     content_body_reads = 0
+    model_visible_body_bytes = 0
   })
   exit 1
+} finally {
+  if ($script:RequestPath -and (Test-Path -LiteralPath $script:RequestPath -PathType Leaf)) {
+    Remove-Item -LiteralPath $script:RequestPath -Force
+  }
 }

@@ -43,6 +43,21 @@ function publicLink(row) {
   };
 }
 
+function publicIdentity(row) {
+  if (!row) return null;
+  return {
+    identity_id: row.id,
+    project_id: row.project_id,
+    signature_hash: row.signature_hash,
+    evidence: parseJson(row.evidence_json, {}),
+    stable_signals: parseJson(row.stable_signals_json, []),
+    status: row.status,
+    valid_from: row.valid_from,
+    valid_to: row.valid_to,
+    reason: row.reason,
+  };
+}
+
 export class ProjectContextRepository {
   constructor({ db, transaction }) {
     this.db = db;
@@ -138,6 +153,108 @@ export class ProjectContextRepository {
       WHERE pl.project_id = ?
       ORDER BY pl.valid_from, pl.rowid
     `).all(projectId);
+  }
+
+  getActiveIdentity(projectId) {
+    const row = this.db.prepare(`
+      SELECT * FROM project_identity_signatures
+      WHERE project_id = ? AND status = 'active'
+    `).get(projectId);
+    return publicIdentity(row);
+  }
+
+  identityHistory(projectId) {
+    return this.db.prepare(`
+      SELECT * FROM project_identity_signatures
+      WHERE project_id = ?
+      ORDER BY valid_from, rowid
+    `).all(projectId).map(publicIdentity);
+  }
+
+  recordIdentity({ projectId, signature, reason, recordedAt }) {
+    return this.transaction(() => {
+      const active = this.db.prepare(`
+        SELECT * FROM project_identity_signatures
+        WHERE project_id = ? AND status = 'active'
+      `).get(projectId);
+      if (active?.signature_hash === signature.signature_hash) return publicIdentity(active);
+      if (active) {
+        this.db.prepare(`
+          UPDATE project_identity_signatures
+          SET status = 'historical', valid_to = ?
+          WHERE id = ?
+        `).run(recordedAt, active.id);
+      }
+      const identityId = `PID-${crypto.randomUUID()}`;
+      this.db.prepare(`
+        INSERT INTO project_identity_signatures(
+          id, project_id, signature_hash, evidence_json, stable_signals_json,
+          status, valid_from, reason
+        ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+      `).run(
+        identityId,
+        projectId,
+        signature.signature_hash,
+        json(signature.evidence),
+        json(signature.stable_signals),
+        recordedAt,
+        reason,
+      );
+      return this.getActiveIdentity(projectId);
+    });
+  }
+
+  listActiveLocations() {
+    return this.db.prepare(`
+      SELECT pl.*, pr.current_path AS root_path, pr.root_type, pr.content_policy,
+             pr.governance_status, p.name AS project_name, p.status AS project_status
+      FROM project_locations pl
+      JOIN portfolio_roots pr ON pr.id = pl.root_id
+      JOIN projects p ON p.id = pl.project_id
+      WHERE pl.status = 'active'
+        AND pr.governance_status = 'adopted'
+        AND p.status = 'active'
+      ORDER BY length(pr.current_path || '/' || pl.relative_path) DESC, pl.valid_from, pl.id
+    `).all();
+  }
+
+  listActiveLocationsForRoot(rootId) {
+    return this.db.prepare(`
+      SELECT pl.*, p.name AS project_name, p.status AS project_status
+      FROM project_locations pl
+      JOIN projects p ON p.id = pl.project_id
+      WHERE pl.root_id = ?
+        AND pl.status = 'active'
+        AND p.status = 'active'
+      ORDER BY pl.valid_from, pl.id
+    `).all(rootId);
+  }
+
+  relocateRoot({ rootId, currentPath, reason, relocatedAt }) {
+    return this.transaction(() => {
+      const root = this.db.prepare('SELECT * FROM portfolio_roots WHERE id = ?').get(rootId);
+      if (!root) throw new Error(`Workspace Root not found: ${rootId}`);
+      const collision = this.db.prepare(`
+        SELECT id FROM portfolio_roots
+        WHERE current_path = ? COLLATE NOCASE AND id <> ?
+      `).get(currentPath, rootId);
+      if (collision) throw new Error(`Another Workspace Root already uses this path: ${collision.id}`);
+      this.db.prepare(`
+        UPDATE portfolio_root_path_history
+        SET valid_to = ?
+        WHERE root_id = ? AND valid_to IS NULL
+      `).run(relocatedAt, rootId);
+      this.db.prepare(`
+        UPDATE portfolio_roots
+        SET current_path = ?, updated_at = ?
+        WHERE id = ?
+      `).run(currentPath, relocatedAt, rootId);
+      this.db.prepare(`
+        INSERT INTO portfolio_root_path_history(root_id, path, valid_from, reason)
+        VALUES (?, ?, ?, ?)
+      `).run(rootId, currentPath, relocatedAt, reason);
+      return this.getRoot(rootId);
+    });
   }
 
   attachLocation({

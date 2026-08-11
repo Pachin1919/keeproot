@@ -115,6 +115,13 @@ test('CLI exposes the bounded Task Contract create and rollback flow', () => {
   assert.equal(fulfilled.write_run.mode, 'derived');
   const shown = cli(stateDir, ['task', 'show', prepared.task_id, '--json']);
   assert.equal(JSON.parse(shown.stdout).data.run.status, 'completed');
+  const compactShown = cli(stateDir, ['show', fulfilled.write_run.run_id, '--compact', '--json']);
+  assert.equal(compactShown.status, 0, compactShown.stderr);
+  const compactRun = JSON.parse(compactShown.stdout).data;
+  assert.equal(compactRun.compact, true);
+  assert.equal(compactRun.changes.length, 1);
+  assert.equal(Object.hasOwn(compactRun, 'events'), false);
+  assert.equal(Object.hasOwn(compactRun.change_set, 'diff_text'), false);
   assert.equal(cli(stateDir, ['task', 'rollback', prepared.task_id, '--json']).status, 0);
   assert.equal(fs.existsSync(path.join(vault, 'Projects', 'Atlas', 'Outputs', 'report.md')), false);
 
@@ -173,6 +180,51 @@ test('CLI Intake creates one Agent-proposed target without a Library Contract', 
   const rolledBack = cli(stateDir, ['intake', 'rollback', prepared.run_id, '--json']);
   assert.equal(rolledBack.status, 0, rolledBack.stderr);
   assert.equal(fs.existsSync(path.join(vault, target)), false);
+});
+
+test('CLI Intake imports multiple authorized attachments in one Runtime process', () => {
+  const { caseRoot, vault, stateDir } = setup('cli-intake-attachment-batch');
+  fs.mkdirSync(path.join(vault, 'Reports'), { recursive: true });
+  const registry = new Registry({ stateDir });
+  const project = registry.create({ name: 'JMC', currentPath: 'Reports' });
+  registry.dispose();
+  const items = ['April', 'May', 'June'].map((month) => {
+    const candidateFile = path.join(caseRoot, `${month}.pdf`);
+    fs.writeFileSync(candidateFile, `${month} report fixture\n`, 'utf8');
+    return {
+      candidateFile,
+      origin: 'human_submitted',
+      kind: 'report',
+      projectId: project.project_id,
+      target: `Reports/${month}.pdf`,
+      intent: `Import ${month} report.`,
+    };
+  });
+  const requestFile = path.join(caseRoot, 'batch.json');
+  fs.writeFileSync(requestFile, JSON.stringify({ items }), 'utf8');
+
+  const result = cli(stateDir, [
+    'intake', 'batch-execute', '--root', vault, '--request-file', requestFile,
+    '--reason', 'The user submitted these three reports for the exact targets.',
+    '--actor', 'agent', '--agent', 'Codex', '--model', 'test', '--tool', 'codex',
+    '--client-run-id', 'attachment-batch-test', '--json',
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+  const receipt = JSON.parse(result.stdout).data;
+  assert.equal(receipt.status, 'executed');
+  assert.equal(receipt.summary.total, 3);
+  assert.equal(receipt.summary.executed, 3);
+  assert.equal(receipt.runtime_processes, 1);
+  assert.equal(receipt.local_input_bytes, items.reduce(
+    (total, item) => total + fs.statSync(item.candidateFile).size,
+    0,
+  ));
+  assert.equal(receipt.content_body_reads, 0);
+  assert.equal(receipt.model_visible_body_bytes, 0);
+  assert.equal(receipt.items.every((item) => item.verified && item.rollback_ready), true);
+  for (const item of items) {
+    assert.equal(fs.existsSync(path.join(vault, item.target)), true);
+  }
 });
 
 test('CLI exposes Risk, Project Registry, and the complete single-file Guarded flow', () => {

@@ -12,17 +12,14 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-PROCESSOR_VERSION = "0.2.0"
+from .common import CharacterBudget, validate_office_package, xml_root, zip_entry_names
+from .document_readers import read_docx, read_pdf, read_pptx
+
+PROCESSOR_VERSION = "0.3.0"
 SCHEMA = "atlas.content-inspection.v1"
 OFFICE_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 OFFICE_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PACKAGE_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
-WORD_MAIN = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-DRAWING_MAIN = "http://schemas.openxmlformats.org/drawingml/2006/main"
-PRESENTATION_MAIN = "http://schemas.openxmlformats.org/presentationml/2006/main"
-MAX_ZIP_ENTRIES = 10_000
-MAX_ZIP_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
-MAX_XML_MEMBER_BYTES = 32 * 1024 * 1024
 MAX_PROFILE_ROWS = 10_000
 MAX_PROFILE_COLUMNS = 80
 HEADER_HINT = re.compile(
@@ -38,51 +35,12 @@ SENSITIVE_HEADER_RULES = (
 )
 
 
-class CharacterBudget:
-    def __init__(self, limit: int) -> None:
-        if limit < 500 or limit > 20_000:
-            raise ValueError("max_characters must be between 500 and 20000")
-        self.limit = limit
-        self.used = 0
-        self.truncated = False
-
-    def take(self, value: object, per_value: int = 500) -> str:
-        text = "" if value is None else str(value)
-        remaining = max(0, self.limit - self.used)
-        allowed = min(per_value, remaining)
-        if len(text) > allowed:
-            self.truncated = True
-        result = text[:allowed]
-        self.used += len(result)
-        return result
-
-
 def sha256_file(file_path: Path) -> str:
     digest = hashlib.sha256()
     with file_path.open("rb") as stream:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def xml_root(archive: zipfile.ZipFile, name: str) -> ET.Element:
-    detail = archive.getinfo(name)
-    if detail.file_size > MAX_XML_MEMBER_BYTES:
-        raise ValueError(f"Office XML member exceeds the local extraction limit: {name}")
-    with archive.open(name) as stream:
-        return ET.parse(stream).getroot()
-
-
-def zip_entry_names(archive: zipfile.ZipFile) -> set[str]:
-    return {item.filename for item in archive.infolist()}
-
-
-def validate_office_package(archive: zipfile.ZipFile) -> None:
-    entries = archive.infolist()
-    if len(entries) > MAX_ZIP_ENTRIES:
-        raise ValueError("Office package contains too many entries for bounded local extraction")
-    if sum(item.file_size for item in entries) > MAX_ZIP_UNCOMPRESSED_BYTES:
-        raise ValueError("Office package exceeds the bounded uncompressed-size limit")
 
 
 def read_text_file(file_path: Path, budget: CharacterBudget) -> dict:
@@ -343,6 +301,7 @@ def profile_rows(
     truncated: bool,
     *,
     merged_ranges: list[str] | None = None,
+    formula_count: int = 0,
 ) -> dict:
     try:
         import pandas as pd
@@ -428,6 +387,7 @@ def profile_rows(
         "row_count": len(frame),
         "column_count": len(headers),
         "duplicate_row_count": duplicate_count,
+        "formula_count": formula_count,
         "columns": columns,
         "sensitive_columns": sensitive_columns,
         "raw_values_returned": False,
@@ -469,6 +429,9 @@ def read_xlsx(
         sheets = []
         all_sheets = workbook.findall(f".//{{{OFFICE_MAIN}}}sheet")
         available_names = [sheet.attrib.get("name", "") for sheet in all_sheets]
+        hidden_sheet_count = sum(
+            sheet.attrib.get("state", "visible") != "visible" for sheet in all_sheets
+        )
         if selected_sheet and selected_sheet not in available_names:
             raise ValueError(
                 f"Worksheet does not exist: {selected_sheet}; available sheets: {available_names}"
@@ -496,6 +459,7 @@ def read_xlsx(
                 continue
             root = xml_root(archive, member)
             rows, rows_truncated = worksheet_rows_with_strings(root, strings)
+            formula_count = len(root.findall(f".//{{{OFFICE_MAIN}}}f"))
             merged = [
                 item.attrib.get("ref", "")
                 for item in root.findall(f".//{{{OFFICE_MAIN}}}mergeCell")
@@ -508,6 +472,7 @@ def read_xlsx(
                         sheet_name,
                         rows_truncated or strings_truncated,
                         merged_ranges=merged,
+                        formula_count=formula_count,
                     )
                 continue
             dimension = root.find(f"{{{OFFICE_MAIN}}}dimension")
@@ -533,21 +498,25 @@ def read_xlsx(
                 sheets.append({
                     "name": budget.take(sheet_name, 200),
                     "status": "read",
+                    "visibility": sheet.attrib.get("state", "visible"),
                     "used_range": dimension.attrib.get("ref") if dimension is not None else None,
                     "header_rows": header_rows,
                     "merged_range_count": len(merged),
                     "merged_ranges": merged[:8],
                     "merged_ranges_truncated": len(merged) > 8,
+                    "formula_count": formula_count,
                     "sensitive_header_candidates": sensitive_headers,
                 })
             else:
                 sheets.append({
                     "name": budget.take(sheet_name, 200),
                     "status": "read",
+                    "visibility": sheet.attrib.get("state", "visible"),
                     "used_range": dimension.attrib.get("ref") if dimension is not None else None,
                     "header_row": header_row_number or None,
                     "headers": [budget.take(value, 120) for value in header.values()],
                     "merged_range_count": len(merged),
+                    "formula_count": formula_count,
                     "sensitive_header_candidates": sensitive_headers,
                 })
         return {
@@ -556,90 +525,14 @@ def read_xlsx(
             if len(all_sheets) > len(sheets) or budget.truncated or strings_truncated
             else "complete",
             "sheet_count": len(all_sheets),
+            "hidden_sheet_count": hidden_sheet_count,
             "mode": "sheet_detail" if selected_sheet else "workbook_overview",
             "selected_sheet": selected_sheet,
             "sheets": sheets,
         }
 
 
-def numeric_member_sort(name: str) -> tuple[int, str]:
-    match = re.search(r"(\d+)\.xml$", name)
-    return (int(match.group(1)) if match else 0, name)
-
-
-def read_pptx(file_path: Path, budget: CharacterBudget) -> dict:
-    with zipfile.ZipFile(file_path) as archive:
-        validate_office_package(archive)
-        names = zip_entry_names(archive)
-        slide_members = sorted(
-            (
-                name for name in names
-                if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
-            ),
-            key=numeric_member_sort,
-        )
-        slides = []
-        for index, member in enumerate(slide_members[:100], start=1):
-            root = xml_root(archive, member)
-            text = "\n".join(
-                node.text or "" for node in root.iter(f"{{{DRAWING_MAIN}}}t") if node.text
-            )
-            note_member = f"ppt/notesSlides/notesSlide{index}.xml"
-            notes = ""
-            if note_member in names:
-                note_root = xml_root(archive, note_member)
-                notes = "\n".join(
-                    node.text or ""
-                    for node in note_root.iter(f"{{{DRAWING_MAIN}}}t")
-                    if node.text
-                )
-            slides.append({
-                "slide": index,
-                "text": budget.take(text, 1200),
-                "notes": budget.take(notes, 800),
-                "shape_count": len(root.findall(f".//{{{PRESENTATION_MAIN}}}sp")),
-                "image_count": len(root.findall(f".//{{{PRESENTATION_MAIN}}}pic")),
-                "table_count": len(root.findall(f".//{{{DRAWING_MAIN}}}tbl")),
-            })
-            if budget.used >= budget.limit:
-                break
-        return {
-            "kind": "pptx",
-            "status": "partial" if len(slide_members) > len(slides) or budget.truncated else "complete",
-            "slide_count": len(slide_members),
-            "slides": slides,
-        }
-
-
-def read_docx(file_path: Path, budget: CharacterBudget) -> dict:
-    with zipfile.ZipFile(file_path) as archive:
-        validate_office_package(archive)
-        names = zip_entry_names(archive)
-        if "word/document.xml" not in names:
-            raise ValueError("DOCX package is missing word/document.xml")
-        root = xml_root(archive, "word/document.xml")
-        paragraphs = []
-        all_paragraphs = root.findall(f".//{{{WORD_MAIN}}}p")
-        stopped_early = False
-        for paragraph in all_paragraphs:
-            value = "".join(
-                node.text or "" for node in paragraph.iter(f"{{{WORD_MAIN}}}t")
-            ).strip()
-            if value:
-                paragraphs.append(budget.take(value, 1000))
-            if budget.used >= budget.limit:
-                stopped_early = True
-                break
-        return {
-            "kind": "docx",
-            "status": "partial" if stopped_early or budget.truncated else "complete",
-            "paragraph_count": len(all_paragraphs),
-            "table_count": len(root.findall(f".//{{{WORD_MAIN}}}tbl")),
-            "paragraphs": paragraphs,
-        }
-
-
-def next_action(extension: str, purpose: str, extraction_status: str) -> dict:
+def next_action(extension: str, purpose: str, extraction: dict) -> dict:
     if purpose == "visual":
         return {
             "mode": "bounded_visual_preview",
@@ -650,7 +543,13 @@ def next_action(extension: str, purpose: str, extraction_status: str) -> dict:
                 "selection": "representative_pages_or_slides",
             },
         }
-    if extraction_status in {"complete", "partial"}:
+    if extension == ".pdf" and extraction.get("image_only_pages"):
+        return {
+            "mode": "use_local_extraction_with_gaps",
+            "reason": "Use the local PDF text layer. Image-only page numbers are reported separately; request a user export or bounded OCR/preview only if those pages are necessary.",
+            "unreadable_page_count": len(extraction["image_only_pages"]),
+        }
+    if extraction["status"] in {"complete", "partial"}:
         if purpose == "data":
             return {
                 "mode": "use_local_data_profile",
@@ -696,6 +595,8 @@ def inspect_file(
         extraction = read_pptx(file_path, budget)
     elif extension == ".docx":
         extraction = read_docx(file_path, budget)
+    elif extension == ".pdf":
+        extraction = read_pdf(file_path, budget)
     elif extension in {
         ".txt", ".md", ".markdown", ".json", ".jsonl", ".xml",
         ".yaml", ".yml", ".html", ".htm", ".css", ".js", ".ts",
@@ -740,5 +641,5 @@ def inspect_file(
             "truncated": budget.truncated or extraction["status"] == "partial",
             "screenshots_used": 0,
         },
-        "next_action": next_action(extension, purpose, extraction["status"]),
+        "next_action": next_action(extension, purpose, extraction),
     }

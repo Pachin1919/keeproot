@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { RuntimeStorage } from './runtime-storage.js';
+import { fetchPublicDocument } from './public-web-capture.js';
 
 const CAPTURE_SCHEMA = 'atlas-browser-capture.v1';
 const MAX_CAPTURE_BYTES = 32 * 1024 * 1024;
@@ -26,6 +27,82 @@ function yamlString(value) {
 function safeTitle(value) {
   const title = normalizeText(value).split('\n')[0].trim();
   return title || '浏览器页面记录';
+}
+
+function timestampValue(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const milliseconds = value > 10_000_000_000 ? value : value * 1000;
+    const parsed = new Date(milliseconds);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  }
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const parsed = new Date(value.trim());
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+function chatRecords(capture) {
+  if (!Array.isArray(capture.messages) || capture.messages.length === 0) return null;
+  const sourceUrl = String(capture.source_url ?? capture.url ?? '').trim();
+  const conversationId = String(capture.conversation_id ?? '').trim()
+    || (() => {
+      try {
+        const last = new URL(sourceUrl).pathname.split('/').filter(Boolean).at(-1);
+        if (last) return last;
+      } catch {
+        // Fall back to a deterministic local identifier.
+      }
+      return `conversation-${crypto.createHash('sha256').update(`${sourceUrl}|${safeTitle(capture.title)}`).digest('hex').slice(0, 20)}`;
+    })();
+  const records = [];
+  const roles = {};
+  let generatedIds = 0;
+  for (const [index, item] of capture.messages.entries()) {
+    const role = String(item?.role ?? '').trim().toLowerCase();
+    const content = normalizeText(item?.content);
+    if (!role || !content) continue;
+    const timestamp = timestampValue(item?.timestamp ?? item?.created_at ?? item?.time);
+    let messageId = String(item?.message_id ?? item?.id ?? '').trim();
+    if (!messageId) {
+      messageId = `message-${crypto.createHash('sha256')
+        .update(`${conversationId}|${index}|${role}|${timestamp ?? ''}|${content}`)
+        .digest('hex').slice(0, 24)}`;
+      generatedIds += 1;
+    }
+    roles[role] = (roles[role] ?? 0) + 1;
+    records.push({
+      schema: 'atlas.chat-message.v1',
+      conversation_id: conversationId,
+      message_id: messageId,
+      parent_message_id: String(item?.parent_message_id ?? '').trim() || null,
+      ordinal: index,
+      timestamp,
+      role,
+      content,
+      source: capture.capture_mode ?? 'chat_capture',
+      source_url: sourceUrl || null,
+    });
+  }
+  if (!records.length) return null;
+  const timestamps = records.map((record) => record.timestamp).filter(Boolean).sort();
+  return {
+    records,
+    jsonl: `${records.map((record) => JSON.stringify(record)).join('\n')}\n`,
+    conversationId,
+    roles,
+    generatedIds,
+    coverage: timestamps.length ? {
+      status: timestamps.length === records.length ? 'complete' : 'partial',
+      basis: 'message_timestamps',
+      start: timestamps[0],
+      end: timestamps.at(-1),
+      timestamped_messages: timestamps.length,
+      message_count: records.length,
+    } : {
+      status: 'unavailable',
+      reason: 'no_parseable_message_timestamps',
+      message_count: records.length,
+    },
+  };
 }
 
 function parseCaptureFile(inputFile) {
@@ -102,15 +179,18 @@ function formatCapture(capture) {
     captureMode: capture.capture_mode ?? 'selected_text',
     messageCount: chat?.count ?? null,
     roleCounts: chat?.counts ?? null,
+    normalizedChat: chatRecords(capture),
   };
 }
 
 export class BrowserCapture {
-  constructor({ stateDir, storage = null }) {
+  constructor({ stateDir, storage = null, fetchImpl = globalThis.fetch, lookupHost = undefined }) {
     if (!stateDir) throw new Error('BrowserCapture requires a stateDir.');
     this.stateDir = path.resolve(stateDir);
     this.storage = storage ?? new RuntimeStorage({ stateDir: this.stateDir });
     this._ownsStorage = storage == null;
+    this.fetchImpl = fetchImpl;
+    this.lookupHost = lookupHost;
   }
 
   localize({ inputFile, ttlHours = 168 }) {
@@ -119,9 +199,17 @@ export class BrowserCapture {
     const tempDir = path.join(this.stateDir, 'tmp');
     fs.mkdirSync(tempDir, { recursive: true });
     const temporary = path.join(tempDir, `${crypto.randomUUID()}.browser-localized.md`);
+    const normalizedTemporary = formatted.normalizedChat
+      ? path.join(tempDir, `${crypto.randomUUID()}.chat-normalized.jsonl`)
+      : null;
     try {
       fs.writeFileSync(temporary, formatted.markdown, { encoding: 'utf8', flag: 'wx' });
       const staged = this.storage.stage({ source: temporary, kind: 'candidate', ttlHours });
+      let normalized = null;
+      if (normalizedTemporary) {
+        fs.writeFileSync(normalizedTemporary, formatted.normalizedChat.jsonl, { encoding: 'utf8', flag: 'wx' });
+        normalized = this.storage.stage({ source: normalizedTemporary, kind: 'intermediate', ttlHours });
+      }
       return {
         status: 'localized',
         source_type: formatted.messageCount == null ? 'browser_text' : 'chat_transcript',
@@ -135,10 +223,49 @@ export class BrowserCapture {
         content_hash: staged.content_hash,
         message_count: formatted.messageCount,
         role_counts: formatted.roleCounts,
+        conversation_id: formatted.normalizedChat?.conversationId ?? null,
+        message_id_generated_count: formatted.normalizedChat?.generatedIds ?? null,
+        coverage: formatted.normalizedChat?.coverage ?? null,
         work_id: staged.work_id,
         candidate_path: staged.payload_path,
+        normalized_work_id: normalized?.work_id ?? null,
+        normalized_path: normalized?.payload_path ?? null,
+        normalized_hash: normalized?.content_hash ?? null,
+        normalized_bytes: normalized?.byte_size ?? null,
+        model_visible_body_bytes: 0,
         next: 'Read only bounded samples, then pass candidate_path to atlas intake prepare.',
         source_file: absolute,
+      };
+    } finally {
+      fs.rmSync(temporary, { force: true });
+      if (normalizedTemporary) fs.rmSync(normalizedTemporary, { force: true });
+    }
+  }
+
+  async fetchPublic({ url, ttlHours = 168 }) {
+    const fetched = await fetchPublicDocument(url, {
+      fetchImpl: this.fetchImpl,
+      ...(this.lookupHost ? { lookupHost: this.lookupHost } : {}),
+    });
+    const tempDir = path.join(this.stateDir, 'tmp');
+    fs.mkdirSync(tempDir, { recursive: true });
+    const temporary = path.join(tempDir, `${crypto.randomUUID()}.public-web-capture.json`);
+    try {
+      fs.writeFileSync(temporary, JSON.stringify(fetched.capture), { encoding: 'utf8', flag: 'wx' });
+      const localized = this.localize({ inputFile: temporary, ttlHours });
+      return {
+        ...localized,
+        source_file: null,
+        requested_url: fetched.requested_url,
+        final_url: fetched.final_url,
+        redirect_count: fetched.redirect_count,
+        http_status: fetched.http_status,
+        content_type: fetched.content_type,
+        downloaded_bytes: fetched.downloaded_bytes,
+        resolver_mode: fetched.resolver_mode,
+        network_used: true,
+        browser_used: false,
+        external_application_used: false,
       };
     } finally {
       fs.rmSync(temporary, { force: true });

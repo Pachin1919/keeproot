@@ -48,11 +48,17 @@ function compareVersions(left, right) {
   return a.prerelease.localeCompare(b.prerelease, 'en');
 }
 
+function isGeneratedPythonCache(entry) {
+  return entry.name === '__pycache__'
+    || (entry.isFile() && ['.pyc', '.pyo'].includes(path.extname(entry.name).toLowerCase()));
+}
+
 function directoryHash(root) {
   const hash = crypto.createHash('sha256');
   const visit = (directory) => {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })
       .sort((left, right) => left.name.localeCompare(right.name, 'en'))) {
+      if (isGeneratedPythonCache(entry)) continue;
       const absolutePath = path.join(directory, entry.name);
       if (entry.isSymbolicLink()) {
         throw new Error(`Atlas installation bundle cannot contain a symbolic link: ${absolutePath}`);
@@ -111,7 +117,14 @@ function copyRuntime(sourceRoot, target) {
   for (const relative of ['bin', 'src', 'schemas', 'python/src', 'python/pyproject.toml', 'package.json']) {
     const source = path.join(sourceRoot, relative);
     if (!fs.existsSync(source)) throw new Error(`Runtime source is incomplete: ${source}`);
-    fs.cpSync(source, path.join(target, relative), { recursive: true, force: true });
+    fs.cpSync(source, path.join(target, relative), {
+      recursive: true,
+      force: true,
+      filter: (candidate) => {
+        const name = path.basename(candidate);
+        return name !== '__pycache__' && !['.pyc', '.pyo'].includes(path.extname(name).toLowerCase());
+      },
+    });
   }
 }
 

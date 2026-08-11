@@ -1,9 +1,11 @@
 [CmdletBinding()]
 param(
-  [ValidateSet('install', 'locate', 'upgrade', 'uninstall')]
+  [ValidateSet('install', 'locate', 'upgrade', 'uninstall', 'hook-install', 'hook-status', 'hook-remove')]
   [string]$Command = 'install',
   [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Atlas'),
   [string]$SkillRoot = (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex\skills\atlas-file-governance'),
+  [string]$CodexHome = (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex'),
+  [string]$ProjectRoot,
   [string]$NodePath = 'node.exe',
   [string[]]$LibraryRoot = @()
 )
@@ -28,7 +30,10 @@ try {
   exit 1
 }
 
-$arguments = @($manager, $Command, '--install-root', $InstallRoot, '--skill-root', $SkillRoot, '--node', $nodeExecutable)
+$arguments = @($manager, $Command, '--install-root', $InstallRoot, '--skill-root', $SkillRoot, '--node', $nodeExecutable, '--codex-home', $CodexHome)
+if ($ProjectRoot) {
+  $arguments += @('--project-root', $ProjectRoot)
+}
 foreach ($root in $LibraryRoot) {
   $arguments += @('--library-root', $root)
 }

@@ -71,6 +71,14 @@ export class CatalogRepository {
     `).get(rootId, relativePath) ?? null;
   }
 
+  findActiveEntriesByHash(projectId, contentHash) {
+    return this.db.prepare(`
+      SELECT * FROM catalog_entries
+      WHERE project_id = ? AND content_hash = ? AND status = 'active'
+      ORDER BY relative_path COLLATE NOCASE
+    `).all(projectId, contentHash).map(publicEntry);
+  }
+
   touchEntry(entryId, { generationId, seenAt }) {
     this.db.prepare(`
       UPDATE catalog_entries

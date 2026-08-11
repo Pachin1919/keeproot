@@ -578,6 +578,77 @@ export class Intake {
     };
   }
 
+  batchExecute({ root, items, reason, caller = {} }) {
+    if (!reason?.trim()) throw new Error('Intake batch execution requires the user task authorization reason.');
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error('Intake batch execution requires at least one item.');
+    }
+    if (items.length > 100) throw new Error('Intake batch execution supports at most 100 items.');
+
+    const plan = this.batchPlan({ root, items });
+    const localInputBytes = plan.items.reduce(
+      (total, item) => total + Number(item.candidate?.byte_size ?? 0),
+      0,
+    );
+    if (plan.status !== 'ready' || plan.summary.ready !== items.length) {
+      return {
+        schema: 'atlas-intake-batch-execution.v1',
+        status: 'needs_input',
+        summary: plan.summary,
+        items: plan.items.map((item) => ({
+          index: item.index,
+          status: item.status,
+          reason: item.reason,
+          target: item.target,
+          project: item.project,
+          questions: item.questions,
+        })),
+        questions: plan.questions,
+        runtime_processes: 1,
+        local_input_bytes: localInputBytes,
+        content_body_reads: 0,
+        model_visible_body_bytes: 0,
+        source_changes: [],
+      };
+    }
+
+    const prepared = items.map((item, index) => {
+      const result = this.prepare({ root, ...item, caller });
+      if (!result.run_id || result.status !== 'prepared' || !result.auto_execute) {
+        throw new Error(`Intake batch item ${index} did not produce an executable prepared run.`);
+      }
+      return result;
+    });
+    const receipts = prepared.map((item, index) => {
+      const receipt = this.execute(item.run_id, { reason: reason.trim() });
+      return {
+        index,
+        run_id: item.run_id,
+        project: item.project,
+        classification: item.classification,
+        target: item.target,
+        verified: receipt.verified === true,
+        rollback_ready: receipt.rollback_ready === true,
+        content_hash: receipt.content_hash ?? receipt.output_hash ?? null,
+      };
+    });
+    return {
+      schema: 'atlas-intake-batch-execution.v1',
+      status: 'executed',
+      summary: {
+        total: receipts.length,
+        executed: receipts.filter((item) => item.verified).length,
+        unresolved: 0,
+      },
+      items: receipts,
+      runtime_processes: 1,
+      local_input_bytes: localInputBytes,
+      content_body_reads: 0,
+      model_visible_body_bytes: 0,
+      source_changes: receipts.map((item) => item.target),
+    };
+  }
+
   execute(runId, { reason = null } = {}) {
     if (!reason?.trim()) throw new Error('Intake execution requires the user task authorization reason.');
     const detail = this.show(runId);

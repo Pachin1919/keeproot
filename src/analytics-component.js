@@ -4,9 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export const ANALYTICS_COMPONENT_FORMAT = 'atlas-analytics-component.v1';
-export const ANALYTICS_COMPONENT_VERSION = '0.3.0';
+export const ANALYTICS_COMPONENT_VERSION = '0.6.0';
 export const MINIMUM_PYTHON = Object.freeze({ major: 3, minor: 11 });
-export const ANALYTICS_REQUIREMENTS = Object.freeze(['pandas==3.0.1']);
+export const ANALYTICS_REQUIREMENTS = Object.freeze(['pandas==3.0.1', 'pypdf==6.14.2']);
 
 function componentPaths(installationRootInput) {
   const installationRoot = path.resolve(installationRootInput);
@@ -83,10 +83,10 @@ function verifyModule(executable, options) {
     : { status: 'ready' };
 }
 
-function probePandas(executable, options) {
+function probeDependencies(executable, options) {
   const result = runPython(executable, [
     '-c',
-    'import json, pandas; print(json.dumps({"pandas": pandas.__version__}))',
+    'import json, pandas, pypdf; print(json.dumps({"pandas": pandas.__version__, "pypdf": pypdf.__version__}))',
   ], {
     ...options,
     timeout: 15_000,
@@ -99,9 +99,9 @@ function probePandas(executable, options) {
   }
   try {
     const payload = JSON.parse(result.stdout.trim());
-    return { status: 'ready', pandas_version: payload.pandas };
+    return { status: 'ready', dependencies: { pandas: payload.pandas, pypdf: payload.pypdf } };
   } catch (error) {
-    return { status: 'unavailable', message: `Pandas version probe failed: ${error.message}` };
+    return { status: 'unavailable', message: `Python dependency probe failed: ${error.message}` };
   }
 }
 
@@ -132,8 +132,8 @@ export function doctorAnalyticsComponent({
       if (probe.status !== 'ready') return { ...probe, mode: 'managed' };
       const module = verifyModule(locations.pythonPath, { runtimeRoot, runProcess });
       if (module.status !== 'ready') return { ...module, mode: 'managed', python_path: locations.pythonPath };
-      const pandas = probePandas(locations.pythonPath, { runtimeRoot, runProcess });
-      if (pandas.status !== 'ready') return { ...pandas, mode: 'managed', python_path: locations.pythonPath };
+      const dependencies = probeDependencies(locations.pythonPath, { runtimeRoot, runProcess });
+      if (dependencies.status !== 'ready') return { ...dependencies, mode: 'managed', python_path: locations.pythonPath };
       return {
         status: 'ready',
         mode: 'managed',
@@ -141,7 +141,7 @@ export function doctorAnalyticsComponent({
         component_version: manifest.component_version,
         python_path: locations.pythonPath,
         python_version: probe.python_version,
-        dependencies: { pandas: pandas.pandas_version },
+        dependencies: dependencies.dependencies,
         installation_network_access: true,
         runtime_network_access: false,
         ledger_access: false,
@@ -157,9 +157,9 @@ export function doctorAnalyticsComponent({
     if (probe.status === 'ready') {
       const module = verifyModule(probe.python_path, { runtimeRoot, runProcess });
       if (module.status === 'ready') {
-        const pandas = probePandas(probe.python_path, { runtimeRoot, runProcess });
-        if (pandas.status !== 'ready') {
-          return { ...pandas, mode: 'external_override', python_path: probe.python_path };
+        const dependencies = probeDependencies(probe.python_path, { runtimeRoot, runProcess });
+        if (dependencies.status !== 'ready') {
+          return { ...dependencies, mode: 'external_override', python_path: probe.python_path };
         }
         return {
           status: 'ready',
@@ -168,7 +168,7 @@ export function doctorAnalyticsComponent({
           component_version: ANALYTICS_COMPONENT_VERSION,
           python_path: probe.python_path,
           python_version: probe.python_version,
-          dependencies: { pandas: pandas.pandas_version },
+          dependencies: dependencies.dependencies,
           installation_network_access: false,
           runtime_network_access: false,
           ledger_access: false,
@@ -276,8 +276,8 @@ export function installAnalyticsComponent({
     }
     const module = verifyModule(stagedPython, { runtimeRoot, runProcess });
     if (module.status !== 'ready') throw new Error(`Atlas analytics module validation failed: ${module.message}`);
-    const pandas = probePandas(stagedPython, { runtimeRoot, runProcess });
-    if (pandas.status !== 'ready') throw new Error(`Pandas validation failed: ${pandas.message}`);
+    const dependencies = probeDependencies(stagedPython, { runtimeRoot, runProcess });
+    if (dependencies.status !== 'ready') throw new Error(`Python dependency validation failed: ${dependencies.message}`);
 
     fs.renameSync(stageVenv, locations.venvRoot);
     installedVenv = true;
@@ -287,7 +287,7 @@ export function installAnalyticsComponent({
       python_version: stagedProbe.python_version,
       source_python: sourceProbe.python_path,
       installed_at: new Date().toISOString(),
-      dependencies: { pandas: pandas.pandas_version },
+      dependencies: dependencies.dependencies,
       installation_network_access: true,
       runtime_network_access: false,
       ledger_access: false,
@@ -302,7 +302,7 @@ export function installAnalyticsComponent({
       component_version: ANALYTICS_COMPONENT_VERSION,
       python_path: locations.pythonPath,
       python_version: stagedProbe.python_version,
-      dependencies: { pandas: pandas.pandas_version },
+      dependencies: dependencies.dependencies,
       installation_network_access: true,
       runtime_network_access: false,
     };

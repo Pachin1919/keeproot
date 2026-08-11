@@ -17,12 +17,12 @@ function setup(name) {
   return { stateDir, vaultRoot, websiteRoot };
 }
 
-test('schema v19 keeps governed roots, Project locations, and versioned context links outside ledger.js', (t) => {
+test('schema v20 keeps Project context and identity tables outside ledger.js', (t) => {
   const { stateDir } = setup('project-context-schema');
   const registry = new Registry({ stateDir });
   t.after(() => registry.dispose());
 
-  assert.equal(registry.ledger.db.prepare('PRAGMA user_version').get().user_version, 19);
+  assert.equal(registry.ledger.db.prepare('PRAGMA user_version').get().user_version, 20);
   const tables = new Set(
     registry.ledger.db.prepare(`
       SELECT name FROM sqlite_master WHERE type = 'table'
@@ -30,6 +30,7 @@ test('schema v19 keeps governed roots, Project locations, and versioned context 
   );
   assert.ok(tables.has('project_locations'));
   assert.ok(tables.has('project_context_links'));
+  assert.ok(tables.has('project_identity_signatures'));
   const rootColumns = new Set(
     registry.ledger.db.prepare('PRAGMA table_info(portfolio_roots)').all().map((row) => row.name),
   );

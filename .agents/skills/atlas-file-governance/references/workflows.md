@@ -13,6 +13,15 @@ $env:ATLAS_STATE_DIR = $located.state_path
 
 ## Browser Capture → Intake
 
+For a public static page, try the bounded local HTTP path first:
+
+```powershell
+& $located.node_path @($located.node_args) $located.cli_path capture fetch `
+  --url <PUBLIC_HTTP_URL> --json
+```
+
+It accepts public HTTP/HTTPS text only, refuses credentials and private/local targets, stops above 8 MiB, and returns a managed Candidate without the body. An HTTPS hostname mapped by a local proxy to `198.18/15` is allowed only with TLS hostname validation; direct IP and HTTP remain denied. Public ChatGPT Share pages are parsed from their structured message payload. If another site requires login or client rendering, ask the user for an export or explicit selection. Do not loop browser automation.
+
 The browser-side helper is called from the controlled browser's local Node session, not by copying page text into the conversation:
 
 ```javascript
@@ -40,6 +49,15 @@ Then use the installed Runtime:
 ```
 
 Do not request a full DOM snapshot or emit the localized body. Stop after two failed capture attempts. A successful Intake execute is verified from its compact receipt and target Hash; do not call `intake show` unless reconciliation or explicit audit is required.
+
+For chat captures, `capture localize` also returns a managed message-level JSONL path using `atlas.chat-message.v1`. Keep the readable Markdown for review; use the JSONL for deterministic message-ID, timestamp, overlap, and incremental comparison. For multiple branches of one chat, run once:
+
+```powershell
+& $located.node_path @($located.node_args) $located.cli_path content branches `
+  --file <BRANCH_1_JSONL> --file <BRANCH_2_JSONL> --file <BRANCH_3_JSONL> --json
+```
+
+Read each returned segment once and reconstruct each source from its `segment_chain`; do not load every duplicated branch body.
 
 ## Workspace Inspect
 
@@ -110,6 +128,54 @@ Write the current task dimensions to a small Atlas-state JSON file:
 
 For observed learning, proposal evidence contains existing paths inside the authorized root and short facts interpreted by the Agent. For an Atlas default, use `basis=default`, the exact returned `default_id`, and the exact default value. Do not claim that a default was learned from the user. Normal tasks read `rule context`, not `rule history`.
 
+When work starts inside an already registered Project, replace separate Project resolution and rule lookup with:
+
+```powershell
+& $atlasCli agent status --path '<CURRENT_WORKING_DIRECTORY>' --json
+& $atlasCli agent context --path '<CURRENT_WORKING_DIRECTORY>' --request-file '<ATLAS_STATE_CONTEXT_JSON>' --json
+```
+
+Resume a pending Task before starting another. When status is idle and one content Task request is ready, `agent start --path '<CURRENT_WORKING_DIRECTORY>' --request-file '<TASK_JSON>' <caller fields> --json` combines Project resolution and Task preparation. `agent context` remains the read-only rule/context query. `setup_required` returns only the missing Root/Location facts and does not scan another drive.
+
+If the adopted Root path itself is missing and one exact new Root path is already known, recover the stable Root ID without scanning or moving files:
+
+```powershell
+& $atlasCli root relocate '<ROOT_ID>' --path '<EXACT_NEW_ROOT>' `
+  --reason '<WHY_THIS_IS_THE_MOVED_ROOT>' --json
+```
+
+Atlas checks every active Project-relative directory and requires at least one saved Git/manifest identity anchor. A rejection makes no Registry change. Projects without identity evidence may remain attached only when their relative directories exist and another Project proves the Root identity.
+
+If an already attached Project path is missing and the user or Agent knows one exact candidate location, verify it without scanning another root:
+
+```powershell
+& $atlasCli project relocate '<PROJECT_ID>' --root '<ROOT_ID>' `
+  --path '<ROOT_RELATIVE_CANDIDATE>' --reason '<WHY_THIS_IS_THE_MOVED_PROJECT>' --json
+```
+
+Continue only when the result is `relocated`. `rejected` means Atlas found mismatched, missing, or unavailable identity evidence and made no Registry change. If the old path still exists, use a governed Evolution move instead.
+
+## Agent operation lifecycle
+
+After a Task Contract is ready and the content Skill has produced one Candidate outside the governed Root, use the host-facing adapter:
+
+```powershell
+& $atlasCli agent prepare '<TASK_ID>' --candidate-file '<CANDIDATE_PATH>' `
+  --reason '<CURRENT_TASK_AUTHORIZATION>' --json
+```
+
+If `approval.required=false`, the exact absent-target Task is already completed; return its receipt without asking again. If status is `needs_approval`, show the returned `review_path` once. After the user approves that Candidate:
+
+```powershell
+$approval = & $atlasCli agent approve '<TASK_ID>' --reason '<USER_APPROVAL>' --json | ConvertFrom-Json
+& $atlasCli agent fulfill '<TASK_ID>' `
+  --approval-token $approval.data.approval_token --json
+```
+
+Do not invent, cache across Tasks, or edit the token. A mismatch or later target change must stop. Recover a completed Task with `agent rollback '<TASK_ID>' --json`. The adapter uses the existing Task, Guarded/Derived, Label, Hash verification and rollback records; direct workflow commands remain available for compatibility and explicit audit.
+
+After interruption, call `agent status --path '<CURRENT_WORKING_DIRECTORY>' --json`. Use `agent resume '<TASK_ID>' --json` only for the returned pending Task. It shows the same review when approval is absent and continues only when an approval record already exists.
+
 ## Unified Intake
 
 For one exact attached local file whose Project, new target, intent, and current-task authorization are already known, prefer the bundled compact wrapper:
@@ -130,6 +196,7 @@ If the Agent has proved that the Project is not registered, replace `-ProjectId`
 & $atlasCli intake execute '<RUN_ID>' --reason '<CURRENT_USER_TASK_AUTHORIZATION>' --json
 & $atlasCli intake show '<RUN_ID>' --json
 & $atlasCli intake batch-plan --root '<AUTHORIZED_ROOT>' --request-file '<ATLAS_STATE_BATCH_JSON>' --json
+& $atlasCli intake batch-execute --root '<AUTHORIZED_ROOT>' --request-file '<ATLAS_STATE_BATCH_JSON>' --reason '<CURRENT_USER_TASK_AUTHORIZATION>' --actor agent --agent '<AGENT>' --model '<MODEL>' --tool '<TOOL>' --client-run-id '<TASK_ID>' --json
 & $atlasCli intake correct --root '<AUTHORIZED_ROOT>' --scope '<artifact|project|global>' --origin '<ORIGIN>' --kind '<KIND>' --role '<ROLE>' --target-subdirectory '<PROJECT_SUBDIRECTORY>' --reason '<USER_REASON>' --candidate-file '<ARTIFACT_SCOPE_CANDIDATE>' --project '<PROJECT_SCOPE_ID>' --json
 ```
 
@@ -161,7 +228,7 @@ Create a request JSON under Atlas runtime state; do not put it in the governed l
 & $atlasCli task prepare --root '<AUTHORIZED_ROOT>' --request-file '<ATLAS_STATE_REQUEST_JSON>' --actor agent --agent '<AGENT>' --model '<MODEL>' --tool '<CONTENT_SKILL>' --client-run-id '<TASK_ID>' --json
 # Open only data.read.selected and generate one Candidate outside the governed root.
 & $atlasCli task fulfill '<TASK_CONTRACT_RUN_ID>' --candidate-file '<CANDIDATE_OUTSIDE_ROOT>' --reason '<CURRENT_CONTENT_TASK_AUTHORIZATION>' --json
-& $atlasCli task show '<TASK_CONTRACT_RUN_ID>' --json
+& $atlasCli task show '<TASK_CONTRACT_RUN_ID>' --compact --json
 # Only when the user corrects one applied rule for this Task:
 & $atlasCli task review-rule '<TASK_CONTRACT_RUN_ID>' --rule-id '<RULE_ID>' --decision corrected --reason '<USER_CORRECTION>' --json
 ```
@@ -193,9 +260,11 @@ Configure the relationship once:
 Reuse it in later tasks:
 
 ```powershell
-& $atlasCli task discover-context --project '<TARGET_PROJECT_ID>' --purpose '<PURPOSE>' --term '<AGENT_SEARCH_TERM>' --actor agent --agent '<AGENT>' --model '<MODEL>' --tool '<CONTENT_SKILL>' --client-run-id '<TASK_ID>' --json
-& $atlasCli task context-candidates '<CANDIDATE_SET_ID>' --json
-& $atlasCli task prepare-context --candidate-set '<CANDIDATE_SET_ID>' --select '<CATALOG_ENTRY_ID>' --request-file '<ATLAS_STATE_REQUEST_JSON>' --actor agent --agent '<AGENT>' --model '<MODEL>' --tool '<CONTENT_SKILL>' --client-run-id '<TASK_ID>' --json
+& $atlasCli task discover-context --project '<TARGET_PROJECT_ID>' --purpose '<PURPOSE>' --term '<AGENT_SEARCH_TERM>' --compact --actor agent --agent '<AGENT>' --model '<MODEL>' --tool '<CONTENT_SKILL>' --client-run-id '<TASK_ID>' --json
+& $atlasCli task context-candidates '<CANDIDATE_SET_ID>' --compact --json
+# Only when one candidate is ambiguous:
+& $atlasCli task context-candidates '<CANDIDATE_SET_ID>' --entry '<CATALOG_ENTRY_ID>' --json
+& $atlasCli task prepare-context --candidate-set '<CANDIDATE_SET_ID>' --select '<CATALOG_ENTRY_ID>' --request-file '<ATLAS_STATE_REQUEST_JSON>' --compact --actor agent --agent '<AGENT>' --model '<MODEL>' --tool '<CONTENT_SKILL>' --client-run-id '<TASK_ID>' --json
 & $atlasCli task source-set '<SOURCE_SET_ID>' --json
 # Open only selected source paths and create one Candidate outside the target Root.
 & $atlasCli task fulfill '<TASK_ID_FROM_PREPARE>' --candidate-file '<CANDIDATE_FILE>' --reason '<CURRENT_USER_TASK_AUTHORIZATION>' --json
@@ -221,7 +290,7 @@ These commands evolve stable IDs, aliases, status, and lineage. `project evolve`
 For one physical change, use the implemented Evolution workflow instead of `project move`:
 
 ```powershell
-& $atlasCli evolve prepare --root '<AUTHORIZED_ROOT>' --operation '<create_directory|move_file|migrate_project|migrate_directory|remove_empty_directory>' --source '<SOURCE_FOR_MOVE_OR_REMOVAL>' --target '<ABSENT_TARGET>' --project '<PROJECT_ID_FOR_PROJECT_MIGRATION>' --intent '<INTENT>' --actor agent --agent '<AGENT>' --model '<MODEL>' --tool '<TOOL>' --client-run-id '<TASK_ID>' --json
+& $atlasCli evolve prepare --root '<AUTHORIZED_SOURCE_ROOT>' --target-root '<TARGET_ROOT_FOR_CROSS_ROOT_ONLY>' --operation '<create_directory|move_file|migrate_project|migrate_directory|migrate_cross_root|remove_empty_directory>' --source '<SOURCE_FOR_MOVE_OR_REMOVAL>' --target '<ABSENT_TARGET>' --project '<PROJECT_ID_FOR_SAME_ROOT_PROJECT_MIGRATION>' --intent '<INTENT>' --actor agent --agent '<AGENT>' --model '<MODEL>' --tool '<TOOL>' --client-run-id '<TASK_ID>' --json
 & $atlasCli evolve preview '<RUN_ID>' --json
 # Present the exact current plan and pause for approval of this structure change.
 & $atlasCli evolve approve '<RUN_ID>' --reason '<USER_REASON>' --json
@@ -229,7 +298,7 @@ For one physical change, use the implemented Evolution workflow instead of `proj
 & $atlasCli evolve preview '<RUN_ID>' --json
 ```
 
-For `create_directory`, omit `--source` and `--project`. For `remove_empty_directory`, include `--source` and omit `--target` and `--project`; Atlas refuses any entry inside that directory. For `move_file`, include `--source` and omit `--project`. For `migrate_project`, include `--project`; Atlas derives the source from Registry, and optional `--source` must match it. For `migrate_directory`, include `--source` and inspect the returned classification, control-file evidence, path references, generated caches, package-manager environment, reparse target validity, recommendation, warnings, and blockers before asking for approval. A nested cache should be quarantined through its own reviewed migration before moving the Library; do not merge it into another cache. One run performs one operation. Move/create targets must be absent with an existing real parent. File deletion, non-empty directory deletion, overwrite, cross-filesystem movement, case-only rename, source paths reached through symbolic links, and unsupported special entries remain unsupported. Use `evolve rollback <RUN_ID> --json` only after reconciling with Preview; stop on any manifest, path-claim, later-content, or Registry conflict.
+For `create_directory`, omit `--source`, `--project`, and `--target-root`. For `remove_empty_directory`, include `--source` and omit `--target`, `--project`, and `--target-root`; Atlas refuses any entry inside that directory. For `move_file`, include `--source` and omit `--project` and `--target-root`. For `migrate_project`, include `--project`; Atlas derives the source from Registry, and optional `--source` must match it. For `migrate_directory`, include `--source` and inspect the returned classification, control-file evidence, path references, generated caches, package-manager environment, reparse target validity, recommendation, warnings, and blockers before asking for approval. For `migrate_cross_root`, include `--source`, `--target`, and `--target-root`, but omit `--project`. Atlas uses copy → Manifest verification → target claim → source removal and can resume an interrupted exact plan. If the moved entry is a registered Project, call `project relocate` with the adopted target Root after execution; rollback if identity verification fails. A nested cache should be quarantined through its own reviewed migration before moving the Library; do not merge it into another cache. One run performs one operation. Move/create targets must be absent with an existing real parent. File deletion, non-empty directory deletion, overwrite, case-only rename, source paths reached through symbolic links, and unsupported special entries remain unsupported. Use `evolve rollback <RUN_ID> --json` only after reconciling with Preview; stop on any manifest, path-claim, later-content, or Registry conflict.
 
 For one user-approved multi-step organization scenario, write an `operations` array to an Atlas-state request file and use:
 
@@ -332,7 +401,7 @@ Remove the optional component only on explicit request:
 & $atlasCli guarded preview '<RUN_ID>' --json
 & $atlasCli derive preview '<RUN_ID>' --json
 & $atlasCli evolve preview '<RUN_ID>' --json
-& $atlasCli task show '<TASK_CONTRACT_RUN_ID>' --json
+& $atlasCli task show '<TASK_CONTRACT_RUN_ID>' --compact --json
 ```
 
 Do this after a timeout, cancellation, process crash, or ambiguous tool result. Keep the global run list bounded; use the exact run ID with the workflow detail command when more evidence is needed. Prefer idempotent close, approve, execute, abort, or rollback behavior after checking current status; never start a replacement run merely because output was lost.

@@ -70,6 +70,19 @@ test('Catalog incrementally indexes a bounded Project and reuses unchanged local
   assert.notEqual(second.generation_id, first.generation_id);
 });
 
+test('Catalog excludes Office lock and editor temporary files in the existing walk', (t) => {
+  const fixture = setup('catalog-temporary-files');
+  fs.writeFileSync(path.join(fixture.projectPath, '~$draft.md'), 'temporary editor state', 'utf8');
+  fs.writeFileSync(path.join(fixture.projectPath, '.notes.md.swp'), 'temporary editor state', 'utf8');
+  const catalog = new Catalog({ stateDir: fixture.stateDir });
+  t.after(() => catalog.dispose());
+
+  const result = catalog.update({ projectId: fixture.projectId });
+  assert.equal(result.observed_files, 2);
+  assert.equal(result.skipped_temporary_files, 2);
+  assert.equal(result.content_files_read, 2);
+});
+
 test('Catalog uses local Chinese trigram search and returns bounded candidates instead of bodies', (t) => {
   const fixture = setup('catalog-chinese-search');
   const catalog = new Catalog({ stateDir: fixture.stateDir });

@@ -472,6 +472,7 @@ export class TaskContract {
     this._registry = null;
     this._catalog = null;
     this._taskContext = null;
+    this._taskRepository = null;
   }
 
   get ledger() {
@@ -520,6 +521,16 @@ export class TaskContract {
       });
     }
     return this._taskContext;
+  }
+
+  get taskRepository() {
+    if (!this._taskRepository) this._taskRepository = this.ledger.tasks;
+    return this._taskRepository;
+  }
+
+  listPendingTasks(projectId, options = {}) {
+    this.ledger.getProject(projectId);
+    return this.taskRepository.listPendingByProject(projectId, options);
   }
 
   discoverContext({
@@ -733,6 +744,121 @@ export class TaskContract {
 
   showSourceSet(sourceSetId) {
     return this.taskContext.getSourceSet(sourceSetId);
+  }
+
+  sourceStatus(taskId, { caller = {} } = {}) {
+    const detail = this.show(taskId);
+    if (!detail.source_set_id) {
+      return {
+        schema: 'atlas-source-freshness.v1',
+        task_id: taskId,
+        status: 'unavailable',
+        reason_code: 'task_has_no_source_set',
+        items: [],
+        attention: 'This Task has no persistent cross-Project Source Set.',
+        source_changes: [],
+      };
+    }
+    const sourceSet = this.taskContext.getSourceSet(detail.source_set_id);
+    const projectIds = [...new Set(sourceSet.items.map((item) => item.source_project_id))];
+    const refresh = projectIds.map((projectId) => this.catalog.update({ projectId, caller }));
+    const exactHash = (rootId, relativePath) => {
+      const root = this.registry.showRoot(rootId).root.current_path;
+      const absolute = path.resolve(root, ...relativePath.split('/'));
+      if (!isPathInside(root, absolute) || absolute === root) return null;
+      try {
+        assertRealPathChain(root, absolute);
+        const stat = fs.lstatSync(absolute);
+        if (!stat.isFile() || stat.isSymbolicLink()) return null;
+        const real = fs.realpathSync.native(absolute);
+        if (!isPathInside(root, real)) return null;
+        return sha256File(real);
+      } catch {
+        return null;
+      }
+    };
+    const items = sourceSet.items.map((item) => {
+      const current = this.catalog.repository.getEntry(
+        item.source_root_id,
+        item.source_relative_path,
+      );
+      if (current?.status === 'active') {
+        const observedHash = exactHash(item.source_root_id, item.source_relative_path);
+        if (observedHash != null) {
+          return observedHash === item.content_hash
+          ? {
+              source_relative_path: item.source_relative_path,
+              status: 'current',
+              expected_hash: item.content_hash,
+              current_hash: observedHash,
+            }
+          : {
+              source_relative_path: item.source_relative_path,
+              status: 'stale_source',
+              expected_hash: item.content_hash,
+              current_hash: observedHash,
+            };
+        }
+      }
+      const matches = this.catalog.repository.findActiveEntriesByHash(
+        item.source_project_id,
+        item.content_hash,
+      ).filter((match) => (
+        match.relative_path !== item.source_relative_path
+        && exactHash(item.source_root_id, match.relative_path) === item.content_hash
+      ));
+      if (matches.length) {
+        return {
+          source_relative_path: item.source_relative_path,
+          status: 'moved_same_content',
+          expected_hash: item.content_hash,
+          current_relative_path: matches[0].relative_path,
+          additional_matches: Math.max(0, matches.length - 1),
+        };
+      }
+      return {
+        source_relative_path: item.source_relative_path,
+        status: 'missing_source',
+        expected_hash: item.content_hash,
+        current_hash: null,
+      };
+    });
+    const counts = Object.fromEntries(
+      ['current', 'stale_source', 'missing_source', 'moved_same_content']
+        .map((status) => [status, items.filter((item) => item.status === status).length]),
+    );
+    const status = counts.stale_source
+      ? 'stale_source'
+      : counts.missing_source
+        ? 'missing_source'
+        : counts.moved_same_content
+          ? 'moved_same_content'
+          : 'current';
+    const attention = status === 'current'
+      ? 'Selected sources are unchanged.'
+      : status === 'moved_same_content'
+        ? 'Source content is unchanged but its path moved; refresh the Source Set before the next write.'
+        : status === 'stale_source'
+          ? 'A selected source changed; refresh context before reusing or revising the output.'
+          : 'A selected source is missing; resolve the source before reusing or revising the output.';
+    return {
+      schema: 'atlas-source-freshness.v1',
+      task_id: taskId,
+      source_set_id: sourceSet.source_set_id,
+      status,
+      counts,
+      items,
+      catalog_refresh: refresh.map((item) => ({
+        project_id: item.project_id,
+        generation_id: item.generation_id,
+        changed_files: item.changed_files,
+        reused_files: item.reused_files,
+        missing_files: item.missing_files,
+        content_files_read: item.content_files_read,
+      })),
+      attention,
+      source_changes: [],
+    };
   }
 
   discover({ root: rootInput, projectId, roles = [], extensions = [], modifiedAfter = null, maxCandidates = 12 }) {
@@ -1350,6 +1476,7 @@ export class TaskContract {
     this._catalog = null;
     this._registry = null;
     this._taskContext = null;
+    this._taskRepository = null;
     this._ledger = null;
   }
 }

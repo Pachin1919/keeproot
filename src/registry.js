@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Ledger } from './ledger.js';
 import { isPathInside, normalizeRoot } from './paths.js';
+import { captureProjectIdentity, compareProjectIdentity } from './project-identity.js';
 import { ProjectContextRepository } from './storage/repositories/project-context-repository.js';
 
 const ROOT_TYPES = new Set([
@@ -158,6 +159,97 @@ export class Registry {
     return this.projectContext.listRoots();
   }
 
+  relocateRoot(rootId, { rootPath, reason }) {
+    const current = this.projectContext.getRoot(rootId).root;
+    if (current.governance_status !== 'adopted') {
+      throw new Error(`Workspace Root is not adopted: ${rootId}`);
+    }
+    if (fs.existsSync(current.current_path)) {
+      throw new Error('The active Workspace Root still exists. Use governed Evolution for a physical move.');
+    }
+    const candidateRoot = normalizeRoot(rootPath);
+    if (isPathInside(candidateRoot, this.stateDir) || isPathInside(this.stateDir, candidateRoot)) {
+      throw new Error(`Atlas state and an adopted Workspace Root must not overlap: ${this.stateDir}`);
+    }
+    for (const existing of this.projectContext.listRoots()) {
+      if (existing.id === rootId) continue;
+      const existingPath = path.resolve(existing.current_path);
+      if (isPathInside(existingPath, candidateRoot) || isPathInside(candidateRoot, existingPath)) {
+        throw new Error(`Adopted Workspace Roots must not overlap: ${candidateRoot} and ${existing.current_path}`);
+      }
+    }
+
+    const locations = this.projectContext.listActiveLocationsForRoot(rootId);
+    const verifiedProjectIds = [];
+    const unverifiedProjectIds = [];
+    for (const location of locations) {
+      let relativePath;
+      try {
+        relativePath = realProjectDirectory(candidateRoot, location.relative_path);
+      } catch {
+        return {
+          schema: 'atlas-root-relocation.v1',
+          status: 'rejected',
+          reason_code: 'project_location_missing',
+          root_id: rootId,
+          project_id: location.project_id,
+          relative_path: location.relative_path,
+          source_changes: [],
+        };
+      }
+      const baseline = this.projectContext.getActiveIdentity(location.project_id);
+      if (!baseline) {
+        unverifiedProjectIds.push(location.project_id);
+        continue;
+      }
+      const candidate = captureProjectIdentity(
+        path.resolve(candidateRoot, ...relativePath.split('/')),
+      );
+      const comparison = compareProjectIdentity(baseline.evidence, candidate.evidence);
+      if (comparison.status !== 'verified') {
+        return {
+          schema: 'atlas-root-relocation.v1',
+          status: 'rejected',
+          root_id: rootId,
+          project_id: location.project_id,
+          ...comparison,
+          identity_reason_code: comparison.reason_code,
+          reason_code: 'project_identity_mismatch',
+          source_changes: [],
+        };
+      }
+      verifiedProjectIds.push(location.project_id);
+    }
+    if (!verifiedProjectIds.length) {
+      return {
+        schema: 'atlas-root-relocation.v1',
+        status: 'rejected',
+        reason_code: 'root_identity_baseline_unavailable',
+        root_id: rootId,
+        unverified_project_ids: unverifiedProjectIds,
+        source_changes: [],
+      };
+    }
+
+    const relocatedAt = timestamp();
+    const updated = this.projectContext.relocateRoot({
+      rootId,
+      currentPath: candidateRoot,
+      reason: normalizeReason(reason, 'Workspace Root relocation'),
+      relocatedAt,
+    });
+    return {
+      schema: 'atlas-root-relocation.v1',
+      status: 'relocated',
+      reason_code: 'project_identity_anchors_verified',
+      root_id: rootId,
+      current_path: updated.root.current_path,
+      verified_project_ids: verifiedProjectIds,
+      unverified_project_ids: unverifiedProjectIds,
+      source_changes: [],
+    };
+  }
+
   attachRoot(projectIdValue, {
     rootId,
     relativePath = null,
@@ -168,13 +260,88 @@ export class Registry {
     if (root.governance_status !== 'adopted') throw new Error(`Workspace Root is not adopted: ${rootId}`);
     const selectedPath = relativePath ?? project.current_path;
     const normalizedPath = realProjectDirectory(root.current_path, selectedPath);
-    return this.projectContext.attachLocation({
+    const attachedAt = timestamp();
+    const location = this.projectContext.attachLocation({
       projectId: projectIdValue,
       rootId,
       relativePath: normalizedPath,
       reason: normalizeReason(reason, 'Project Root attachment'),
-      attachedAt: timestamp(),
+      attachedAt,
     });
+    const absolute = path.resolve(root.current_path, ...normalizedPath.split('/'));
+    const captured = captureProjectIdentity(absolute);
+    const identity = captured.status === 'captured'
+      ? this.projectContext.recordIdentity({
+          projectId: projectIdValue,
+          signature: captured,
+          reason: 'Project Root attachment identity capture.',
+          recordedAt: attachedAt,
+        })
+      : captured;
+    return { ...location, identity: identity ? { ...identity, status: captured.status } : captured };
+  }
+
+  relocate(projectIdValue, {
+    rootId,
+    relativePath,
+    reason,
+  }) {
+    const project = this.ledger.getProject(projectIdValue);
+    const current = this.projectContext.getActiveLocation(projectIdValue);
+    if (!current) throw new Error(`Project has no active Workspace Root location: ${projectIdValue}`);
+    const currentAbsolute = path.resolve(current.root_path, ...current.relative_path.split('/'));
+    if (fs.existsSync(currentAbsolute)) {
+      throw new Error('The active Project location still exists. Use a governed Evolution move instead of identity recovery.');
+    }
+    const baseline = this.projectContext.getActiveIdentity(projectIdValue);
+    if (!baseline) {
+      return {
+        schema: 'atlas-project-relocation.v1',
+        status: 'rejected',
+        reason_code: 'identity_baseline_unavailable',
+        project_id: project.id,
+        source_changes: [],
+      };
+    }
+    const root = this.projectContext.getRoot(rootId).root;
+    const normalizedPath = realProjectDirectory(root.current_path, relativePath);
+    const absolute = path.resolve(root.current_path, ...normalizedPath.split('/'));
+    const candidate = captureProjectIdentity(absolute);
+    const comparison = compareProjectIdentity(baseline.evidence, candidate.evidence);
+    if (comparison.status !== 'verified') {
+      return {
+        schema: 'atlas-project-relocation.v1',
+        ...comparison,
+        project_id: project.id,
+        candidate: { root_id: rootId, relative_path: normalizedPath },
+        source_changes: [],
+      };
+    }
+    const relocatedAt = timestamp();
+    const location = this.projectContext.attachLocation({
+      projectId: projectIdValue,
+      rootId,
+      relativePath: normalizedPath,
+      reason: normalizeReason(reason, 'Project relocation'),
+      attachedAt: relocatedAt,
+    });
+    this.projectContext.recordIdentity({
+      projectId: projectIdValue,
+      signature: candidate,
+      reason: 'Verified Project relocation identity.',
+      recordedAt: relocatedAt,
+    });
+    return {
+      schema: 'atlas-project-relocation.v1',
+      status: 'relocated',
+      reason_code: comparison.reason_code,
+      project_id: project.id,
+      location,
+      matched_signals: comparison.matched_signals,
+      mismatched_signals: [],
+      missing_signals: comparison.missing_signals,
+      source_changes: [],
+    };
   }
 
   linkContext(targetProjectId, {
@@ -214,6 +381,64 @@ export class Registry {
   contextLinkHistory(projectIdValue) {
     this.ledger.getProject(projectIdValue);
     return this.projectContext.listContextLinks(projectIdValue, { includeHistory: true });
+  }
+
+  resolvePath(pathValue) {
+    const resolvedPath = normalizeRoot(pathValue);
+    const locations = this.projectContext.listActiveLocations();
+    const matches = locations.filter((location) => {
+      const projectPath = path.resolve(
+        location.root_path,
+        ...location.relative_path.split('/'),
+      );
+      return isPathInside(projectPath, resolvedPath);
+    }).sort((left, right) => {
+      const leftPath = path.resolve(left.root_path, ...left.relative_path.split('/'));
+      const rightPath = path.resolve(right.root_path, ...right.relative_path.split('/'));
+      return rightPath.length - leftPath.length;
+    });
+    if (matches.length) {
+      const location = matches[0];
+      return {
+        schema: 'atlas-project-resolution.v1',
+        status: 'resolved',
+        input_path: resolvedPath,
+        root: this.projectContext.getRoot(location.root_id).root,
+        project: this.ledger.getProject(location.project_id),
+        location,
+        context_links: this.projectContext.listContextLinks(location.project_id),
+        source_changes: [],
+      };
+    }
+    const containingRoots = this.projectContext.listRoots().filter((root) => (
+      isPathInside(path.resolve(root.current_path), resolvedPath)
+    ));
+    const containingRoot = containingRoots[0] ?? null;
+    const projectCandidates = containingRoot
+      ? locations.filter((location) => {
+        if (location.root_id !== containingRoot.id) return false;
+        const projectPath = path.resolve(
+          location.root_path,
+          ...location.relative_path.split('/'),
+        );
+        return isPathInside(resolvedPath, projectPath);
+      }).map((location) => ({
+        project: this.ledger.getProject(location.project_id),
+        location,
+      }))
+      : [];
+    return {
+      schema: 'atlas-project-resolution.v1',
+      status: 'setup_required',
+      input_path: resolvedPath,
+      root: containingRoot,
+      project: null,
+      location: null,
+      context_links: [],
+      project_candidates: projectCandidates,
+      missing: containingRoots.length ? ['project_location'] : ['workspace_root', 'project_location'],
+      source_changes: [],
+    };
   }
 
   disableContextLink(linkId, { reason }) {
@@ -315,6 +540,8 @@ export class Registry {
       ...this.ledger.getProjectDetail(projectIdValue),
       location: this.projectContext.getActiveLocation(projectIdValue),
       location_history: this.projectContext.locationHistory(projectIdValue),
+      identity: this.projectContext.getActiveIdentity(projectIdValue),
+      identity_history: this.projectContext.identityHistory(projectIdValue),
       context_links: this.projectContext.listContextLinks(projectIdValue),
     };
   }

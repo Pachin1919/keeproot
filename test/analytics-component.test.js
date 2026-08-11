@@ -37,7 +37,7 @@ test('optional analytics component installs, diagnoses, repeats, and removes ind
     }
     if (args[0] === '-m' && args[1] === 'pip' && args[2] === 'install') {
       dependencyInstalls += 1;
-      assert.equal(args.at(-1), 'pandas==3.0.1');
+      assert.deepEqual(args.slice(-2), ['pandas==3.0.1', 'pypdf==6.14.2']);
       return { status: 0, stdout: 'installed\n', stderr: '' };
     }
     if (args[0] === '--version') {
@@ -46,8 +46,8 @@ test('optional analytics component installs, diagnoses, repeats, and removes ind
     if (args[0] === '-m' && args[1] === 'atlas_analytics' && args[2] === '--help') {
       return { status: 0, stdout: 'usage: atlas_analytics\n', stderr: '' };
     }
-    if (args[0] === '-c' && args[1].includes('import json, pandas')) {
-      return { status: 0, stdout: '{"pandas":"3.0.1"}\n', stderr: '' };
+    if (args[0] === '-c' && args[1].includes('import json, pandas, pypdf')) {
+      return { status: 0, stdout: '{"pandas":"3.0.1","pypdf":"6.14.2"}\n', stderr: '' };
     }
     return { status: 1, stdout: '', stderr: 'unexpected invocation' };
   };
@@ -60,7 +60,7 @@ test('optional analytics component installs, diagnoses, repeats, and removes ind
   });
   assert.equal(installed.status, 'installed');
   assert.equal(installed.runtime_network_access, false);
-  assert.deepEqual(installed.dependencies, { pandas: '3.0.1' });
+  assert.deepEqual(installed.dependencies, { pandas: '3.0.1', pypdf: '6.14.2' });
   assert.equal(venvCreates, 1);
   assert.equal(dependencyInstalls, 1);
 
@@ -68,7 +68,7 @@ test('optional analytics component installs, diagnoses, repeats, and removes ind
   assert.equal(diagnosed.status, 'ready');
   assert.equal(diagnosed.mode, 'managed');
   assert.equal(diagnosed.python_version, '3.12.4');
-  assert.deepEqual(diagnosed.dependencies, { pandas: '3.0.1' });
+  assert.deepEqual(diagnosed.dependencies, { pandas: '3.0.1', pypdf: '6.14.2' });
 
   const repeated = installAnalyticsComponent({
     installationRoot,

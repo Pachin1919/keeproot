@@ -77,6 +77,13 @@ test('repository Agent Skill is a complete user-installable source and reference
   assert.match(skill, /does not prohibit read-only structural inspection/);
   assert.match(skill, /atlas content inspect/);
   assert.match(skill, /review_path/);
+  assert.match(skill, /root relocate/);
+  assert.match(skill, /agent prepare/);
+  assert.match(skill, /approval_token/);
+  assert.match(protocol, /root relocate/);
+  assert.match(protocol, /agent fulfill/);
+  assert.match(workflows, /root relocate/);
+  assert.match(workflows, /agent approve/);
   assert.match(protocol, /content inspect/);
   assert.match(workflows, /--scan-mode structure/);
   for (const command of [
@@ -121,6 +128,7 @@ test('installed Skill reuses one cross-Project Context Link without rereading un
   });
   const atlas = new InstalledSkillDriver({ installRoot });
   assert.match(atlas.skill, /recurring cross-Project work/);
+  assert.match(atlas.skill, /agent\s+context/);
   assert.match(atlas.workflows, /task\s+discover-context/);
 
   const sourceRootReceipt = atlas.call([
@@ -325,6 +333,9 @@ test('Skill attachment Intake script preserves spaced Chinese paths and returns 
   assert.equal(receipt.hash_match, true);
   assert.equal(receipt.verified, true);
   assert.equal(receipt.rollback_ready, true);
+  assert.equal(receipt.atlas_calls, 3);
+  assert.equal(receipt.runtime_processes, 1);
+  assert.equal(receipt.model_visible_body_bytes, 0);
   assert.equal(receipt.ppt_body_reads, 0);
   assert.equal(
     fs.readFileSync(path.join(vault, receipt.target), 'utf8'),
@@ -348,7 +359,7 @@ test('Skill command sequence completes Agent Bootstrap, Derived, Tracked Direct,
   assert.equal(agentCli(stateDir, ['doctor']).status, 'ok');
   const capabilities = agentCli(stateDir, ['capabilities']);
   assert.ok(capabilities.workflows.bootstrap.includes('scan'));
-  assert.deepEqual(capabilities.workflows.content, ['inspect']);
+  assert.deepEqual(capabilities.workflows.content, ['inspect', 'compare', 'branches']);
   assert.deepEqual(capabilities.bootstrap_scan_modes, ['structure', 'metadata']);
   assert.ok(capabilities.workflows.tracked_direct.includes('rollback'));
   assert.ok(capabilities.workflows.guarded.includes('execute'));
@@ -358,11 +369,12 @@ test('Skill command sequence completes Agent Bootstrap, Derived, Tracked Direct,
   assert.ok(capabilities.workflows.bootstrap.includes('contract'));
   assert.ok(capabilities.workflows.bootstrap.includes('adopt'));
   assert.ok(capabilities.workflows.intake.includes('execute'));
-  assert.deepEqual(capabilities.workflows.capture, ['localize', 'sample']);
+  assert.deepEqual(capabilities.workflows.capture, ['fetch', 'localize', 'sample']);
   assert.equal(capabilities.browser_capture.maximum_sample_characters, 4000);
   assert.ok(capabilities.workflows.evolution.includes('execute'));
   assert.deepEqual(capabilities.evolution_operations, [
     'create_directory', 'move_file', 'migrate_project', 'migrate_directory',
+    'migrate_cross_root',
     'remove_empty_directory',
   ]);
   assert.ok(capabilities.workflows.registry.includes('evolve'));

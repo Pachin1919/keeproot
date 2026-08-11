@@ -17,6 +17,14 @@ const IGNORED_DIRECTORIES = new Set([
   'node_modules', 'dist', 'build', 'coverage',
 ]);
 
+function isTemporaryFileName(name) {
+  const normalized = name.toLowerCase();
+  return normalized.startsWith('~$')
+    || normalized.startsWith('.~lock.')
+    || /^#.+#$/u.test(name)
+    || /\.(?:swp|swo|tmp|temp|part|crdownload)$/u.test(normalized);
+}
+
 function timestamp() {
   return new Date().toISOString();
 }
@@ -165,6 +173,7 @@ export class Catalog {
         content_files_read: 0,
         content_bytes_read: 0,
         skipped_unindexed_files: 0,
+        skipped_temporary_files: 0,
         skipped_symbolic_links: 0,
         skipped_special_files: 0,
         truncated_files: 0,
@@ -186,6 +195,10 @@ export class Catalog {
           }
           if (!child.isFile()) {
             summary.skipped_special_files += 1;
+            continue;
+          }
+          if (isTemporaryFileName(child.name)) {
+            summary.skipped_temporary_files += 1;
             continue;
           }
           const extension = path.extname(child.name).toLowerCase();

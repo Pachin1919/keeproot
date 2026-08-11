@@ -1,0 +1,36 @@
+:root {
+  color-scheme: light dark;
+  --canvas: #f3f5f2;
+  --surface: #fbfcfa;
+  --surface-muted: #e9eeea;
+  --ink: #17201b;
+  --muted: #657067;
+  --line: #d5dcd6;
+  --accent: #2f6b52;
+  --accent-soft: #e2eee7;
+  --warning: #9a621d;
+  --warning-soft: #f6ead8;
+  --danger: #a13f3a;
+  --danger-soft: #f6e3e1;
+  --radius-surface: 12px;
+  --radius-control: 8px;
+  --font-sans: Geist, "Segoe UI Variable", "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono", "Cascadia Code", Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: #111613;
+    --surface: #181e1a;
+    --surface-muted: #202822;
+    --ink: #e8ece8;
+    --muted: #98a39b;
+    --line: #303a33;
+    --accent: #68a987;
+    --accent-soft: #20352a;
+    --warning: #d9a04e;
+    --warning-soft: #3a2d1c;
+    --danger: #df7770;
+    --danger-soft: #3b2422;
+  }
+}

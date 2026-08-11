@@ -131,6 +131,184 @@ test('Evolution moves one file without rewriting it and safely moves it back', (
   assert.equal(fs.existsSync(path.join(root, prepared.target)), false);
 });
 
+test('Evolution copies, verifies, removes, and safely restores one directory across Roots', (t) => {
+  const caseRoot = path.join(tempRoot, 'evolution-cross-root-directory');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const sourceRoot = path.join(caseRoot, 'source-root');
+  const targetRoot = path.join(caseRoot, 'target-root');
+  const stateDir = path.join(caseRoot, 'state');
+  fs.mkdirSync(path.join(sourceRoot, 'Projects', 'Website', 'src'), { recursive: true });
+  fs.mkdirSync(path.join(targetRoot, 'projects'), { recursive: true });
+  fs.writeFileSync(path.join(sourceRoot, 'Projects', 'Website', 'README.md'), '# Website\n', 'utf8');
+  fs.writeFileSync(path.join(sourceRoot, 'Projects', 'Website', 'src', 'index.js'), 'export {};\n', 'utf8');
+  const evolution = new Evolution({ stateDir });
+  t.after(() => evolution.dispose());
+
+  const prepared = evolution.prepare({
+    root: sourceRoot,
+    targetRoot,
+    operation: 'migrate_cross_root',
+    source: 'Projects/Website',
+    target: 'projects/Website',
+    intent: 'Move one exact Project directory between controlled Roots.',
+  });
+  const preview = evolution.preview(prepared.run_id);
+  assert.equal(preview.plan.source_root, path.resolve(sourceRoot));
+  assert.equal(preview.plan.target_root, path.resolve(targetRoot));
+  assert.equal(preview.plan.transfer_method, 'copy_verify_remove');
+  assert.equal(preview.plan.source_manifest.kind, 'directory');
+  evolution.approve(prepared.run_id, { reason: 'Approve this exact cross-Root migration.' });
+
+  const executed = evolution.execute(prepared.run_id);
+  assert.equal(executed.status, 'executed');
+  assert.equal(executed.verified, true);
+  assert.equal(executed.transfer_method, 'copy_verify_remove');
+  assert.equal(fs.existsSync(path.join(sourceRoot, 'Projects', 'Website')), false);
+  assert.equal(fs.readFileSync(path.join(targetRoot, 'projects', 'Website', 'README.md'), 'utf8'), '# Website\n');
+  assert.deepEqual(evolution.execute(prepared.run_id), executed);
+
+  const rolledBack = evolution.rollback(prepared.run_id);
+  assert.equal(rolledBack.status, 'rolled_back');
+  assert.equal(fs.readFileSync(path.join(sourceRoot, 'Projects', 'Website', 'src', 'index.js'), 'utf8'), 'export {};\n');
+  assert.equal(fs.existsSync(path.join(targetRoot, 'projects', 'Website')), false);
+});
+
+test('Evolution refuses cross-Root rollback after a legitimate target change', (t) => {
+  const caseRoot = path.join(tempRoot, 'evolution-cross-root-conflict');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const sourceRoot = path.join(caseRoot, 'source-root');
+  const targetRoot = path.join(caseRoot, 'target-root');
+  const stateDir = path.join(caseRoot, 'state');
+  fs.mkdirSync(path.join(sourceRoot, 'Incoming'), { recursive: true });
+  fs.mkdirSync(path.join(targetRoot, 'Library'), { recursive: true });
+  fs.writeFileSync(path.join(sourceRoot, 'Incoming', 'note.md'), '# Original\n', 'utf8');
+  const evolution = new Evolution({ stateDir });
+  t.after(() => evolution.dispose());
+
+  const prepared = evolution.prepare({
+    root: sourceRoot,
+    targetRoot,
+    operation: 'migrate_cross_root',
+    source: 'Incoming/note.md',
+    target: 'Library/note.md',
+  });
+  evolution.approve(prepared.run_id, { reason: 'Move the exact reviewed file.' });
+  evolution.execute(prepared.run_id);
+  fs.appendFileSync(path.join(targetRoot, 'Library', 'note.md'), 'Later legal change.\n', 'utf8');
+
+  assert.throws(
+    () => evolution.rollback(prepared.run_id),
+    (error) => error.code === 'ATLAS_ROLLBACK_CONFLICT',
+  );
+  assert.equal(fs.existsSync(path.join(sourceRoot, 'Incoming', 'note.md')), false);
+  assert.match(fs.readFileSync(path.join(targetRoot, 'Library', 'note.md'), 'utf8'), /Later legal change/u);
+});
+
+test('Evolution resumes a cross-Root copy after interruption before source removal', (t) => {
+  const caseRoot = path.join(tempRoot, 'evolution-cross-root-resume');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const sourceRoot = path.join(caseRoot, 'source-root');
+  const targetRoot = path.join(caseRoot, 'target-root');
+  const source = path.join(sourceRoot, 'Project');
+  const target = path.join(targetRoot, 'Projects', 'Project');
+  const stateDir = path.join(caseRoot, 'state');
+  fs.mkdirSync(source, { recursive: true });
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(path.join(source, 'data.txt'), 'stable\n', 'utf8');
+  const evolution = new Evolution({ stateDir });
+  t.after(() => evolution.dispose());
+  const prepared = evolution.prepare({
+    root: sourceRoot,
+    targetRoot,
+    operation: 'migrate_cross_root',
+    source: 'Project',
+    target: 'Projects/Project',
+  });
+  evolution.approve(prepared.run_id, { reason: 'Approve the resumable migration.' });
+
+  const originalRemove = fs.rmSync;
+  let interrupted = false;
+  fs.rmSync = function interruptSourceRemoval(candidate, options) {
+    if (!interrupted && path.resolve(candidate) === path.resolve(source)) {
+      interrupted = true;
+      throw new Error('fixture interruption before source removal');
+    }
+    return originalRemove.call(fs, candidate, options);
+  };
+  try {
+    assert.throws(() => evolution.execute(prepared.run_id), /fixture interruption/u);
+  } finally {
+    fs.rmSync = originalRemove;
+  }
+  assert.equal(fs.existsSync(source), true);
+  assert.equal(fs.readFileSync(path.join(target, 'data.txt'), 'utf8'), 'stable\n');
+  assert.equal(evolution.execute(prepared.run_id).status, 'executed');
+  assert.equal(fs.existsSync(source), false);
+});
+
+test('Evolution stops a cross-Root migration when the target is claimed after review', (t) => {
+  const caseRoot = path.join(tempRoot, 'evolution-cross-root-target-conflict');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const sourceRoot = path.join(caseRoot, 'source-root');
+  const targetRoot = path.join(caseRoot, 'target-root');
+  const source = path.join(sourceRoot, 'note.md');
+  const target = path.join(targetRoot, 'Library', 'note.md');
+  const stateDir = path.join(caseRoot, 'state');
+  fs.mkdirSync(sourceRoot, { recursive: true });
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(source, 'source\n', 'utf8');
+  const evolution = new Evolution({ stateDir });
+  t.after(() => evolution.dispose());
+  const prepared = evolution.prepare({
+    root: sourceRoot,
+    targetRoot,
+    operation: 'migrate_cross_root',
+    source: 'note.md',
+    target: 'Library/note.md',
+  });
+  evolution.approve(prepared.run_id, { reason: 'Approve the exact target.' });
+  fs.writeFileSync(target, 'claimed later\n', 'utf8');
+
+  assert.throws(
+    () => evolution.execute(prepared.run_id),
+    (error) => error.code === 'ATLAS_STATE_CONFLICT',
+  );
+  assert.equal(fs.readFileSync(source, 'utf8'), 'source\n');
+  assert.equal(fs.readFileSync(target, 'utf8'), 'claimed later\n');
+});
+
+test('Evolution blocks a cross-Root move when an ancestor control file still uses the source path', (t) => {
+  const caseRoot = path.join(tempRoot, 'evolution-cross-root-control-reference');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const sourceRoot = path.join(caseRoot, 'source-root');
+  const targetRoot = path.join(caseRoot, 'target-root');
+  const source = path.join(sourceRoot, 'Projects', 'Website');
+  const stateDir = path.join(caseRoot, 'state');
+  fs.mkdirSync(source, { recursive: true });
+  fs.mkdirSync(path.join(targetRoot, 'projects'), { recursive: true });
+  fs.writeFileSync(path.join(source, 'package.json'), '{"name":"website"}\n', 'utf8');
+  fs.writeFileSync(path.join(sourceRoot, 'AGENTS.md'), 'Use Projects/Website for website work.\n', 'utf8');
+  const evolution = new Evolution({ stateDir });
+  t.after(() => evolution.dispose());
+
+  const prepared = evolution.prepare({
+    root: sourceRoot,
+    targetRoot,
+    operation: 'migrate_cross_root',
+    source: 'Projects/Website',
+    target: 'projects/Website',
+  });
+  const preview = evolution.preview(prepared.run_id);
+  assert.deepEqual(preview.plan.blockers, ['external_control_file_references_source_path']);
+  assert.equal(preview.plan.inspection.external_control_references.references[0].path.toLowerCase(), 'agents.md');
+  assert.throws(
+    () => evolution.approve(prepared.run_id, { reason: 'Do not approve stale control paths.' }),
+    /unresolved blockers/u,
+  );
+  assert.equal(fs.existsSync(source), true);
+  assert.equal(fs.existsSync(path.join(targetRoot, 'projects', 'Website')), false);
+});
+
 test('Evolution migrates one Project directory and updates Registry only after verification', (t) => {
   const { root, stateDir, projectId } = setup('evolution-migrate-project');
   fs.mkdirSync(path.join(root, 'Projects', 'Atlas', 'nested'), { recursive: true });
