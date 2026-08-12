@@ -1,4 +1,4 @@
-export const ATLAS_VERSION = '1.5.1';
+export const ATLAS_VERSION = '1.5.2-rc.1';
 export const PROTOCOL_VERSION = 'atlas-cli.v1';
 
 export const CAPABILITIES = Object.freeze({
@@ -22,7 +22,7 @@ export const CAPABILITIES = Object.freeze({
   json_flag: '--json',
   workflows: {
     agent: ['context', 'start', 'status', 'prepare', 'approve', 'fulfill', 'resume', 'rollback'],
-    ui: ['start', 'context', 'operation', 'serve', 'action'],
+    ui: ['start', 'install', 'doctor', 'remove', 'context', 'operation', 'serve', 'action'],
     inspect: ['workspace'],
     portfolio: ['inventory', 'show', 'review', 'plan'],
     bootstrap: ['profiles', 'scan', 'recommend', 'contract', 'adopt', 'context', 'propose', 'status', 'show', 'review', 'initialize'],
@@ -162,6 +162,18 @@ export const CAPABILITIES = Object.freeze({
     runtime_network_required: false,
     lifecycle: ['install', 'doctor', 'remove'],
     content_inspection_access: 'explicit_authorized_files_only',
+  },
+  desktop_ui_component: {
+    format: 'atlas-desktop-ui-component.v1',
+    mode: 'optional_managed_python_venv',
+    minimum_python: '3.11',
+    renderer: 'webview2',
+    transport: 'loopback_url_only',
+    external_browser_default: false,
+    browser_debug_flag: '--browser',
+    ledger_access: false,
+    library_access: false,
+    lifecycle: ['install', 'doctor', 'remove'],
   },
   browser_capture: {
     bridge: 'installed_skill_script',

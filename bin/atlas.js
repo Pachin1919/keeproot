@@ -33,6 +33,12 @@ import { TaskContract } from '../src/task-contract.js';
 import { createContextView } from '../src/ui-context.js';
 import { createOperationSnapshot } from '../src/ui-operation.js';
 import { applyUiAction } from '../src/ui-action.js';
+import {
+  doctorDesktopUiComponent,
+  installDesktopUiComponent,
+  removeDesktopUiComponent,
+  startDesktopUi,
+} from '../src/desktop-ui-component.js';
 import { openLocalUi } from '../src/ui-launcher.js';
 import { startAtlasUiServer, startTaskReviewServer } from '../src/ui-server.js';
 import {
@@ -144,7 +150,9 @@ Usage:
   atlas agent fulfill <task_id> --approval-token <token>
   atlas agent resume <task_id>
   atlas agent rollback <task_id>
-  atlas ui [--path <current_directory>] [--task <task_id>] [--port <port>] [--no-open] [--refresh-sources]
+  atlas ui [--path <current_directory>] [--task <task_id>] [--port <port>] [--no-open|--browser] [--refresh-sources]
+  atlas ui install --python <python-3.11-or-newer>
+  atlas ui doctor | remove
   atlas ui context --path <current_directory>
   atlas ui operation --task <task_id> [--refresh-sources]
   atlas ui serve --task <task_id> [--port <port>] [--refresh-sources]
@@ -2291,7 +2299,14 @@ async function main() {
         });
         return;
       }
-      if (args.length) throw new Error('doctor accepts only the optional analytics target');
+      if (args.length === 1 && args[0] === 'ui') {
+        const data = doctorDesktopUiComponent({ installationRoot, runtimeRoot: projectRoot });
+        emit('doctor.ui', data, (detail) => {
+          console.log(`Atlas Desktop UI doctor: ${detail.status}; ${detail.mode}.`);
+        });
+        return;
+      }
+      if (args.length) throw new Error('doctor accepts only the optional analytics or ui target');
       const ledger = tracker.ledger.diagnostics();
       const data = {
         status: ledger.integrity === 'ok' && ledger.schema_version === ledger.supported_schema_version
@@ -2308,6 +2323,7 @@ async function main() {
           file_governance: true,
           analytics_export: true,
           analytics_python: optionalPythonCapability(),
+          desktop_ui: doctorDesktopUiComponent({ installationRoot, runtimeRoot: projectRoot }),
         },
       };
       emit('doctor', data, (detail) => {
@@ -2390,18 +2406,19 @@ async function main() {
     } else if (command === 'ui') {
       if (!args[0] || args[0].startsWith('--')) {
         const options = {
-          currentPath: process.cwd(), taskId: null, port: 0, open: true, refreshSources: false,
+          currentPath: process.cwd(), taskId: null, port: 0, mode: 'desktop', refreshSources: false,
         };
         for (let index = 0; index < args.length; index += 1) {
           if (args[index] === '--path') options.currentPath = args[++index];
           else if (args[index] === '--task') options.taskId = args[++index];
           else if (args[index] === '--port') options.port = Number(args[++index]);
-          else if (args[index] === '--no-open') options.open = false;
+          else if (args[index] === '--no-open') options.mode = 'host_only';
+          else if (args[index] === '--browser') options.mode = 'browser_debug';
           else if (args[index] === '--refresh-sources') options.refreshSources = true;
           else throw new Error(`Unknown ui argument: ${args[index]}`);
         }
         if (!options.currentPath || !Number.isInteger(options.port) || options.port < 0 || options.port > 65535) {
-          throw new Error('ui accepts an optional --path, --task, --port, --no-open, and --refresh-sources.');
+          throw new Error('ui accepts an optional --path, --task, --port, --no-open, --browser, and --refresh-sources.');
         }
         const diagnostics = tracker.ledger.diagnostics();
         const session = await startAtlasUiServer({
@@ -2427,27 +2444,80 @@ async function main() {
           port: options.port,
           refreshSources: options.refreshSources,
         });
-        let browser = { status: 'not_requested' };
-        if (options.open) {
+        let surface = { status: 'not_requested', mode: options.mode };
+        let desktop = null;
+        if (options.mode === 'desktop') {
           try {
-            browser = openLocalUi(session.url);
+            desktop = await startDesktopUi({
+              url: session.url,
+              installationRoot,
+              runtimeRoot: projectRoot,
+            });
+            surface = {
+              status: desktop.status,
+              mode: 'desktop',
+              renderer: desktop.renderer,
+              pid: desktop.pid,
+              external_browser: false,
+            };
           } catch (error) {
-            browser = { status: 'failed', message: error.message };
+            await session.close();
+            throw error;
           }
+        } else if (options.mode === 'browser_debug') {
+          surface = { ...openLocalUi(session.url), mode: 'browser_debug', external_browser: true };
         }
         emit('ui.start', {
           schema: session.schema,
           url: session.url,
           workspace_url: session.workspace_url,
           network_scope: session.network_scope,
-          browser,
+          surface,
           source_changes: [],
-        }, (detail) => console.log(`Atlas UI: ${detail.url}\nClose it from the Workspace page or press Ctrl+C.`));
-        await new Promise((resolve, reject) => {
+        }, (detail) => {
+          if (detail.surface.mode === 'desktop') console.log('Atlas Desktop is open. Close the window to stop.');
+          else if (detail.surface.mode === 'browser_debug') console.log(`Atlas browser debug UI: ${detail.url}`);
+          else console.log(`Atlas UI host: ${detail.url}\nPress Ctrl+C to stop.`);
+        });
+        const stopped = new Promise((resolve, reject) => {
           const stop = () => session.close().then(resolve, reject);
           process.once('SIGINT', stop);
           process.once('SIGTERM', stop);
           session.closed.then(resolve, reject);
+        });
+        if (desktop) {
+          await Promise.race([stopped, desktop.closed]);
+          desktop.close();
+          await session.close();
+        } else {
+          await stopped;
+        }
+      } else if (args[0] === 'doctor') {
+        if (args.length !== 1) throw new Error('ui doctor does not accept arguments.');
+        const result = doctorDesktopUiComponent({ installationRoot, runtimeRoot: projectRoot });
+        emit('ui.doctor', result, (detail) => {
+          console.log(`Atlas Desktop UI: ${detail.status}; ${detail.mode}.`);
+          if (detail.next_step) console.log(detail.next_step);
+        });
+      } else if (args[0] === 'install') {
+        let sourcePython = null;
+        for (let index = 1; index < args.length; index += 1) {
+          if (args[index] === '--python') sourcePython = args[++index];
+          else throw new Error(`Unknown ui install argument: ${args[index]}`);
+        }
+        const result = installDesktopUiComponent({
+          installationRoot,
+          runtimeRoot: projectRoot,
+          sourcePython,
+        });
+        emit('ui.install', result, (detail) => {
+          console.log(`Atlas Desktop UI: ${detail.status}; Python ${detail.python_version}.`);
+        });
+      } else if (args[0] === 'remove') {
+        if (args.length !== 1) throw new Error('ui remove does not accept arguments.');
+        const result = removeDesktopUiComponent({ installationRoot });
+        emit('ui.remove', result, (detail) => {
+          console.log(`Atlas Desktop UI: ${detail.status}; Node governance preserved.`);
         });
       } else if (args[0] === 'context') {
         if (args[1] !== '--path' || !args[2] || args.length !== 3) {
@@ -2541,7 +2611,7 @@ async function main() {
           process.once('SIGTERM', stop);
         });
       } else {
-        throw new Error('ui requires context, operation, serve, or action');
+        throw new Error('ui requires install, doctor, remove, context, operation, serve, or action');
       }
     } else if (command === 'rule') {
       handleRule(rules, tracker.ledger, args);

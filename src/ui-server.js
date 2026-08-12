@@ -1,13 +1,20 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import http from 'node:http';
 import { createOperationSnapshot } from './ui-operation.js';
 import { applyUiAction } from './ui-action.js';
 import { buildContextModel } from './ui/read-model/context-model.js';
 import { buildOperationModel } from './ui/read-model/operation-model.js';
+import { buildTaskListModel } from './ui/read-model/task-list-model.js';
+import {
+  preferenceHtmlAttributes, preferenceRailStyle, readUiPreferences, resetUiPreferences, writeUiPreferences,
+} from './ui/preferences.js';
 import { escapeHtml, renderNav } from './ui/components.js';
 import { uiStyles } from './ui/styles.js';
 import { renderContextView } from './ui/views/context-view.js';
 import { renderTaskReviewView } from './ui/views/task-review-view.js';
+import { renderTasksView } from './ui/views/tasks-view.js';
+import { renderSettingsView } from './ui/views/settings-view.js';
 
 const MAX_BODY_BYTES = 8 * 1024;
 
@@ -41,11 +48,21 @@ function sendHtml(response, statusCode, html) {
   response.writeHead(statusCode, {
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',
-    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
     'x-content-type-options': 'nosniff',
     'referrer-policy': 'no-referrer',
   });
   response.end(html);
+}
+
+function sendUiClient(response) {
+  response.writeHead(200, {
+    'content-type': 'text/javascript; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-security-policy': "default-src 'none'",
+    'x-content-type-options': 'nosniff',
+  });
+  response.end(fs.readFileSync(new URL('./ui/client.js', import.meta.url), 'utf8'));
 }
 
 function safeNotice(error) {
@@ -63,6 +80,49 @@ function requireConfirmation(action, form) {
   }
 }
 
+function applyBoundUiAction({
+  action, form, stateDir, taskId, services, task, guarded, derived, lifecycle,
+}) {
+  const snapshot = createOperationSnapshot({ stateDir, taskId, ...services });
+  if (action !== 'approve_execute') {
+    return applyUiAction({
+      stateDir,
+      taskId,
+      action,
+      snapshotPath: snapshot.operation_path,
+      reason: form.get('reason'),
+      task,
+      guarded,
+      derived,
+      lifecycle,
+    });
+  }
+  const approval = applyUiAction({
+    stateDir,
+    taskId,
+    action: 'approve',
+    snapshotPath: snapshot.operation_path,
+    reason: 'User approved the exact Candidate in Atlas Desktop.',
+    task,
+    guarded,
+    derived,
+    lifecycle,
+  });
+  const approvedSnapshot = createOperationSnapshot({ stateDir, taskId, ...services });
+  const execution = applyUiAction({
+    stateDir,
+    taskId,
+    action: 'execute',
+    snapshotPath: approvedSnapshot.operation_path,
+    approvalToken: approval.approval_token,
+    task,
+    guarded,
+    derived,
+    lifecycle,
+  });
+  return { ...execution, action: 'approve_execute' };
+}
+
 function taskRoute(pathname) {
   const match = pathname.match(/^\/tasks\/([^/]+)(?:\/(action|refresh))?$/u);
   if (!match) return null;
@@ -72,7 +132,7 @@ function taskRoute(pathname) {
 }
 
 function errorView(message, workspaceHref = '/') {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Atlas stopped</title><style>${uiStyles()}</style></head><body><div class="app-shell">${renderNav('Workspace', { interactive: true, workspaceHref })}<main class="page"><section class="surface"><h1>Atlas stopped this action</h1><p>${escapeHtml(message)}</p><p><a class="text-link" href="${escapeHtml(workspaceHref)}">Return to Workspace</a></p></section></main></div></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Atlas stopped</title><style>${uiStyles()}</style><script src="/ui.js" defer></script></head><body><div class="app-shell">${renderNav('Workspace', { interactive: true, workspaceHref })}<main class="page"><section class="surface"><h1>Atlas stopped this action</h1><p>${escapeHtml(message)}</p><p><a class="text-link" href="${escapeHtml(workspaceHref)}">Return to Workspace</a></p></section></main></div></body></html>`;
 }
 
 export async function startTaskReviewServer({
@@ -87,6 +147,11 @@ export async function startTaskReviewServer({
   refreshSources = false,
 }) {
   const csrfToken = crypto.randomBytes(32).toString('hex');
+  const preferences = readUiPreferences(stateDir);
+  const displayOptions = {
+    htmlAttributes: preferenceHtmlAttributes(preferences),
+    railStyle: preferenceRailStyle(preferences),
+  };
   let notice = null;
   const services = { task, guarded, derived };
   const sourceFreshness = refreshSources
@@ -96,6 +161,10 @@ export async function startTaskReviewServer({
   const server = http.createServer(async (request, response) => {
     try {
       const url = new URL(request.url, `http://${host}`);
+      if (url.pathname === '/ui.js' && request.method === 'GET') {
+        sendUiClient(response);
+        return;
+      }
       if (url.pathname === '/' && request.method === 'GET') {
         const model = buildOperationModel({ taskId, ...services, sourceFreshness });
         sendHtml(response, 200, renderTaskReviewView(model, {
@@ -104,6 +173,7 @@ export async function startTaskReviewServer({
           bindingDigest: bindingDigest(model.action_binding),
           notice,
           interactive: true,
+          ...displayOptions,
         }));
         notice = null;
         return;
@@ -122,17 +192,9 @@ export async function startTaskReviewServer({
           throw error;
         }
         requireConfirmation(form.get('action'), form);
-        const snapshot = createOperationSnapshot({ stateDir, taskId, ...services });
-        const result = applyUiAction({
-          stateDir,
-          taskId,
-          action: form.get('action'),
-          snapshotPath: snapshot.operation_path,
-          reason: form.get('reason'),
-          task,
-          guarded,
-          derived,
-          lifecycle,
+        const result = applyBoundUiAction({
+          action: form.get('action'), form, stateDir, taskId, services,
+          task, guarded, derived, lifecycle,
         });
         notice = `${result.action} recorded: ${result.status}.`;
         response.writeHead(303, { location: '/', 'cache-control': 'no-store' });
@@ -149,6 +211,7 @@ export async function startTaskReviewServer({
         bindingDigest: bindingDigest(model.action_binding),
         notice: safeNotice(error),
         interactive: true,
+        ...displayOptions,
       }));
     }
   });
@@ -186,6 +249,12 @@ export async function startAtlasUiServer({
   refreshSources = false,
 }) {
   const csrfToken = crypto.randomBytes(32).toString('hex');
+  let preferences = readUiPreferences(stateDir);
+  const displayOptions = () => ({
+    htmlAttributes: preferenceHtmlAttributes(preferences),
+    railStyle: preferenceRailStyle(preferences),
+    settingsHref: '/settings',
+  });
   const notices = new Map();
   const sourceFreshness = new Map();
   const services = { task, guarded, derived };
@@ -199,7 +268,7 @@ export async function startAtlasUiServer({
       error.code = 'ATLAS_PATH_BOUNDARY';
       throw error;
     }
-    return { ...model, projects: [selected], status_label: `Selected Project: ${selected.project.name}` };
+    return { ...model, selected_project_id: selectedProjectId, status_label: `Selected Project: ${selected.project.name}` };
   };
 
   const operation = (taskId) => {
@@ -222,6 +291,10 @@ export async function startAtlasUiServer({
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, `http://${host}`);
     try {
+      if (url.pathname === '/ui.js' && request.method === 'GET') {
+        sendUiClient(response);
+        return;
+      }
       if (url.pathname === '/' && request.method === 'GET') {
         sendHtml(response, 200, renderContextView(context(), {
           interactive: true,
@@ -230,7 +303,48 @@ export async function startAtlasUiServer({
           taskBasePath: '/tasks/',
           stopEndpoint: '/session/stop',
           csrfToken,
+          ...displayOptions(),
         }));
+        return;
+      }
+      if (url.pathname === '/settings' && request.method === 'GET') {
+        sendHtml(response, 200, renderSettingsView({ preferences, runtime }, {
+          workspaceHref: '/', csrfToken, saved: url.searchParams.get('saved') === '1',
+        }));
+        return;
+      }
+      if (url.pathname === '/settings' && request.method === 'POST') {
+        const form = await readForm(request);
+        if (!equalSecret(csrfToken, form.get('csrf'))) {
+          response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+          response.end('Atlas UI session token is invalid.');
+          return;
+        }
+        preferences = form.get('action') === 'reset'
+          ? resetUiPreferences(stateDir)
+          : writeUiPreferences(stateDir, {
+              theme: form.get('theme'),
+              accent: form.get('accent'),
+              contrast: form.get('contrast'),
+              text_size: form.get('text_size'),
+              density: form.get('density'),
+              project_rail_width: form.get('project_rail_width'),
+              app_rail_width: form.get('app_rail_width'),
+              show_technical_ids: form.get('show_technical_ids'),
+            });
+        response.writeHead(303, { location: '/settings?saved=1', 'cache-control': 'no-store' });
+        response.end();
+        return;
+      }
+      if (url.pathname === '/tasks' && request.method === 'GET') {
+        const model = buildTaskListModel(context(), {
+          q: url.searchParams.get('q'),
+          project: url.searchParams.get('project'),
+          status: url.searchParams.get('status'),
+          sort: url.searchParams.get('sort'),
+          page: url.searchParams.get('page'),
+        });
+        sendHtml(response, 200, renderTasksView(model, { workspaceHref: '/', ...displayOptions() }));
         return;
       }
       const projectMatch = url.pathname.match(/^\/projects\/([^/]+)$/u);
@@ -238,11 +352,13 @@ export async function startAtlasUiServer({
         const projectId = decodeURIComponent(projectMatch[1]);
         sendHtml(response, 200, renderContextView(context(projectId), {
           interactive: true,
+          projectDetail: true,
           workspaceHref: '/',
           projectBasePath: '/projects/',
           taskBasePath: '/tasks/',
           stopEndpoint: '/session/stop',
           csrfToken,
+          ...displayOptions(),
         }));
         return;
       }
@@ -261,6 +377,7 @@ export async function startAtlasUiServer({
           notice: notices.get(route.taskId) ?? null,
           interactive: true,
           workspaceHref: '/',
+          ...displayOptions(),
           refreshEndpoint: model.sources.freshness.status === 'unavailable'
             ? null
             : `/tasks/${encodeURIComponent(route.taskId)}/refresh`,
@@ -293,17 +410,9 @@ export async function startAtlasUiServer({
           throw error;
         }
         requireConfirmation(form.get('action'), form);
-        const snapshot = createOperationSnapshot({ stateDir, taskId: route.taskId, ...services });
-        const result = applyUiAction({
-          stateDir,
-          taskId: route.taskId,
-          action: form.get('action'),
-          snapshotPath: snapshot.operation_path,
-          reason: form.get('reason'),
-          task,
-          guarded,
-          derived,
-          lifecycle,
+        const result = applyBoundUiAction({
+          action: form.get('action'), form, stateDir, taskId: route.taskId, services,
+          task, guarded, derived, lifecycle,
         });
         notices.set(route.taskId, `${result.action} recorded: ${result.status}.`);
         response.writeHead(303, {
@@ -337,6 +446,7 @@ export async function startAtlasUiServer({
             notice: safeNotice(error),
             interactive: true,
             workspaceHref: '/',
+            ...displayOptions(),
           }));
           return;
         } catch {

@@ -68,7 +68,12 @@ export class TaskRepository {
     return this.db.prepare(`
       SELECT tc.run_id, tc.contract_id, tc.underlying_run_id, tc.source_set_id, tc.contract_json,
              r.status AS task_status, r.intent, r.started_at, r.closed_at, r.rolled_back_at,
-             wr.mode AS write_mode, wr.status AS write_status
+             wr.mode AS write_mode, wr.status AS write_status,
+             (SELECT ti.path FROM task_inputs ti
+              WHERE ti.run_id = tc.run_id AND ti.selected = 1
+              ORDER BY ti.ordinal LIMIT 1) AS primary_source,
+             (SELECT COUNT(*) FROM task_inputs ti
+              WHERE ti.run_id = tc.run_id AND ti.selected = 1) AS selected_source_count
       FROM task_contracts tc
       JOIN runs r ON r.id = tc.run_id
       LEFT JOIN runs wr ON wr.id = tc.underlying_run_id
@@ -91,6 +96,8 @@ export class TaskRepository {
         started_at: row.started_at,
         closed_at: row.closed_at,
         rolled_back_at: row.rolled_back_at,
+        primary_source: row.primary_source,
+        selected_source_count: row.selected_source_count,
       };
     });
   }

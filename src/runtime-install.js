@@ -114,7 +114,7 @@ function assertOutsideLibraries(installRoot, stateDir, libraryRoots) {
 
 function copyRuntime(sourceRoot, target) {
   fs.mkdirSync(target, { recursive: true });
-  for (const relative of ['bin', 'src', 'schemas', 'python/src', 'python/pyproject.toml', 'package.json']) {
+  for (const relative of ['assets', 'bin', 'src', 'schemas', 'python/src', 'python/pyproject.toml', 'package.json']) {
     const source = path.join(sourceRoot, relative);
     if (!fs.existsSync(source)) throw new Error(`Runtime source is incomplete: ${source}`);
     fs.cpSync(source, path.join(target, relative), {
@@ -193,6 +193,26 @@ function uiWrapperText() {
   ].join('\r\n');
 }
 
+function uiPowerShellWrapperText() {
+  return [
+    "$ErrorActionPreference = 'Continue'",
+    "$atlas = Join-Path $PSScriptRoot 'atlas.cmd'",
+    '$output = & $atlas ui --json 2>&1 | Out-String',
+    '$exitCode = $LASTEXITCODE',
+    'if ($exitCode -ne 0) {',
+    "  $message = 'Atlas Desktop UI could not start. Run atlas ui doctor in PowerShell for details.'",
+    '  try {',
+    '    $payload = $output | ConvertFrom-Json',
+    '    if ($payload.error.message) { $message = $payload.error.message }',
+    '  } catch {}',
+    '  Add-Type -AssemblyName PresentationFramework',
+    "  [System.Windows.MessageBox]::Show($message, 'Atlas Desktop UI', 'OK', 'Error') | Out-Null",
+    '}',
+    'exit $exitCode',
+    '',
+  ].join('\r\n');
+}
+
 export function locateInstalledRuntime(installRootInput) {
   const installRoot = path.resolve(installRootInput);
   const manifestPath = path.join(installRoot, MANIFEST_NAME);
@@ -218,6 +238,7 @@ export function locateInstalledRuntime(installRootInput) {
     manifest.skill_path,
     path.join(installRoot, 'atlas.cmd'),
     path.join(installRoot, 'atlas-ui.cmd'),
+    path.join(installRoot, 'atlas-ui.ps1'),
   ];
   if (required.some((entry) => !entry || !fs.existsSync(entry))) {
     return { status: 'runtime_required', install_root: installRoot, manifest };
@@ -320,9 +341,13 @@ export function installRuntime(options) {
   const manifestPath = path.join(installRoot, MANIFEST_NAME);
   const wrapperPath = path.join(installRoot, 'atlas.cmd');
   const uiWrapperPath = path.join(installRoot, 'atlas-ui.cmd');
+  const uiPowerShellWrapperPath = path.join(installRoot, 'atlas-ui.ps1');
   const oldManifest = fs.existsSync(manifestPath) ? fs.readFileSync(manifestPath) : null;
   const oldWrapper = fs.existsSync(wrapperPath) ? fs.readFileSync(wrapperPath) : null;
   const oldUiWrapper = fs.existsSync(uiWrapperPath) ? fs.readFileSync(uiWrapperPath) : null;
+  const oldUiPowerShellWrapper = fs.existsSync(uiPowerShellWrapperPath)
+    ? fs.readFileSync(uiPowerShellWrapperPath)
+    : null;
   let runtimeSwapped = false;
   let skillSwapped = false;
   try {
@@ -345,6 +370,7 @@ export function installRuntime(options) {
     });
     fs.writeFileSync(wrapperPath, wrapperText(manifest), 'utf8');
     fs.writeFileSync(uiWrapperPath, uiWrapperText(), 'utf8');
+    fs.writeFileSync(uiPowerShellWrapperPath, uiPowerShellWrapperText(), 'utf8');
     fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
     if (fs.existsSync(runtimeBackup)) safeRemove(runtimeBackup, installRoot);
     if (fs.existsSync(skillBackup)) safeRemove(skillBackup, skillParent);
@@ -374,6 +400,8 @@ export function installRuntime(options) {
     else fs.rmSync(wrapperPath, { force: true });
     if (oldUiWrapper) fs.writeFileSync(uiWrapperPath, oldUiWrapper);
     else fs.rmSync(uiWrapperPath, { force: true });
+    if (oldUiPowerShellWrapper) fs.writeFileSync(uiPowerShellWrapperPath, oldUiPowerShellWrapper);
+    else fs.rmSync(uiPowerShellWrapperPath, { force: true });
     throw error;
   }
 }
@@ -388,6 +416,9 @@ export function uninstallRuntime({ installRoot: installRootInput, skillRoot: ski
   fs.rmSync(path.join(installRoot, MANIFEST_NAME), { force: true });
   fs.rmSync(path.join(installRoot, 'atlas.cmd'), { force: true });
   fs.rmSync(path.join(installRoot, 'atlas-ui.cmd'), { force: true });
+  fs.rmSync(path.join(installRoot, 'atlas-ui.ps1'), { force: true });
+  const desktopUi = path.join(installRoot, 'desktop-ui');
+  if (fs.existsSync(desktopUi)) safeRemove(desktopUi, installRoot);
   return {
     status: 'uninstalled',
     install_root: installRoot,

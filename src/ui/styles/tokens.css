@@ -1,36 +1,71 @@
 :root {
-  color-scheme: light dark;
-  --canvas: #f3f5f2;
-  --surface: #fbfcfa;
-  --surface-muted: #e9eeea;
-  --ink: #17201b;
-  --muted: #657067;
-  --line: #d5dcd6;
-  --accent: #2f6b52;
-  --accent-soft: #e2eee7;
-  --warning: #9a621d;
-  --warning-soft: #f6ead8;
-  --danger: #a13f3a;
-  --danger-soft: #f6e3e1;
+  color-scheme: dark;
+  --canvas: #161a1f;
+  --surface: #20252b;
+  --surface-muted: #282e35;
+  --ink: #e7ece9;
+  --muted: #b8c1bc;
+  --line: #414950;
+  --accent: #72b18c;
+  --accent-strong: #9bd0af;
+  --accent-soft: #243a2d;
+  --accent-line: #4d745c;
+  --warning: #e1ae63;
+  --warning-soft: #40331f;
+  --danger: #e58a84;
+  --danger-soft: #432a2b;
+  --shadow-soft: 0 1px 2px rgba(0, 0, 0, .18), 0 14px 34px rgba(0, 0, 0, .16);
   --radius-surface: 12px;
   --radius-control: 8px;
-  --font-sans: Geist, "Segoe UI Variable", "Segoe UI", sans-serif;
+  --font-sans: Satoshi, Aptos, "Segoe UI Variable", "Segoe UI", sans-serif;
   --font-mono: "Geist Mono", "Cascadia Code", Consolas, monospace;
+  --font-size-base: 16px;
+  --font-size-work: 14px;
+  --font-size-small: 13px;
+  --font-size-micro: 11px;
+  --font-size-section: 17px;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --canvas: #111613;
-    --surface: #181e1a;
-    --surface-muted: #202822;
-    --ink: #e8ece8;
-    --muted: #98a39b;
-    --line: #303a33;
-    --accent: #68a987;
-    --accent-soft: #20352a;
-    --warning: #d9a04e;
-    --warning-soft: #3a2d1c;
-    --danger: #df7770;
-    --danger-soft: #3b2422;
-  }
+html[data-theme="graphite"] {
+  --canvas: #101317;
+  --surface: #191d22;
+  --surface-muted: #23282e;
+  --ink: #edf1ef;
+  --muted: #bdc5c1;
+  --line: #3f474f;
+}
+html[data-theme="warm_charcoal"] {
+  --canvas: #181714;
+  --surface: #24221f;
+  --surface-muted: #2d2a26;
+  --ink: #eeeae2;
+  --muted: #c3bbb0;
+  --line: #49443d;
+}
+html[data-contrast="standard"] { --muted: #9ba5a0; --line: #353c43; }
+html[data-accent="blue"] {
+  --accent: #7fa7c3;
+  --accent-strong: #acd0e7;
+  --accent-soft: #253746;
+  --accent-line: #4e7188;
+}
+html[data-accent="amber"] {
+  --accent: #d3a766;
+  --accent-strong: #e7c48f;
+  --accent-soft: #3d3221;
+  --accent-line: #765f3c;
+}
+html[data-text-size="compact"] {
+  --font-size-base: 14px;
+  --font-size-work: 12px;
+  --font-size-small: 12px;
+  --font-size-micro: 10px;
+  --font-size-section: 16px;
+}
+html[data-text-size="large"] {
+  --font-size-base: 17px;
+  --font-size-work: 15px;
+  --font-size-small: 14px;
+  --font-size-micro: 12px;
+  --font-size-section: 19px;
 }

@@ -111,7 +111,7 @@ function waitForAtlasUiUrl(child) {
     const timer = setTimeout(() => reject(new Error(`Timed out waiting for Atlas UI. Output: ${output}`)), 5000);
     child.stdout.on('data', (chunk) => {
       output += chunk;
-      const match = output.match(/Atlas UI: (http:\/\/127\.0\.0\.1:\d+\/)/u);
+      const match = output.match(/Atlas UI host: (http:\/\/127\.0\.0\.1:\d+\/)/u);
       if (match) {
         clearTimeout(timer);
         resolve(match[1]);
@@ -307,35 +307,77 @@ test('Atlas UI opens one Workspace and completes a Task without a manually enter
   const url = await waitForAtlasUiUrl(child);
 
   const workspace = await (await fetch(url)).text();
-  assert.match(workspace, /Atlas Workspace/u);
+  assert.match(workspace, /Project Studio/u);
+  assert.match(workspace, /Decision inbox/u);
+  assert.match(workspace, /Active tasks/u);
   assert.match(workspace, new RegExp(`href="/tasks/${fixture.taskId}"`, 'u'));
+  assert.match(workspace, /href="\/tasks\?status=action_required"/u);
+  assert.match(workspace, /Status guide/u);
+  assert.match(workspace, /How to read Atlas states/u);
+  assert.match(workspace, /Waiting for you/u);
+  assert.match(workspace, /data-rail="project"/u);
+  assert.match(workspace, /src="\/ui\.js"/u);
+  assert.match(workspace, /Ledger health/u);
+  assert.match(workspace, /Python tools/u);
+  assert.match(workspace, /Ledger schema v\d+/u);
+  assert.match(workspace, /Atlas state is stored locally/u);
+
+  const uiClient = await fetch(`${url}ui.js`);
+  assert.equal(uiClient.status, 200);
+  assert.match(uiClient.headers.get('content-type'), /text\/javascript/u);
+  const uiClientSource = await uiClient.text();
+  assert.match(uiClientSource, /--project-rail-width/u);
+  assert.match(uiClientSource, /sessionStorage/u);
+
+  let settingsPage = await (await fetch(`${url}settings`)).text();
+  assert.match(settingsPage, /Theme and color/u);
+  assert.match(settingsPage, /Text and density/u);
+  assert.match(settingsPage, /Navigation and technical detail/u);
+  const settingsForm = new URLSearchParams({
+    csrf: hiddenValue(settingsPage, 'csrf'),
+    action: 'save',
+    theme: 'graphite',
+    accent: 'blue',
+    contrast: 'high',
+    text_size: 'large',
+    density: 'comfortable',
+    project_rail_width: '320',
+    app_rail_width: '250',
+  });
+  let settingsResponse = await fetch(`${url}settings`, {
+    method: 'POST', body: settingsForm, redirect: 'manual',
+  });
+  assert.equal(settingsResponse.status, 303);
+  const styledWorkspace = await (await fetch(url)).text();
+  assert.match(styledWorkspace, /data-theme="graphite"/u);
+  assert.match(styledWorkspace, /data-accent="blue"/u);
+  assert.match(styledWorkspace, /data-text-size="large"/u);
+  assert.match(styledWorkspace, /--project-rail-width:320px/u);
+
+  settingsPage = await (await fetch(`${url}settings`)).text();
+  settingsResponse = await fetch(`${url}settings`, {
+    method: 'POST',
+    body: new URLSearchParams({ csrf: hiddenValue(settingsPage, 'csrf'), action: 'reset' }),
+    redirect: 'manual',
+  });
+  assert.equal(settingsResponse.status, 303);
+
+  const taskQueue = await (await fetch(`${url}tasks?sort=oldest`)).text();
+  assert.match(taskQueue, /Task queue/u);
+  assert.match(taskQueue, /name="sort"/u);
+  assert.match(taskQueue, new RegExp(`href="/tasks/${fixture.taskId}"`, 'u'));
+  assert.match(taskQueue, /data-rail="app"/u);
 
   const taskUrl = `${url}tasks/${fixture.taskId}`;
   let page = await (await fetch(taskUrl)).text();
   let form = new URLSearchParams({
     csrf: hiddenValue(page, 'csrf'),
     binding: hiddenValue(page, 'binding'),
-    action: 'approve',
-    reason: 'The user approved the exact Candidate displayed here.',
+    action: 'approve_execute',
   });
   let response = await fetch(`${taskUrl}/action`, { method: 'POST', body: form, redirect: 'manual' });
   assert.equal(response.status, 303);
   assert.equal(response.headers.get('location'), `/tasks/${fixture.taskId}`);
-  assert.equal(fs.readFileSync(fixture.target, 'utf8'), fixture.baseline);
-
-  page = await (await fetch(taskUrl)).text();
-  form = new URLSearchParams({
-    csrf: hiddenValue(page, 'csrf'),
-    binding: hiddenValue(page, 'binding'),
-    action: 'execute',
-  });
-  response = await fetch(`${taskUrl}/action`, { method: 'POST', body: form, redirect: 'manual' });
-  assert.equal(response.status, 400);
-  assert.equal(fs.readFileSync(fixture.target, 'utf8'), fixture.baseline);
-
-  form.set('confirmed', 'yes');
-  response = await fetch(`${taskUrl}/action`, { method: 'POST', body: form, redirect: 'manual' });
-  assert.equal(response.status, 303);
   assert.equal(fs.readFileSync(fixture.target, 'utf8'), `${fixture.baseline}2026-02-01,20\n`);
 
   page = await (await fetch(taskUrl)).text();

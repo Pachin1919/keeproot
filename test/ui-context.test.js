@@ -4,6 +4,16 @@ import path from 'node:path';
 import test from 'node:test';
 import { createContextView } from '../src/ui-context.js';
 import { openLocalUi } from '../src/ui-launcher.js';
+import { renderStatus, statusPresentation } from '../src/ui/components.js';
+
+test('UI status vocabulary explains the recorded state instead of exposing only raw codes', () => {
+  assert.deepEqual(statusPresentation('blocked'), {
+    label: 'Blocked',
+    meaning: 'Atlas stopped the Task because a conflict or policy condition needs attention.',
+  });
+  assert.match(renderStatus('not_checked'), />Not checked<\/span>/u);
+  assert.match(renderStatus('completed'), /title="The Task output was recorded and verified\."/u);
+});
 
 test('UI context writes one local HTML view for bounded Project candidates', () => {
   const stateDir = path.resolve('test', '.tmp', 'ui-context');

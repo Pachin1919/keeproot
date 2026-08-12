@@ -60,7 +60,7 @@ For multiple attachments, write one request under Atlas state:
       "origin": "human_submitted",
       "kind": "report",
       "projectId": "PRJ-...",
-      "target": "JMCMOTORS_社媒管理/06_分析报告/report-april.pdf",
+      "target": "ClientCampaign/Reports/monthly-report-april.pdf",
       "intent": "Keep the submitted monthly report."
     }
   ]

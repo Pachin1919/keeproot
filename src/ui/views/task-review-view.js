@@ -1,4 +1,6 @@
-import { escapeHtml, renderFacts, renderNav, renderStatus } from '../components.js';
+import {
+  escapeHtml, renderFacts, renderNav, renderStatus, renderUiClientScript, statusPresentation,
+} from '../components.js';
 import { uiStyles } from '../styles.js';
 
 function sourceList(sources) {
@@ -74,24 +76,33 @@ function receiptPanel(model) {
 }
 
 function actionForm(action, options) {
-  const needsReason = ['approve', 'reject'].includes(action);
+  const submittedAction = action === 'approve' ? 'approve_execute' : action;
+  const needsReason = action === 'reject';
   const needsConfirmation = ['execute', 'rollback'].includes(action);
+  const labels = {
+    approve: 'Approve & apply',
+    reject: 'Reject proposal',
+    execute: 'Apply approved change',
+    rollback: 'Restore previous version',
+  };
   return `<form class="action-form" method="post" action="${escapeHtml(options.actionEndpoint)}">
     <input type="hidden" name="csrf" value="${escapeHtml(options.csrfToken)}">
     <input type="hidden" name="binding" value="${escapeHtml(options.bindingDigest)}">
-    <input type="hidden" name="action" value="${escapeHtml(action)}">
+    <input type="hidden" name="action" value="${escapeHtml(submittedAction)}">
     ${needsReason ? `<label class="label" for="reason-${escapeHtml(action)}">Reason</label>
       <input class="action-input" id="reason-${escapeHtml(action)}" name="reason" required maxlength="500" autocomplete="off">` : ''}
     ${needsConfirmation ? `<label class="confirmation"><input type="checkbox" name="confirmed" value="yes" required> I reviewed the current state and want Atlas to ${escapeHtml(action)} this exact Task.</label>` : ''}
-    <button class="action-button${action === 'reject' || action === 'rollback' ? ' action-button-secondary' : ''}" type="submit">${escapeHtml(action)}</button>
+    <button class="action-button${action === 'reject' || action === 'rollback' ? ' action-button-secondary' : ''}" type="submit">${escapeHtml(labels[action] ?? action)}</button>
   </form>`;
 }
 
 function actionPanel(model, options) {
   const actions = model.ui_state.allowed_actions;
+  const state = statusPresentation(model.ui_state.state);
   return `<section class="surface">
     <span class="label">Current state</span>
     ${renderStatus(model.ui_state.state)}
+    <p class="muted status-explanation">${escapeHtml(state.meaning)}</p>
     ${options.notice ? `<p class="action-notice">${escapeHtml(options.notice)}</p>` : ''}
     <div class="action-summary">
       ${actions.length
@@ -107,17 +118,18 @@ function actionPanel(model, options) {
 export function renderTaskReviewView(model, options = {}) {
   const pageTitle = options.interactive ? 'Atlas Task Review' : 'Atlas Task Snapshot';
   return `<!doctype html>
-<html lang="en">
+<html lang="en" ${options.htmlAttributes ?? ''}>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${pageTitle}</title>
   <style>${uiStyles()}</style>
+  ${renderUiClientScript(Boolean(options.interactive))}
 </head>
 <body>
-  <div class="app-shell">
+  <div class="app-shell" style="${escapeHtml(options.railStyle ?? '')}">
     ${renderNav(options.interactive ? 'Tasks' : 'Snapshot', {
-    interactive: Boolean(options.interactive), workspaceHref: options.workspaceHref ?? '/',
+    interactive: Boolean(options.interactive), workspaceHref: options.workspaceHref ?? '/', settingsHref: options.settingsHref,
   })}
     <div class="workspace">
       <header class="topbar">

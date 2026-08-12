@@ -77,6 +77,10 @@ function normalizeTask(task) {
     write_mode: task.write_mode,
     write_status: task.write_status,
     started_at: task.started_at,
+    closed_at: task.closed_at ?? null,
+    rolled_back_at: task.rolled_back_at ?? null,
+    primary_source: task.primary_source ?? null,
+    selected_source_count: task.selected_source_count ?? 0,
     source_set_id: task.source_set_id ?? null,
     source_freshness: task.source_set_id
       ? { status: 'not_checked', reason_code: 'explicit_refresh_required' }
@@ -87,7 +91,7 @@ function normalizeTask(task) {
 function tasksForProject(registry, projectId) {
   const repository = registry.ledger?.tasks;
   const all = repository?.listForUiByProject
-    ? repository.listForUiByProject(projectId, { limit: 20 })
+    ? repository.listForUiByProject(projectId, { limit: 500 })
     : (repository?.listPendingByProject(projectId, { limit: 8 }) ?? []);
   return all.map(normalizeTask);
 }
@@ -102,6 +106,7 @@ function projectEntry(registry, activeRules, ruleHistory, project, location, rel
     task_status: pending.length ? `${pending[0].task_status} / ${pending[0].task_id}` : 'idle',
     pending_tasks: pending,
     tasks,
+    task_history_truncated: tasks.length >= 500,
     routes: rulesForProject(activeRules, project.id),
     rule_history: ruleHistorySummary(ruleHistory, project.id),
   };
@@ -145,7 +150,7 @@ export function buildContextModel({ currentPath, registry, rules, runtime = null
   }
   if (!projects.length && typeof registry.list === 'function' && typeof registry.show === 'function') {
     overview = true;
-    projects = registry.list().filter((project) => project.status !== 'merged').slice(0, 24).flatMap((project) => {
+    projects = registry.list().filter((project) => project.status === 'active').slice(0, 24).flatMap((project) => {
       const detail = registry.show(project.id);
       if (!detail.location?.root_path) return [];
       const projectRules = rules.active({ root: detail.location.root_path });
