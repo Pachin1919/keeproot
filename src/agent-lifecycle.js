@@ -61,7 +61,10 @@ export class AgentLifecycle {
       read: {
         selected_paths: (prepared.read?.selected ?? []).map((item) => item.path),
         excluded_count: prepared.read?.excluded?.length ?? 0,
-        estimated_tokens: prepared.read?.estimated_tokens ?? 0,
+        selected_text_bytes: prepared.read?.selected_text_bytes ?? 0,
+        selected_binary_bytes: prepared.read?.selected_binary_bytes ?? 0,
+        estimated_tokens: prepared.read?.estimated_tokens ?? null,
+        token_estimate_basis: prepared.read?.token_estimate_basis ?? 'unavailable_without_host_usage',
         requires_local_extraction: prepared.read?.requires_local_extraction ?? [],
       },
       write: prepared.write,

@@ -84,6 +84,39 @@ test('CLI returns structured cross-Project setup actions instead of a generic mi
   );
 });
 
+test('CLI releases an adopted Root only when no active Project depends on it', () => {
+  const caseRoot = path.join(tempRoot, 'project-context-cli-root-release');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  const stateDir = stateFor(caseRoot, 'project-context-cli-root-release');
+  const workspace = path.join(caseRoot, 'workspace');
+  fs.mkdirSync(path.join(workspace, 'Project'), { recursive: true });
+  const root = call(stateDir, [
+    'root', 'adopt', '--path', workspace,
+    '--type', 'project_workspace', '--content-policy', 'bounded_content',
+  ]);
+  const project = call(stateDir, ['project', 'create', '--name', 'Project', '--path', 'Project']);
+  call(stateDir, [
+    'project', 'attach-root', project.project_id, '--root', root.root_id,
+    '--reason', 'Bind the active Project.',
+  ]);
+
+  const blocked = callFailure(stateDir, [
+    'root', 'release', root.root_id, '--reason', 'Must remain governed while active.',
+  ]);
+  assert.match(blocked.message, /active Project/u);
+
+  call(stateDir, [
+    'project', 'evolve', project.project_id, '--status', 'archived',
+    '--reason', 'Archive the fixture Project.',
+  ]);
+  const released = call(stateDir, [
+    'root', 'release', root.root_id,
+    '--reason', 'Release the archived fixture Root and preserve history.',
+  ]);
+  assert.equal(released.status, 'released');
+  assert.equal(fs.existsSync(workspace), true);
+});
+
 test('CLI adopts Roots, persists a Context Link, and performs bounded local Catalog search', () => {
   const caseRoot = path.join(tempRoot, 'project-context-cli');
   fs.rmSync(caseRoot, { recursive: true, force: true });
@@ -154,8 +187,12 @@ test('CLI adopts Roots, persists a Context Link, and performs bounded local Cata
   ]);
   assert.equal(agentContext.status, 'ready');
   assert.equal(agentContext.project.id, targetProject.project_id);
-  assert.equal(agentContext.context_links[0].link_id, link.link_id);
-  assert.equal(agentContext.attention.request.project_id, targetProject.project_id);
+  assert.equal(agentContext.context_links[0].purpose, link.purpose);
+  assert.equal(Object.hasOwn(agentContext.context_links[0], 'link_id'), false);
+  assert.equal(Object.hasOwn(agentContext.attention, 'request'), false);
+  assert.equal(Object.hasOwn(agentContext.attention, 'eligible_rules'), false);
+  assert.equal(agentContext.attention.applied_rules.every((rule) => !Object.hasOwn(rule, 'rule_id')), true);
+  assert.equal(Object.hasOwn(agentContext, 'diagnostics'), false);
   assert.equal(agentContext.attention.status, 'advice_available');
 
   const generation = call(stateDir, [

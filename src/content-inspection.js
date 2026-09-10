@@ -2,14 +2,22 @@ import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { locateAnalyticsPython } from './analytics-evaluation.js';
 
+// Coordination boundary: Desktop UI and Execution Hosts call these same Node
+// application services. Node binds local resource identity and state; Python
+// performs deterministic content work. Neither port owns a separate parser.
+
 export const CONTENT_INSPECTION_SCHEMA = 'atlas.content-inspection.v1';
-export const CONTENT_PROCESSOR_VERSION = '0.3.0';
+export const CONTENT_PROCESSOR_VERSION = '0.3.4';
 export const CONTENT_RELATIONSHIP_SCHEMA = 'atlas.content-relationship.v1';
 export const CONTENT_RELATIONSHIP_PROCESSOR_VERSION = '0.2.0';
 export const CHAT_BRANCH_SET_SCHEMA = 'atlas.chat-branch-set.v1';
 export const CHAT_BRANCH_PROCESSOR_VERSION = '0.1.0';
+export const DATA_WORK_PROCESSOR_VERSION = '1.0.3';
+const CONTENT_COMPARISON_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.json', '.jsonl', '.csv', '.tsv', '.log']);
+const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function sha256File(filePath) {
   const digest = crypto.createHash('sha256');
@@ -59,33 +67,48 @@ function parseCached(cachePath, expectedHash, purpose, maxCharacters, sheet) {
   }
 }
 
-export function inspectContent({
-  stateDir: stateDirInput,
-  projectRoot,
-  installationRoot,
-  filePath: filePathInput,
-  purpose = 'content',
-  sheet = null,
-  maxCharacters = 4000,
-  pythonPath = null,
-  runProcess = spawnSync,
-} = {}) {
+function inspectionOptions({ purpose = 'content', sheet = null, maxCharacters = 4000 } = {}) {
   if (!['structure', 'content', 'data', 'visual'].includes(purpose)) {
     throw new Error('content inspect --purpose must be structure, content, data, or visual');
   }
   if (!Number.isInteger(maxCharacters) || maxCharacters < 500 || maxCharacters > 20_000) {
     throw new Error('content inspect --max-characters must be an integer from 500 to 20000');
   }
+  return { purpose, sheet: sheet || null, maxCharacters };
+}
+
+export function contentFilePath(filePathInput) {
   if (!filePathInput) throw new Error('content inspect requires --file <path>');
   const filePath = path.resolve(filePathInput);
-  if (!fs.existsSync(filePath)) throw new Error(`Content input does not exist: ${filePath}`);
+  if (!fs.existsSync(filePath)) {
+    const error = new Error(`Content input does not exist: ${filePath}`);
+    error.code = 'ATLAS_CONTENT_INPUT_MISSING';
+    throw error;
+  }
   assertNoLinkTraversal(filePath);
   const stat = fs.lstatSync(filePath);
   if (!stat.isFile() || stat.isSymbolicLink()) {
     throw new Error(`Content input must be a regular non-symbolic-link file: ${filePath}`);
   }
+  return filePath;
+}
 
-  const sourceHash = sha256File(filePath);
+export function contentFileFingerprint(filePathInput) {
+  const filePath = contentFilePath(filePathInput);
+  const stat = fs.lstatSync(filePath);
+  return {
+    file_path: filePath,
+    sha256: sha256File(filePath),
+    bytes: stat.size,
+    modified_ns: Math.round(stat.mtimeMs * 1_000_000),
+  };
+}
+
+export function contentComparisonSupported(filePathInput) {
+  return CONTENT_COMPARISON_EXTENSIONS.has(path.extname(String(filePathInput ?? '')).toLowerCase());
+}
+
+function inspectionCache({ stateDir, filePath, sourceHash, purpose, sheet, maxCharacters }) {
   const cacheKey = crypto.createHash('sha256').update(JSON.stringify({
     source_path: filePath,
     source_hash: sourceHash,
@@ -95,10 +118,145 @@ export function inspectContent({
     processor_version: CONTENT_PROCESSOR_VERSION,
   })).digest('hex');
   const inspectionId = `CIN-${cacheKey.slice(0, 24)}`;
-  const cacheDirectory = path.join(path.resolve(stateDirInput), 'tmp', 'content-inspections');
-  const cachePath = path.join(cacheDirectory, `${cacheKey}.json`);
+  const cacheDirectory = path.join(path.resolve(stateDir), 'tmp', 'content-inspections');
+  return {
+    inspectionId,
+    cachePath: path.join(cacheDirectory, `${cacheKey}.json`),
+  };
+}
+
+function writeInspectionCache(cachePath, inspection) {
+  fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+  const temporary = `${cachePath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(inspection, null, 2)}\n`, 'utf8');
+    fs.renameSync(temporary, cachePath);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+}
+
+export function readCachedContentInspection({
+  stateDir, filePath, purpose = 'content', sheet = null, maxCharacters = 4000, cacheReference = null,
+} = {}) {
+  const options = inspectionOptions({ purpose, sheet, maxCharacters });
+  const source = contentFileFingerprint(filePath);
+  const cache = inspectionCache({
+    stateDir,
+    filePath: source.file_path,
+    sourceHash: source.sha256,
+    ...options,
+  });
+  if (cacheReference) {
+    const referencedPath = path.resolve(path.resolve(stateDir), cacheReference);
+    if (referencedPath !== cache.cachePath) return null;
+  }
+  const cached = fs.existsSync(cache.cachePath)
+    ? parseCached(cache.cachePath, source.sha256, options.purpose, options.maxCharacters, options.sheet)
+    : null;
+  if (!cached) return null;
+  return {
+    ...cached,
+    inspection_id: cache.inspectionId,
+    cache_hit: true,
+    cache_path: cache.cachePath,
+  };
+}
+
+// Reuses one verified inspection when an Intake operation has created an identical
+// Project artifact.  This is deliberately a cache binding, not another result store.
+export function rebindCachedContentInspection({
+  stateDir,
+  sourceFilePath,
+  sourceCacheReference,
+  targetFilePath,
+  purpose = 'content',
+  sheet = null,
+  maxCharacters = 4000,
+} = {}) {
+  const options = inspectionOptions({ purpose, sheet, maxCharacters });
+  const source = contentFileFingerprint(sourceFilePath);
+  const target = contentFileFingerprint(targetFilePath);
+  if (target.sha256 !== source.sha256) {
+    const error = new Error('The saved Project file does not match the inspected local file.');
+    error.code = 'ATLAS_STATE_CONFLICT';
+    throw error;
+  }
+  const existing = readCachedContentInspection({
+    stateDir,
+    filePath: source.file_path,
+    purpose: options.purpose,
+    sheet: options.sheet,
+    maxCharacters: options.maxCharacters,
+    cacheReference: sourceCacheReference,
+  });
+  if (!existing) {
+    const error = new Error('The earlier local inspection result is unavailable and cannot be attached to the saved Project file.');
+    error.code = 'ATLAS_CONTENT_CACHE_UNAVAILABLE';
+    throw error;
+  }
+  const cache = inspectionCache({
+    stateDir,
+    filePath: target.file_path,
+    sourceHash: target.sha256,
+    ...options,
+  });
+  const cached = fs.existsSync(cache.cachePath)
+    ? parseCached(cache.cachePath, target.sha256, options.purpose, options.maxCharacters, options.sheet)
+    : null;
+  if (cached) {
+    return {
+      ...cached,
+      inspection_id: cache.inspectionId,
+      cache_hit: true,
+      cache_path: cache.cachePath,
+    };
+  }
+  const rebound = {
+    ...existing,
+    source: {
+      ...existing.source,
+      path: target.file_path,
+      name: path.basename(target.file_path),
+      extension: path.extname(target.file_path).toLowerCase(),
+      media_type: path.extname(target.file_path).toLowerCase() === String(existing.source?.extension ?? '').toLowerCase()
+        ? existing.source?.media_type ?? null
+        : null,
+      bytes: target.bytes,
+      sha256: target.sha256,
+      modified_ns: target.modified_ns,
+    },
+  };
+  writeInspectionCache(cache.cachePath, rebound);
+  return {
+    ...rebound,
+    inspection_id: cache.inspectionId,
+    cache_hit: true,
+    cache_path: cache.cachePath,
+  };
+}
+
+export function inspectContent({
+  stateDir: stateDirInput,
+  projectRoot = runtimeRoot,
+  installationRoot = process.env.ATLAS_HOME ? path.resolve(process.env.ATLAS_HOME) : runtimeRoot,
+  filePath: filePathInput,
+  purpose = 'content',
+  sheet = null,
+  maxCharacters = 4000,
+  pythonPath = null,
+  runProcess = spawnSync,
+} = {}) {
+  const options = inspectionOptions({ purpose, sheet, maxCharacters });
+  const source = contentFileFingerprint(filePathInput);
+  const filePath = source.file_path;
+  const sourceHash = source.sha256;
+  const { inspectionId, cachePath } = inspectionCache({
+    stateDir: stateDirInput, filePath, sourceHash, ...options,
+  });
+  const cacheDirectory = path.dirname(cachePath);
   const cached = fs.existsSync(cachePath)
-    ? parseCached(cachePath, sourceHash, purpose, maxCharacters, sheet)
+    ? parseCached(cachePath, sourceHash, options.purpose, options.maxCharacters, options.sheet)
     : null;
   if (cached) {
     return {
@@ -128,10 +286,10 @@ export function inspectContent({
     '--file',
     filePath,
     '--purpose',
-    purpose,
-    ...(sheet ? ['--sheet', sheet] : []),
+    options.purpose,
+    ...(options.sheet ? ['--sheet', options.sheet] : []),
     '--max-characters',
-    String(maxCharacters),
+    String(options.maxCharacters),
     '--expected-sha256',
     sourceHash,
   ], {
@@ -171,20 +329,71 @@ export function inspectContent({
     throw error;
   }
 
-  fs.mkdirSync(cacheDirectory, { recursive: true });
-  const temporary = `${cachePath}.tmp-${process.pid}-${crypto.randomUUID()}`;
-  try {
-    fs.writeFileSync(temporary, `${JSON.stringify(inspection, null, 2)}\n`, 'utf8');
-    fs.renameSync(temporary, cachePath);
-  } finally {
-    fs.rmSync(temporary, { force: true });
-  }
+  writeInspectionCache(cachePath, inspection);
   return {
     ...inspection,
     inspection_id: inspectionId,
     cache_hit: false,
     cache_path: cachePath,
   };
+}
+
+// Data Work uses the same optional local Python component as inspection.  Node only
+// carries the bounded session request; CSV/XLSX parsing and operations stay in Python.
+export function runDataWork({
+  projectRoot = runtimeRoot,
+  installationRoot = process.env.ATLAS_HOME ? path.resolve(process.env.ATLAS_HOME) : runtimeRoot,
+  filePath: filePathInput,
+  expectedSha256,
+  action,
+  sheet = null,
+  requestPath = null,
+  outputPath = null,
+  pythonPath = null,
+  runProcess = spawnSync,
+} = {}) {
+  const source = contentFileFingerprint(filePathInput);
+  if (expectedSha256 && source.sha256 !== expectedSha256) {
+    const error = new Error('The original file changed while this Data Work was open.');
+    error.code = 'ATLAS_STATE_CONFLICT';
+    throw error;
+  }
+  const executable = pythonPath ?? locateAnalyticsPython({ installationRoot });
+  if (!executable) {
+    const error = new Error('Atlas Data Work requires the installed local Python component.');
+    error.code = 'ATLAS_CAPABILITY_UNAVAILABLE';
+    throw error;
+  }
+  const pythonSourceRoot = path.join(projectRoot, 'python', 'src');
+  if (!fs.existsSync(path.join(pythonSourceRoot, 'atlas_content', '__main__.py'))) {
+    throw new Error('Atlas local content Python source is missing from the Runtime.');
+  }
+  const result = runProcess(executable, [
+    '-m', 'atlas_content', 'data-work', '--file', source.file_path,
+    '--expected-sha256', source.sha256, '--action', action,
+    ...(sheet ? ['--sheet', sheet] : []),
+    ...(requestPath ? ['--request', requestPath] : []),
+    ...(outputPath ? ['--output', outputPath] : []),
+  ], {
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      PYTHONPATH: [pythonSourceRoot, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+      PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8',
+    }, encoding: 'utf8', windowsHide: true, timeout: 90_000, maxBuffer: 4 * 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`Atlas Data Work failed: ${result.error?.message ?? result.stderr?.trim() ?? `exit ${result.status}`}`);
+  }
+  let parsed;
+  try { parsed = JSON.parse(result.stdout.trim()); } catch (error) { throw new Error(`Atlas Data Work returned invalid JSON: ${error.message}`); }
+  if (parsed.processor?.version !== DATA_WORK_PROCESSOR_VERSION || parsed.source?.sha256 !== source.sha256) {
+    throw new Error('Atlas Data Work returned an incompatible local result.');
+  }
+  if (contentFileFingerprint(source.file_path).sha256 !== source.sha256) {
+    const error = new Error('The original file changed while Atlas was preparing this result.'); error.code = 'ATLAS_STATE_CONFLICT'; throw error;
+  }
+  return parsed;
 }
 
 function relationshipInput(filePathInput, label) {

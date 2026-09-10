@@ -226,7 +226,7 @@ function publicContract(taskId, contract) {
   return { task_id: taskId, ...contract };
 }
 
-function estimateModelVisibleTokens(selected) {
+function summarizeSelectedPayload(selected) {
   let textBytes = 0;
   let binaryBytes = 0;
   const requiresLocalExtraction = [];
@@ -241,8 +241,15 @@ function estimateModelVisibleTokens(selected) {
   return {
     selected_text_bytes: textBytes,
     selected_binary_bytes: binaryBytes,
-    estimated_tokens: Math.ceil(textBytes / 4),
-    token_estimate_basis: 'direct_text_bytes_only',
+    estimated_tokens: null,
+    token_estimate_basis: 'unavailable_without_host_usage',
+    direct_text_payload_estimate: {
+      bytes: textBytes,
+      approximate_tokens: Math.ceil(textBytes / 4),
+      basis: 'rough_utf8_bytes_divided_by_four',
+      excludes_binary_extraction: true,
+      is_host_usage: false,
+    },
     requires_local_extraction: requiresLocalExtraction,
   };
 }
@@ -1019,7 +1026,7 @@ export class TaskContract {
     request.output.target = target.path;
     const temporal = buildTemporalRelations(inputs);
     const readSet = chooseReadSet(inputs, temporal.excluded, request.budget);
-    const tokenEstimate = estimateModelVisibleTokens(readSet.selected);
+    const tokenEstimate = summarizeSelectedPayload(readSet.selected);
     const attention = this.rules.context({
       root,
       request: {

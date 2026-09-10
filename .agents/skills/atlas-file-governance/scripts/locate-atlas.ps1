@@ -23,12 +23,14 @@ try {
     exit 3
   }
   $cli = Join-Path $manifest.runtime_path 'bin\atlas.js'
-  if (-not (Test-Path -LiteralPath $manifest.node_path -PathType Leaf) -or -not (Test-Path -LiteralPath $cli -PathType Leaf)) {
+  $launcher = Join-Path $InstallRoot 'atlas.cmd'
+  if (-not (Test-Path -LiteralPath $manifest.node_path -PathType Leaf) -or -not (Test-Path -LiteralPath $cli -PathType Leaf) -or -not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
     throw 'Atlas Runtime files are incomplete.'
   }
   @{
     status = 'ready'
     install_root = $InstallRoot
+    launcher_path = $launcher
     node_path = $manifest.node_path
     node_args = @($manifest.node_args)
     cli_path = $cli

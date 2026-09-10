@@ -492,6 +492,7 @@ export class PreferenceRules {
       default_advice: defaultAdvice,
       conflicts,
     };
+    const modelPayloadBytes = Buffer.byteLength(json(modelPayload), 'utf8');
     return {
       schema: 'atlas-effective-rule-context.v1',
       status,
@@ -507,7 +508,11 @@ export class PreferenceRules {
         eligible_rules_considered: compactEligibleRules.length,
         active_rules_returned: compactRules.length,
         maximum_active_rules: 12,
-        estimated_tokens: Math.ceil(Buffer.byteLength(json(modelPayload), 'utf8') / 4),
+        estimated_tokens: null,
+        token_estimate_basis: 'unavailable_without_host_usage',
+        model_payload_bytes: modelPayloadBytes,
+        approximate_payload_tokens: Math.ceil(modelPayloadBytes / 4),
+        approximate_payload_basis: 'rough_utf8_bytes_divided_by_four_not_host_usage',
         visual_default_images: 0,
         visual_maximum_images: 8,
         visual_maximum_resolution: '768x432',

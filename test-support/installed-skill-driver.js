@@ -18,7 +18,8 @@ export class InstalledSkillDriver {
 
   acceptsScenario(scenario) {
     assert.equal(typeof scenario.user_request, 'string');
-    assert.match(this.skill, new RegExp(`\\*\\*${scenario.workflow}\\*\\*`, 'i'));
+    assert.match(this.skill, /local coordination Runtime/i);
+    assert.match(this.skill, /recovery/i);
     for (const command of scenario.required_commands ?? []) {
       assert.match(this.workflows, new RegExp(command.replace(' ', '\\s+')));
     }

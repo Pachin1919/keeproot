@@ -15,7 +15,15 @@ import {
 import { Bootstrap } from '../src/bootstrap.js';
 import { BrowserCapture } from '../src/browser-capture.js';
 import { Catalog } from '../src/catalog.js';
-import { compareContent, compareContentBranches, inspectContent } from '../src/content-inspection.js';
+import {
+  compareContent,
+  compareContentBranches,
+  contentFileFingerprint,
+  inspectContent,
+} from '../src/content-inspection.js';
+import { prepareDataWorkspace } from '../src/data-workspace.js';
+import { compactContextPackReceipt, prepareContextPack } from '../src/context-pack.js';
+import { localizeConversationSelection } from '../src/conversation-localization.js';
 import { exportAnalytics } from '../src/analytics-export.js';
 import { Derived } from '../src/derived.js';
 import { Evolution } from '../src/evolution.js';
@@ -50,6 +58,15 @@ import {
 } from '../src/protocol.js';
 import { RollbackConflictError, Tracker } from '../src/tracker.js';
 import { ledgerFileHash, listLedgerBackups, restoreLedgerBackup } from '../src/ledger-maintenance.js';
+import {
+  inspectionResultSummary,
+  recordInspectionWork,
+} from '../src/work-coordination.js';
+import {
+  beginCurrentActivity,
+  failCurrentActivity,
+  finishCurrentActivity,
+} from '../src/ui/current-activity.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const stateDirInput = process.env.ATLAS_STATE_DIR
@@ -61,6 +78,19 @@ const installationRoot = process.env.ATLAS_HOME
   : projectRoot;
 let outputJson = false;
 let activeCommand = null;
+
+function isUnboundInstalledRuntime() {
+  if (process.env.ATLAS_STATE_DIR) return false;
+  const manifestPath = path.join(path.dirname(projectRoot), 'atlas-install.json');
+  if (!fs.existsSync(manifestPath)) return false;
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    return manifest.install_format === 'atlas-runtime-install.v1'
+      && path.resolve(manifest.runtime_path ?? '') === projectRoot;
+  } catch {
+    return false;
+  }
+}
 
 function emit(command, data, printHuman) {
   activeCommand = command;
@@ -115,8 +145,18 @@ Usage:
   atlas content inspect --file <path> [--purpose <structure|content|data|visual>]
                         [--sheet <xlsx_sheet_name>]
                         [--max-characters <500..20000>]
+                        [--project <project_id>]
+                        [--compact]
+                        [--actor <actor>] [--agent <name>] [--model <name>]
+                        [--tool <name>] [--client-run-id <id>]
+  atlas content prepare-data --file <csv|tsv|xlsx> [--sheet <xlsx_sheet_name>]
+  atlas content prepare-context --file <csv|tsv|xlsx> [--sheet <name>] --purpose <text> --include-column <exact_name> [...]
   atlas content compare --left <path> --right <path>
   atlas content branches --file <jsonl_path> --file <jsonl_path> [--file <jsonl_path> ...]
+  atlas content localize-conversation --input <selection.json> --project <project_id>
+                                      --output-relative <new_file.md>
+                                      --actor <actor> --agent <name> --model <name>
+                                      --tool <name> --client-run-id <id>
   atlas work stage --file <path> --kind <candidate|proposal|intermediate> [--ttl-hours <number>]
   atlas work status [work_id] | release <work_id> [--reason <text>]
   atlas bootstrap profiles
@@ -141,6 +181,7 @@ Usage:
                    --content-policy <structure_only|bounded_content>
   atlas root list | show <root_id>
   atlas root relocate <root_id> --path <new_path> --reason <text>
+  atlas root release <root_id> --reason <text>
   atlas project resolve --path <current_directory>
   atlas agent start --path <current_directory> --request-file <task_json> [agent options]
   atlas agent status --path <current_directory>
@@ -729,6 +770,19 @@ function handleRoot(registry, args) {
     ));
     return;
   }
+  if (action === 'release') {
+    const rootId = rest[0];
+    if (!rootId || rootId.startsWith('--')) throw new Error('root release requires a root_id');
+    let reason = null;
+    for (let index = 1; index < rest.length; index += 1) {
+      if (rest[index] === '--reason') reason = rest[++index];
+      else throw new Error(`Unknown root release argument: ${rest[index]}`);
+    }
+    if (!reason?.trim()) throw new Error('root release requires --reason');
+    const receipt = registry.releaseRoot(rootId, { reason });
+    emit('root.release', receipt, () => console.log(`Released Workspace Root ${receipt.root_id}.`));
+    return;
+  }
   throw new Error(`Unknown root action: ${action ?? '(missing)'}`);
 }
 
@@ -1014,15 +1068,38 @@ function handleAgent(registry, rules, lifecycle, args) {
       root: resolution.root.current_path,
       request: effectiveRequest,
     });
+    const compactRule = (rule) => ({
+      kind: rule.kind,
+      value: rule.value,
+      summary: rule.summary ?? null,
+    });
+    const compactLinks = resolution.context_links.map((link) => ({
+      purpose: link.purpose,
+      source_project_id: link.source_project_id,
+      filters: link.filters,
+    }));
     emit('agent.context', {
       schema: 'atlas-agent-context.v1',
       status: attention.status === 'conflict' ? 'conflict' : 'ready',
-      input_path: resolution.input_path,
-      root: resolution.root,
-      project: resolution.project,
-      location: resolution.location,
-      context_links: resolution.context_links,
-      attention,
+      project: { id: resolution.project.id, name: resolution.project.name },
+      root: { id: resolution.root.id, path: resolution.root.current_path },
+      location: { path: resolution.location.relative_path },
+      context_links: compactLinks,
+      attention: {
+        status: attention.status,
+        applied_rules: attention.applied_rules.map(compactRule),
+        gaps: attention.gaps,
+        default_advice: attention.default_advice,
+        conflicts: attention.conflicts.map((conflict) => ({
+          kind: conflict.kind,
+          reason: conflict.reason,
+        })),
+        estimated_tokens: attention.attention_budget.estimated_tokens,
+      },
+      counts: {
+        eligible_rules: attention.eligible_rules.length,
+        applied_rules: attention.applied_rules.length,
+      },
       source_changes: [],
     }, (data) => console.log(JSON.stringify(data, null, 2)));
     return;
@@ -2164,15 +2241,25 @@ function parseContent(args) {
       purpose: 'content',
       sheet: null,
       maxCharacters: 4000,
+      callerProvided: false,
+      compact: false,
     };
     for (let index = 0; index < rest.length; index += 1) {
       if (rest[index] === '--file') options.filePath = rest[++index];
       else if (rest[index] === '--purpose') options.purpose = rest[++index];
       else if (rest[index] === '--sheet') options.sheet = rest[++index];
       else if (rest[index] === '--max-characters') options.maxCharacters = Number(rest[++index]);
-      else throw new Error(`Unknown content inspect argument: ${rest[index]}`);
+      else if (rest[index] === '--project') options.projectId = rest[++index];
+      else if (rest[index] === '--compact') options.compact = true;
+      else {
+        const callerIndex = parseCallerFlag(options, rest, index);
+        if (callerIndex == null) throw new Error(`Unknown content inspect argument: ${rest[index]}`);
+        options.callerProvided = true;
+        index = callerIndex;
+      }
     }
     if (!options.filePath) throw new Error('content inspect requires --file <path>');
+    options.caller = callerFromOptions(options);
     return options;
   }
   if (action === 'compare') {
@@ -2187,6 +2274,32 @@ function parseContent(args) {
     }
     return options;
   }
+  if (action === 'prepare-data') {
+    const options = { action, sheet: null };
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--file') options.filePath = rest[++index];
+      else if (rest[index] === '--sheet') options.sheet = rest[++index];
+      else throw new Error(`Unknown content prepare-data argument: ${rest[index]}`);
+    }
+    if (!options.filePath) throw new Error('content prepare-data requires --file <path>');
+    return options;
+  }
+  if (action === 'prepare-context') {
+    const options = { action, sheet: null, includeColumns: [] };
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--file') options.filePath = rest[++index];
+      else if (rest[index] === '--sheet') options.sheet = rest[++index];
+      else if (rest[index] === '--purpose') options.purpose = rest[++index];
+      else if (rest[index] === '--include-column') options.includeColumns.push(rest[++index]);
+      else throw new Error(`Unknown content prepare-context argument: ${rest[index]}`);
+    }
+    if (!options.filePath || !options.purpose || !options.includeColumns.length) {
+      throw new Error(
+        'content prepare-context requires --file, --purpose, and one or more --include-column values',
+      );
+    }
+    return options;
+  }
   if (action === 'branches') {
     const options = { action, filePaths: [] };
     for (let index = 0; index < rest.length; index += 1) {
@@ -2198,7 +2311,107 @@ function parseContent(args) {
     }
     return options;
   }
+  if (action === 'localize-conversation') {
+    const options = { action, callerProvided: false };
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--input') options.inputPath = rest[++index];
+      else if (rest[index] === '--project') options.projectId = rest[++index];
+      else if (rest[index] === '--output-relative') options.outputRelative = rest[++index];
+      else {
+        const callerIndex = parseCallerFlag(options, rest, index);
+        if (callerIndex == null) throw new Error(`Unknown content localize-conversation argument: ${rest[index]}`);
+        options.callerProvided = true;
+        index = callerIndex;
+      }
+    }
+    if (!options.inputPath || !options.projectId || !options.outputRelative || !options.callerProvided) {
+      throw new Error('content localize-conversation requires --input, --project, --output-relative, and caller metadata');
+    }
+    options.caller = callerFromOptions(options);
+    return options;
+  }
   throw new Error(`Unknown content action: ${action ?? '(missing)'}`);
+}
+
+function activeProjectLocation(projectId) {
+  const registry = new Registry({ stateDir });
+  try {
+    const project = registry.list().find((item) => item.id === projectId && item.status === 'active');
+    if (!project) throw new Error('The command requires one active Project id.');
+    const location = registry.show(project.id).location;
+    if (!location?.root_path || location.relative_path == null) {
+      throw new Error('The selected Project does not have an available local location.');
+    }
+    const root = path.resolve(location.root_path, ...location.relative_path.split('/').filter(Boolean));
+    return { project: { id: project.id, name: project.name }, root };
+  } finally {
+    registry.dispose();
+  }
+}
+
+function projectForHostInspection(projectId, filePath) {
+  if (!projectId) return null;
+  const location = activeProjectLocation(projectId);
+  if (!isPathInside(location.root, path.resolve(filePath))) {
+    throw new Error('The inspected file must remain inside the selected Project.');
+  }
+  return location.project;
+}
+
+function compactDataWorkspaceReceipt(result) {
+  return {
+    schema: result.schema,
+    status: result.status,
+    workspace_id: result.workspace_id,
+    cache_hit: result.cache_hit,
+    source: {
+      name: result.source?.name,
+      path: result.source?.path,
+    },
+    selection: result.selection,
+    summary: result.summary,
+    review_path: result.files?.review?.path ?? null,
+    normalized_path: result.files?.normalized?.path ?? null,
+    model_visible_body_bytes: result.attention?.model_visible_body_bytes ?? null,
+    elapsed_ms: result.elapsed_ms,
+    limitations: result.limitations,
+  };
+}
+
+function compactContentInspection(result) {
+  const extraction = result.extraction ?? {};
+  const columns = Array.isArray(extraction.columns) ? extraction.columns : [];
+  const typeCounts = {};
+  for (const column of columns) {
+    const type = column.inferred_type ?? column.kind ?? column.type ?? 'Unknown';
+    typeCounts[type] = (typeCounts[type] ?? 0) + 1;
+  }
+  const limitations = extraction.limits ?? result.limitations ?? null;
+  return {
+    schema: result.schema,
+    compact: true,
+    inspection_id: result.inspection_id,
+    cache_hit: result.cache_hit === true,
+    source: {
+      name: result.source?.name,
+      path: result.source?.path,
+      extension: result.source?.extension,
+      bytes: result.source?.bytes,
+      sha256: result.source?.sha256,
+    },
+    processor: result.processor ? { name: result.processor.name, version: result.processor.version } : null,
+    summary: {
+      ...inspectionResultSummary(result),
+      kind: extraction.kind ?? null,
+      duplicate_rows: Number.isFinite(extraction.duplicate_row_count) ? extraction.duplicate_row_count : null,
+      type_counts: typeCounts,
+    },
+    quality_warnings: Array.isArray(extraction.quality_warnings) ? extraction.quality_warnings : [],
+    limitations,
+    model_visible_body_bytes: 0,
+    coordination: result.coordination,
+    next_action: result.next_action ?? null,
+  };
 }
 
 function optionalPythonCapability() {
@@ -2220,6 +2433,11 @@ async function main() {
   outputJson = rawArgs.includes('--json');
   const [command, ...args] = rawArgs.filter((item) => item !== '--json');
   activeCommand = command ?? 'help';
+  if (isUnboundInstalledRuntime()) {
+    const error = new Error('This installed Atlas Runtime must be started through atlas.cmd so it uses the installed state.');
+    error.code = 'ATLAS_RUNTIME_ENTRYPOINT_REQUIRED';
+    throw error;
+  }
   if (!command || command === '--help' || command === '-h') {
     emit('help', { usage: usage() }, ({ usage: helpText }) => console.log(helpText));
     return;
@@ -2247,11 +2465,87 @@ async function main() {
   if (command === 'content') {
     const options = parseContent(args);
     if (options.action === 'inspect') {
-      const result = inspectContent({ stateDir, projectRoot, installationRoot, ...options });
-      emit('content.inspect', result, (detail) => {
+      const project = options.callerProvided
+        ? projectForHostInspection(options.projectId, options.filePath)
+        : null;
+      const activity = options.callerProvided
+        ? beginCurrentActivity({
+          stateDir,
+          filePath: options.filePath,
+          purpose: options.purpose,
+          caller: options.caller,
+          project,
+        })
+        : null;
+      try {
+        const inspection = inspectContent({ stateDir, projectRoot, installationRoot, ...options });
+        let coordination = {
+          saving_point_recorded: false,
+          reason: 'Caller metadata was not supplied.',
+        };
+        if (options.callerProvided) {
+          const sourceFingerprint = contentFileFingerprint(options.filePath);
+          if (sourceFingerprint.sha256 !== inspection.source?.sha256) {
+            const error = new Error('The file changed while Atlas was inspecting it. Inspect the current file again.');
+            error.code = 'ATLAS_STATE_CONFLICT';
+            throw error;
+          }
+          const work = recordInspectionWork({
+            stateDir,
+            filePath: options.filePath,
+            inspect: options,
+            inspection,
+            sourceFingerprint,
+            project,
+            caller: options.caller,
+            channel: 'host',
+          });
+          coordination = {
+            saving_point_recorded: true,
+            work_id: work.work_id,
+            initiated_by: work.initiated_by,
+            project: work.project,
+            activity_visible_in_desktop: true,
+            result_source: inspection.cache_hit ? 'existing_cache' : 'local_processing',
+          };
+        }
+        if (activity) finishCurrentActivity(stateDir, activity.activity_id);
+        const fullResult = { ...inspection, coordination };
+        const result = options.compact ? compactContentInspection(fullResult) : fullResult;
+        emit('content.inspect', result, (detail) => {
+          if (detail.compact) {
+            console.log(`Inspected ${detail.source.name} locally; ${detail.summary.label}.`);
+          } else {
+            console.log(
+              `Inspected ${detail.source.name} locally with ${detail.processor.name}; `
+              + `${detail.attention.screenshots_used} screenshot(s).`,
+            );
+          }
+        });
+      } catch (error) {
+        if (activity) {
+          try {
+            failCurrentActivity({ stateDir, activityId: activity.activity_id, error });
+          } catch {
+            // Preserve the actual inspection error when activity state also cannot be updated.
+          }
+        }
+        throw error;
+      }
+    } else if (options.action === 'prepare-data') {
+      const result = prepareDataWorkspace({ stateDir, projectRoot, installationRoot, ...options });
+      emit('content.prepare-data', compactDataWorkspaceReceipt(result), (detail) => {
         console.log(
-          `Inspected ${detail.source.name} locally with ${detail.processor.name}; `
-          + `${detail.attention.screenshots_used} screenshot(s).`,
+          `Prepared ${detail.summary.rows} local row(s); quality ${detail.summary.quality}; `
+          + `review: ${detail.review_path}`,
+        );
+      });
+    } else if (options.action === 'prepare-context') {
+      const result = prepareContextPack({ stateDir, projectRoot, installationRoot, ...options });
+      emit('content.prepare-context', compactContextPackReceipt(result), (detail) => {
+        console.log(
+          `Prepared Context Pack ${detail.context_pack_id}; ${detail.selection.included_columns.length} field(s); `
+          + `review: ${detail.review_path}`,
         );
       });
     } else if (options.action === 'compare') {
@@ -2259,13 +2553,28 @@ async function main() {
       emit('content.compare', result, (detail) => {
         console.log(`Compared content locally: ${detail.relation.type} (${detail.relation.basis}).`);
       });
-    } else {
+    } else if (options.action === 'branches') {
       const result = compareContentBranches({ stateDir, projectRoot, installationRoot, ...options });
       emit('content.branches', result, (detail) => {
         console.log(
           `Built ${detail.segments.length} local chat segment(s); `
           + `${detail.evidence.duplicate_records_avoided} duplicate record read(s) avoided.`,
         );
+      });
+    } else {
+      const location = activeProjectLocation(options.projectId);
+      const outputPath = path.resolve(location.root, ...String(options.outputRelative).split(/[\\/]/u).filter(Boolean));
+      const result = localizeConversationSelection({
+        inputPath: options.inputPath,
+        outputPath,
+        projectRoot: location.root,
+      });
+      emit('content.localize-conversation', {
+        ...result,
+        project: location.project,
+        caller: options.caller,
+      }, (detail) => {
+        console.log(`Localized ${detail.decision_count} selected conversation decision(s) to ${detail.output.path}.`);
       });
     }
     return;
@@ -2406,30 +2715,35 @@ async function main() {
     } else if (command === 'ui') {
       if (!args[0] || args[0].startsWith('--')) {
         const options = {
-          currentPath: process.cwd(), taskId: null, port: 0, mode: 'desktop', refreshSources: false,
+          currentPath: null, taskId: null, contextPackId: null, port: 0, mode: 'desktop', refreshSources: false,
         };
         for (let index = 0; index < args.length; index += 1) {
           if (args[index] === '--path') options.currentPath = args[++index];
           else if (args[index] === '--task') options.taskId = args[++index];
+          else if (args[index] === '--context') options.contextPackId = args[++index];
           else if (args[index] === '--port') options.port = Number(args[++index]);
           else if (args[index] === '--no-open') options.mode = 'host_only';
           else if (args[index] === '--browser') options.mode = 'browser_debug';
           else if (args[index] === '--refresh-sources') options.refreshSources = true;
           else throw new Error(`Unknown ui argument: ${args[index]}`);
         }
-        if (!options.currentPath || !Number.isInteger(options.port) || options.port < 0 || options.port > 65535) {
-          throw new Error('ui accepts an optional --path, --task, --port, --no-open, --browser, and --refresh-sources.');
+        if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535) {
+          throw new Error('ui accepts an optional --path, --task, --context, --port, --no-open, --browser, and --refresh-sources.');
         }
         const diagnostics = tracker.ledger.diagnostics();
         const session = await startAtlasUiServer({
           stateDir,
           currentPath: options.currentPath,
           initialTaskId: options.taskId,
+          initialContextPackId: options.contextPackId,
           registry,
           rules,
           runtime: {
             atlas_version: ATLAS_VERSION,
             node_version: process.versions.node,
+            runtime_root: projectRoot,
+            state_dir: stateDir,
+            installation_root: installationRoot,
             ledger: {
               integrity: diagnostics.integrity,
               schema_version: diagnostics.schema_version,
@@ -2440,9 +2754,13 @@ async function main() {
           task,
           guarded,
           derived,
+          intake,
           lifecycle: agentLifecycle,
+          projectRoot,
+          installationRoot,
           port: options.port,
           refreshSources: options.refreshSources,
+          desktopPickerEnabled: options.mode === 'desktop',
         });
         let surface = { status: 'not_requested', mode: options.mode };
         let desktop = null;
@@ -2452,6 +2770,8 @@ async function main() {
               url: session.url,
               installationRoot,
               runtimeRoot: projectRoot,
+              pickerRegistrationUrl: session.desktop_picker?.registration_url,
+              pickerToken: session.desktop_picker?.token,
             });
             surface = {
               status: desktop.status,

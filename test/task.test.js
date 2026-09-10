@@ -144,7 +144,7 @@ test('Task Contract accepts explicit inputs and bounded Project discovery withou
   assert.equal(discoveredTask.read.selected.length, 1);
 });
 
-test('Task Contract estimates only directly readable text and flags binary inputs for local extraction', (t) => {
+test('Task Contract reports payload bytes without presenting a byte heuristic as host Token usage', (t) => {
   const { root, stateDir, projectId } = setupWithoutLibraryContract('task-binary-token-estimate');
   write(root, 'Notes/context.md', 'short text context\n');
   const binaryPath = path.join(root, 'Notes', 'deck.pptx');
@@ -174,9 +174,16 @@ test('Task Contract estimates only directly readable text and flags binary input
   assert.equal(prepared.status, 'ready');
   assert.equal(prepared.read.selected_binary_bytes, 16 * 1024);
   assert.equal(prepared.read.selected_text_bytes, Buffer.byteLength('short text context\n'));
-  assert.equal(prepared.read.estimated_tokens, Math.ceil(Buffer.byteLength('short text context\n') / 4));
+  assert.equal(prepared.read.estimated_tokens, null);
   assert.deepEqual(prepared.read.requires_local_extraction, ['Notes/deck.pptx']);
-  assert.equal(prepared.read.token_estimate_basis, 'direct_text_bytes_only');
+  assert.equal(prepared.read.token_estimate_basis, 'unavailable_without_host_usage');
+  assert.deepEqual(prepared.read.direct_text_payload_estimate, {
+    bytes: Buffer.byteLength('short text context\n'),
+    approximate_tokens: Math.ceil(Buffer.byteLength('short text context\n') / 4),
+    basis: 'rough_utf8_bytes_divided_by_four',
+    excludes_binary_extraction: true,
+    is_host_usage: false,
+  });
 });
 
 test('Task Contract selects a verified newer snapshot, fulfills once, records lineage, and rolls back', (t) => {

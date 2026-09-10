@@ -35,7 +35,12 @@ test('user-level locator handshakes with an installed runtime outside any target
       path.join(skillRoot, 'scripts', 'locate-atlas.ps1'), '-InstallRoot', installRoot,
     ], { encoding: 'utf8', windowsHide: true, timeout: 10_000 });
     assert.equal(located.status, 0, located.stderr || located.stdout);
-    assert.equal(JSON.parse(located.stdout).status, 'ready');
+    const location = JSON.parse(located.stdout);
+    assert.equal(location.status, 'ready');
+    assert.equal(location.launcher_path, path.join(installRoot, 'atlas.cmd'));
+    const launcher = fs.readFileSync(location.launcher_path, 'utf8');
+    assert.match(launcher, /ATLAS_HOME=/u);
+    assert.match(launcher, /ATLAS_STATE_DIR=/u);
   }
 });
 
@@ -74,4 +79,25 @@ test('locator returns runtime_required and fails closed on old protocol, non-JSO
     invoke: () => ({ status: null, signal: 'SIGTERM', stdout: '', stderr: '', error: { code: 'ETIMEDOUT' } }),
   });
   assert.equal(timeout.status, 'timeout');
+});
+
+test('an installed runtime refuses direct Node startup without the installed state binding', () => {
+  const root = setup('runtime-direct-node-refused');
+  const installRoot = path.join(root, 'Atlas Runtime');
+  const skillRoot = path.join(root, '.codex', 'skills', 'atlas-file-governance');
+  installRuntime({ sourceRoot: projectRoot, installRoot, skillRoot, nodePath: process.execPath });
+
+  const direct = spawnSync(process.execPath, [
+    path.join(installRoot, 'runtime', 'bin', 'atlas.js'), 'version', '--json',
+  ], {
+    encoding: 'utf8',
+    windowsHide: true,
+    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !['ATLAS_HOME', 'ATLAS_STATE_DIR'].includes(key))),
+  });
+
+  assert.equal(direct.status, 1, direct.stderr || direct.stdout);
+  const envelope = JSON.parse(direct.stdout);
+  assert.equal(envelope.ok, false);
+  assert.equal(envelope.error.code, 'ATLAS_RUNTIME_ENTRYPOINT_REQUIRED');
+  assert.equal(fs.existsSync(path.join(installRoot, 'runtime', '.atlas')), false);
 });

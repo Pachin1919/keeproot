@@ -83,6 +83,49 @@ test('Registry adopts real roots and binds each Project to one active location',
   assert.equal(registry.showRoot(vault.root_id).root.content_policy, 'bounded_content');
 });
 
+test('Registry releases an adopted root only after all attached Projects stop being active', (t) => {
+  const { stateDir, vaultRoot } = setup('project-context-root-release');
+  const registry = new Registry({ stateDir });
+  t.after(() => registry.dispose());
+
+  const root = registry.adoptRoot({
+    rootPath: vaultRoot,
+    rootType: 'project_workspace',
+    contentPolicy: 'bounded_content',
+  });
+  const project = registry.create({ name: 'Career', currentPath: 'Career' });
+  registry.attachRoot(project.project_id, {
+    rootId: root.root_id,
+    reason: 'Bind the active Project.',
+  });
+
+  assert.throws(
+    () => registry.releaseRoot(root.root_id, { reason: 'This must not detach an active Project.' }),
+    /active Project/u,
+  );
+
+  registry.evolve(project.project_id, {
+    status: 'archived',
+    reason: 'The fixture Project is no longer active.',
+  });
+  const receipt = registry.releaseRoot(root.root_id, {
+    reason: 'Release the archived fixture Root while preserving Registry history.',
+  });
+
+  assert.equal(receipt.status, 'released');
+  assert.equal(registry.listRoots().length, 0);
+  assert.equal(registry.showRoot(root.root_id).root.governance_status, 'released');
+  assert.equal(fs.existsSync(vaultRoot), true);
+
+  const adoptedAgain = registry.adoptRoot({
+    rootPath: vaultRoot,
+    rootType: 'project_workspace',
+    contentPolicy: 'bounded_content',
+  });
+  assert.equal(adoptedAgain.root_id, root.root_id);
+  assert.equal(registry.showRoot(root.root_id).root.status, 'active');
+});
+
 test('Registry persists one reusable context link and keeps superseded versions', (t) => {
   const { stateDir, vaultRoot, websiteRoot } = setup('project-context-link');
   const registry = new Registry({ stateDir });

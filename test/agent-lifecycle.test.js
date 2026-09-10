@@ -287,7 +287,7 @@ test('Local Task Review completes approve, execute, and rollback through one loo
   assert.equal(fs.readFileSync(fixture.target, 'utf8'), fixture.baseline);
 });
 
-test('Atlas UI opens one Workspace and completes a Task without a manually entered Task ID', async (t) => {
+test('Atlas UI opens Project Resources from an explicit Project path and keeps legacy Task actions separate', async (t) => {
   const fixture = setup('ui-workspace-loopback');
   call(fixture.stateDir, [
     'agent', 'prepare', fixture.taskId,
@@ -295,7 +295,7 @@ test('Atlas UI opens one Workspace and completes a Task without a manually enter
     '--reason', 'Stage the Candidate shown in the Atlas Workspace.',
   ]);
   const child = spawn(process.execPath, [
-    cliPath, 'ui', '--path', fixture.caseRoot, '--no-open',
+    cliPath, 'ui', '--path', fixture.projectDir, '--no-open',
   ], {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
@@ -307,20 +307,12 @@ test('Atlas UI opens one Workspace and completes a Task without a manually enter
   const url = await waitForAtlasUiUrl(child);
 
   const workspace = await (await fetch(url)).text();
-  assert.match(workspace, /Project Studio/u);
-  assert.match(workspace, /Decision inbox/u);
-  assert.match(workspace, /Active tasks/u);
-  assert.match(workspace, new RegExp(`href="/tasks/${fixture.taskId}"`, 'u'));
-  assert.match(workspace, /href="\/tasks\?status=action_required"/u);
-  assert.match(workspace, /Status guide/u);
-  assert.match(workspace, /How to read Atlas states/u);
-  assert.match(workspace, /Waiting for you/u);
-  assert.match(workspace, /data-rail="project"/u);
+  assert.match(workspace, /<h1>Resources<\/h1>/u);
+  assert.match(workspace, /data-folder-navigator/u);
+  assert.match(workspace, /data-resource-file-list/u);
+  assert.match(workspace, /data-resource-inspector/u);
+  assert.doesNotMatch(workspace, /<h1>Project Studio<\/h1>|<h2>Decision inbox<\/h2>|Ledger schema v\d+|<span>Active tasks<\/span>/u);
   assert.match(workspace, /src="\/ui\.js"/u);
-  assert.match(workspace, /Ledger health/u);
-  assert.match(workspace, /Python tools/u);
-  assert.match(workspace, /Ledger schema v\d+/u);
-  assert.match(workspace, /Atlas state is stored locally/u);
 
   const uiClient = await fetch(`${url}ui.js`);
   assert.equal(uiClient.status, 200);
@@ -350,7 +342,7 @@ test('Atlas UI opens one Workspace and completes a Task without a manually enter
   assert.equal(settingsResponse.status, 303);
   const styledWorkspace = await (await fetch(url)).text();
   assert.match(styledWorkspace, /data-theme="graphite"/u);
-  assert.match(styledWorkspace, /data-accent="blue"/u);
+  assert.match(styledWorkspace, /data-accent="vermilion"/u);
   assert.match(styledWorkspace, /data-text-size="large"/u);
   assert.match(styledWorkspace, /--project-rail-width:320px/u);
 
@@ -370,6 +362,10 @@ test('Atlas UI opens one Workspace and completes a Task without a manually enter
 
   const taskUrl = `${url}tasks/${fixture.taskId}`;
   let page = await (await fetch(taskUrl)).text();
+  assert.match(page, /Rules used for this task/u);
+  assert.match(page, /Safety decision/u);
+  assert.match(page, /<details class="details-panel technical-details technical-id">/u);
+  assert.doesNotMatch(page, /<h2>Atlas PolicyDecision<\/h2>/u);
   let form = new URLSearchParams({
     csrf: hiddenValue(page, 'csrf'),
     binding: hiddenValue(page, 'binding'),
@@ -391,13 +387,6 @@ test('Atlas UI opens one Workspace and completes a Task without a manually enter
   assert.equal(response.status, 303);
   assert.equal(fs.readFileSync(fixture.target, 'utf8'), fixture.baseline);
 
-  const refreshedWorkspace = await (await fetch(url)).text();
-  response = await fetch(`${url}session/stop`, {
-    method: 'POST',
-    body: new URLSearchParams({ csrf: hiddenValue(refreshedWorkspace, 'csrf') }),
-  });
-  assert.equal(response.status, 200);
-  assert.match(await response.text(), /Atlas stopped/u);
 });
 
 test('UI action bridge records rejection without changing the target', () => {

@@ -250,6 +250,22 @@ export class Registry {
     };
   }
 
+  releaseRoot(rootId, { reason }) {
+    const releasedAt = timestamp();
+    const root = this.projectContext.releaseRoot({
+      rootId,
+      reason: normalizeReason(reason, 'Workspace Root release'),
+      releasedAt,
+    });
+    return {
+      schema: 'atlas-root-release.v1',
+      root_id: root.id,
+      status: root.governance_status,
+      released_at: releasedAt,
+      source_changes: [],
+    };
+  }
+
   attachRoot(projectIdValue, {
     rootId,
     relativePath = null,

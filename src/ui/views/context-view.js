@@ -1,5 +1,5 @@
 import {
-  escapeHtml, renderFacts, renderNav, renderStatus, renderStatusGuide, renderUiClientScript,
+  escapeHtml, renderFacts, renderNav, renderStatus, renderUiClientScript,
 } from '../components.js';
 import { uiStyles } from '../styles.js';
 
@@ -69,8 +69,8 @@ function projectCards(projects, options) {
 
 function runtimePanel(runtime) {
   if (!runtime) return '';
-  return `<section class="surface">
-    <h2>Runtime</h2>
+  return `<details class="surface technical-id">
+    <summary>Runtime diagnostics</summary>
     ${renderFacts([
     ['Atlas', runtime.atlas_version, true],
     ['Node', runtime.node_version, true],
@@ -85,7 +85,7 @@ function runtimePanel(runtime) {
         <span class="muted">${escapeHtml(processor.runtime ?? 'Not installed')} / network ${processor.network_used ? 'used' : 'not used'}</span>
       </li>`).join('')}</ul>
     </div>
-  </section>`;
+  </details>`;
 }
 
 const TERMINAL_TASKS = new Set(['completed', 'rolled_back', 'rejected', 'cancelled']);
@@ -106,8 +106,14 @@ function attentionCount(entry) {
   return (entry.tasks ?? []).filter((task) => !TERMINAL_TASKS.has(task.task_status)).length;
 }
 
-function ruleTarget(rule) {
-  return rule.value?.target_subdirectory ?? rule.value?.directory ?? rule.value?.role ?? rule.kind;
+function projectActivity(entry) {
+  const recentWorkTime = (entry.recent_work ?? []).reduce((latest, item) => {
+    const value = [item.inspected_at, item.last_continued_at].filter(Boolean).sort().at(-1) ?? '';
+    return value.localeCompare(latest) > 0 ? value : latest;
+  }, '');
+  const savedWorkTime = String(entry.resources?.last_saved_at ?? '');
+  const compatibilityActivity = String(latestTasks([entry], { limit: 1 })[0]?.updated_at ?? '');
+  return [recentWorkTime, savedWorkTime, compatibilityActivity].sort().at(-1) ?? '';
 }
 
 function selectProject(model) {
@@ -115,9 +121,8 @@ function selectProject(model) {
     return model.projects.find((entry) => entry.project.id === model.selected_project_id) ?? model.projects[0] ?? null;
   }
   return [...model.projects].sort((left, right) => (
-    attentionCount(right) - attentionCount(left)
-    || String(latestTasks([right], { limit: 1 })[0]?.updated_at ?? '')
-      .localeCompare(String(latestTasks([left], { limit: 1 })[0]?.updated_at ?? ''))
+    projectActivity(right).localeCompare(projectActivity(left))
+    || attentionCount(right) - attentionCount(left)
   ))[0] ?? null;
 }
 
@@ -125,74 +130,46 @@ function projectRail(projects, selected, options) {
   if (!projects.length) return '<div class="studio-empty">No managed Project.</div>';
   return projects.map((entry) => {
     const isSelected = entry.project.id === selected?.project.id;
-    const routes = entry.routes.slice(0, 3);
+    const recentCount = entry.recent_work?.length ?? 0;
     return `<section class="project-tree-group">
       <a class="project-tree-parent${isSelected ? ' is-selected' : ''}" href="${escapeHtml(`${options.projectBasePath}${encodeURIComponent(entry.project.id)}`)}">
-        <span>${escapeHtml(entry.project.name)}</span><span class="count-badge">${attentionCount(entry)}</span>
+        <span>${escapeHtml(entry.project.name)}</span>${recentCount ? `<span class="count-badge" title="Recent file work">${escapeHtml(recentCount)}</span>` : ''}
       </a>
-      ${isSelected && routes.length ? `<div class="project-tree-children">${routes.map((route) => `<span>${escapeHtml(ruleTarget(route))}</span>`).join('')}</div>` : ''}
     </section>`;
   }).join('');
 }
 
-function activeTaskTable(entry) {
-  const tasks = latestTasks([entry], { attentionOnly: true, limit: 7 });
-  if (!tasks.length) return '<div class="studio-empty"><strong>No active task</strong><span>Completed work remains available from the Tasks page.</span></div>';
-  return `<div class="studio-table" role="table" aria-label="Active tasks">
-    <div class="studio-table-row studio-table-head" role="row"><span>Task</span><span>Source</span><span>Mode</span><span>Status</span><span>Updated</span></div>
-    ${tasks.map((task) => `<a class="studio-table-row" role="row" href="/tasks/${encodeURIComponent(task.task_id)}">
-      <span><strong>${escapeHtml(task.intent)}</strong><small class="mono technical-id">${escapeHtml(task.task_id)}</small></span>
-      <span class="truncate-cell">${escapeHtml(task.primary_source ?? (task.selected_source_count ? `${task.selected_source_count} selected sources` : 'No Source Set'))}</span>
-      <span>${escapeHtml(task.strategy ?? task.write_mode ?? 'inspect')}</span>
-      <span>${renderStatus(task.task_status)}</span>
-      <span class="mono">${escapeHtml(task.updated_at.slice(0, 10))}</span>
-    </a>`).join('')}
+function projectContinue(entry, options) {
+  const items = entry.recent_work ?? [];
+  if (!items.length) {
+    return '<div class="studio-empty"><strong>No recent file work</strong><span>Files added or inspected for this Project will appear here.</span></div>';
+  }
+  return `<div class="studio-table" role="table" aria-label="Recent Project files">
+    <div class="studio-table-row studio-table-head" role="row"><span>File</span><span>Result</span><span>Last used</span><span>Action</span></div>
+    ${items.map((item) => `<div class="studio-table-row" role="row"><span><strong>${escapeHtml(item.file_name)}</strong><small class="mono">${escapeHtml(item.file_path)}</small>${item.sheet ? `<small>Sheet: ${escapeHtml(item.sheet)}</small>` : ''}</span><span>${escapeHtml(item.result_status === 'check_on_continue' ? 'Previous result checked when you continue' : 'Not checked')}</span><span>${escapeHtml((item.last_continued_at ?? item.inspected_at ?? '').slice(0, 10) || 'Unknown')}</span><span><form method="post" action="/files/continue"><input type="hidden" name="csrf" value="${escapeHtml(options.csrfToken)}"><input type="hidden" name="work_id" value="${escapeHtml(item.work_id)}"><input type="hidden" name="return_to" value="/projects/${encodeURIComponent(entry.project.id)}"><button class="action-button action-button-continue" type="submit">Continue</button></form></span></div>`).join('')}
   </div>`;
 }
 
-function recentSources(entry) {
-  const sources = [];
-  const seen = new Set();
-  for (const task of latestTasks([entry], { limit: 20 })) {
-    if (!task.primary_source || seen.has(task.primary_source)) continue;
-    seen.add(task.primary_source);
-    sources.push({ path: task.primary_source, date: task.updated_at.slice(0, 10), task_id: task.task_id });
-    if (sources.length === 6) break;
-  }
-  if (!sources.length) return '<div class="studio-empty">No selected source path is available in recent Tasks.</div>';
-  return `<div class="source-grid">${sources.map((source) => `<a href="/tasks/${encodeURIComponent(source.task_id)}"><strong>${escapeHtml(source.path)}</strong><small>Used ${escapeHtml(source.date)}</small></a>`).join('')}</div>`;
-}
-
-function latestVerifiedOutput(entry) {
-  const task = latestTasks([entry], { limit: 50 }).find((item) => item.task_status === 'completed' && item.target);
-  if (!task) return '<div class="studio-empty">No completed output is recorded for this Project.</div>';
-  return `<a class="verified-output" href="/tasks/${encodeURIComponent(task.task_id)}">
-    <span class="output-mark">OK</span><span><strong>${escapeHtml(task.target)}</strong><small>Verified Task ${escapeHtml(task.task_id)} · ${escapeHtml(task.updated_at.slice(0, 10))}</small></span><span>${renderStatus('verified')}</span>
-  </a>`;
-}
-
-function decisionInbox(projects) {
+function attentionItems(projects) {
   const priority = new Map([['blocked', 0], ['needs_input', 1], ['awaiting_review', 2], ['ready', 3]]);
   const tasks = latestTasks(projects, { attentionOnly: true, limit: 40 })
     .sort((left, right) => (priority.get(left.task_status) ?? 9) - (priority.get(right.task_status) ?? 9) || right.updated_at.localeCompare(left.updated_at))
     .slice(0, 3);
   const explanation = {
-    blocked: 'Atlas stopped this Task. Inspect the conflict before continuing.',
-    needs_input: 'A user decision is required before work can continue.',
-    awaiting_review: 'The proposed change is waiting for review.',
-    ready: 'The next controlled action is ready to inspect.',
+    blocked: 'Atlas stopped because a source or destination needs attention.',
+    needs_input: 'Atlas needs your choice before it can continue.',
+    awaiting_review: 'Changes are ready for review.',
+    ready: 'A saved operation is ready to continue.',
   };
-  if (!tasks.length) return '<div class="studio-empty">No decision is waiting.</div>';
+  if (!tasks.length) return '<div class="studio-empty">Nothing needs your attention.</div>';
   return tasks.map((task) => `<a class="decision-item" href="/tasks/${encodeURIComponent(task.task_id)}">
     <span class="decision-meta">${renderStatus(task.task_status)}<time>${escapeHtml(task.updated_at.slice(5, 10))}</time></span>
-    <strong>${escapeHtml(task.intent)}</strong><small>${escapeHtml(task.project_name)}</small><p>${escapeHtml(explanation[task.task_status] ?? 'Open this Task to inspect its current state.')}</p>
+    <strong>${escapeHtml(task.intent)}</strong><small>${escapeHtml(task.project_name)}</small><p>${escapeHtml(explanation[task.task_status] ?? 'Open this item to see what Atlas needs.')}</p>
   </a>`).join('');
 }
 
-function runtimeFooter(runtime, options) {
-  if (!runtime) return '';
-  const ledgerIntegrity = runtime.ledger?.integrity ?? 'unavailable';
-  return `<footer class="studio-runtime"><span>Ledger health ${renderStatus(ledgerIntegrity)}</span><span>Atlas ${escapeHtml(runtime.atlas_version)}</span><span>Python tools ${renderStatus(runtime.python?.status ?? 'unavailable')}</span><span>Ledger schema v${escapeHtml(runtime.ledger?.schema_version ?? 'n/a')}</span>${renderStatusGuide()}<span class="runtime-local">Atlas state is stored locally</span>${options.stopEndpoint ? `<form method="post" action="${escapeHtml(options.stopEndpoint)}"><input type="hidden" name="csrf" value="${escapeHtml(options.csrfToken)}"><button type="submit">Stop</button></form>` : ''}</footer>`;
+function sessionFooter(options) {
+  return `<footer class="studio-runtime"><span class="runtime-local">Files stay on this device</span>${options.stopEndpoint ? `<form method="post" action="${escapeHtml(options.stopEndpoint)}"><input type="hidden" name="csrf" value="${escapeHtml(options.csrfToken)}"><button type="submit">Stop Atlas</button></form>` : ''}</footer>`;
 }
 
 function renderInteractiveContext(model, options) {
@@ -202,26 +179,24 @@ function renderInteractiveContext(model, options) {
     return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Atlas Project Studio</title><style>${uiStyles()}</style></head><body><main class="page"><h1>Project setup required</h1><p>${escapeHtml(model.status_label)}</p></main></body></html>`;
   }
   const projectHref = `${options.projectBasePath}${encodeURIComponent(selected.project.id)}`;
-  const latestActivity = latestTasks([selected], { limit: 1 })[0]?.updated_at?.slice(0, 10) ?? 'No activity';
+  const latestActivity = projectActivity(selected).slice(0, 10) || 'No recent work';
   return `<!doctype html><html lang="en" ${options.htmlAttributes ?? ''}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(selected.project.name)} · Atlas</title><style>${uiStyles()}</style>${renderUiClientScript(true)}</head>
   <body class="studio-body"><div class="studio-shell" style="${escapeHtml(options.railStyle ?? '')}">
-    <header class="studio-header"><a class="studio-brand" href="/"><span class="brand-mark">A</span><span><strong>Atlas</strong><small>Local governance</small></span></a><strong class="studio-title">Project Studio</strong>
-      <form class="global-search" method="get" action="/tasks"><label class="sr-only" for="global-q">Search Atlas</label><input id="global-q" type="search" name="q" placeholder="Search projects, sources, tasks, rules..."><button class="search-submit" type="submit">Search</button></form>
-      <div class="studio-header-state">${renderStatus(displayStatus)}<a href="/tasks">All tasks</a><a href="/settings">Settings</a></div>
+    <header class="studio-header"><a class="studio-brand" href="${escapeHtml(options.workspaceHref ?? '/projects')}"><span class="brand-mark">A</span><span><strong>Atlas</strong><small>Local workspace</small></span></a><strong class="studio-title">Project</strong>
+      <form class="global-search" method="get" action="${projectHref}/search"><label class="sr-only" for="global-q">Search Project files</label><input id="global-q" type="search" name="q" placeholder="Search this Project..."><button class="search-submit" type="submit">Search</button></form>
+      <div class="studio-header-state">${renderStatus(displayStatus)}<a href="/projects">Projects</a><a href="/files">Files</a><a href="/settings">Settings</a></div>
     </header>
-    <aside class="project-rail" id="atlas-project-rail"><form class="rail-search" method="get" action="/tasks"><label class="sr-only" for="rail-q">Search projects and tasks</label><input id="rail-q" type="search" name="q" placeholder="Search projects..."><button class="search-submit" type="submit">Search</button></form><nav aria-label="Projects">${projectRail(model.projects, selected, options)}</nav></aside>
+    <aside class="project-rail" id="atlas-project-rail"><div class="rail-search"><strong>Projects</strong><a class="text-link" href="/projects">View all</a></div><nav aria-label="Projects">${projectRail(model.projects, selected, options)}</nav></aside>
     <div class="rail-resizer project-rail-resizer" role="separator" aria-label="Resize Project navigation" aria-orientation="vertical" aria-valuemin="220" aria-valuemax="420" tabindex="0" data-rail="project"></div>
     <main class="studio-main">
-      <nav class="breadcrumbs"><a href="/">Projects</a><span>/</span><strong>${escapeHtml(selected.project.name)}</strong></nav>
-      <section class="project-hero"><div><h1>${escapeHtml(selected.project.name)}</h1><p><span>Governed scope</span> ${escapeHtml(selected.routes.length)} confirmed routes and ${escapeHtml(selected.tasks.length)} recorded Tasks.</p><p><span>Current boundary</span> ${escapeHtml(selected.location.relative_path ?? selected.location.root_path ?? 'Location unavailable')}</p><div class="project-meta"><span><strong>Relationship</strong>${escapeHtml(selected.relationship)}</span><span class="technical-id"><strong>Project ID</strong><span class="mono">${escapeHtml(selected.project.id)}</span></span><span><strong>Last activity</strong>${escapeHtml(latestActivity)}</span></div></div></section>
-      <nav class="studio-tabs" aria-label="Project sections"><a class="is-current" href="${escapeHtml(projectHref)}">Overview</a><a href="/tasks?project=${encodeURIComponent(selected.project.id)}&status=active">Active tasks <span>${attentionCount(selected)}</span></a><a href="#sources">Sources</a><a href="#output">Output</a><a href="#rules">Rules</a></nav>
-      <section class="studio-section"><div class="studio-section-heading"><h2>Active tasks</h2><div><a href="/tasks?project=${encodeURIComponent(selected.project.id)}">Filter</a><a href="/tasks?project=${encodeURIComponent(selected.project.id)}&sort=newest">Sort: Updated</a></div></div>${activeTaskTable(selected)}</section>
-      <section class="studio-section" id="sources"><div class="studio-section-heading"><h2>Recent sources</h2><a href="/tasks?project=${encodeURIComponent(selected.project.id)}">View all</a></div>${recentSources(selected)}</section>
-      <section class="studio-section" id="output"><div class="studio-section-heading"><h2>Latest verified output</h2></div>${latestVerifiedOutput(selected)}</section>
-      <section class="studio-section studio-rules" id="rules"><details><summary>Project rules and technical identity</summary><div class="rules-grid"><div><h3>Confirmed routes</h3>${selected.routes.length ? `<ul>${selected.routes.map((rule) => `<li>${escapeHtml(routeText(rule))}</li>`).join('')}</ul>` : '<p>No confirmed routes.</p>'}</div><div><h3>Rule history</h3>${ruleHistory(selected.rule_history)}</div><div><h3>Identity</h3>${renderFacts([['Project ID', selected.project.id, true], ['Relationship', selected.relationship]])}</div></div></details></section>
+      <nav class="breadcrumbs"><a href="${escapeHtml(options.workspaceHref ?? '/projects')}">Projects</a><span>/</span><strong>${escapeHtml(selected.project.name)}</strong></nav>
+      <section class="project-hero"><div><h1>${escapeHtml(selected.project.name)}</h1><p><span>Continue from</span> ${escapeHtml(selected.recent_work.length)} recent file${selected.recent_work.length === 1 ? '' : 's'}.</p><div class="project-meta"><span><strong>Last used</strong>${escapeHtml(latestActivity)}</span></div></div><div class="inline-actions"><a class="action-button" href="${projectHref}/files">Browse</a><a class="action-button action-button-secondary" href="${projectHref}/search">Search</a><a class="action-button action-button-secondary" href="${projectHref}/compare">Compare</a></div></section>
+      <nav class="studio-tabs" aria-label="Project sections"><a class="is-current" href="${escapeHtml(projectHref)}">Overview</a><a href="${projectHref}/resources">Resources</a></nav>
+      <section class="studio-section"><div class="studio-section-heading"><h2>Continue</h2><a href="${projectHref}/files">Browse files</a></div>${projectContinue(selected, options)}</section>
+      <section class="studio-section"><div class="studio-section-heading"><div><h2>Resources</h2><p class="muted">Atlas keeps the existing folder structure and only groups work identities it can confirm.</p></div><div><a href="${projectHref}/resources">Open Resources</a><a href="${projectHref}/files">Browse</a><a href="${projectHref}/search">Search</a><a href="${projectHref}/compare">Compare</a></div></div>${selected.resources ? `${selected.resources.saved_work_error ? '<p class="callout warn">Created results could not be loaded. Project files remain available.</p>' : ''}${renderFacts([['Known Sources', selected.resources.known_sources], ['Created Work', selected.resources.saved_work_error ? 'Unavailable' : selected.resources.created_work], ['Current Output', selected.resources.current_output ? 'Selected' : 'No current output selected'], [selected.resources.truncated ? 'Other Files shown' : 'Other Files', selected.resources.other_files]])}${selected.resources.truncated ? '<p class="muted">The resource summary is limited to the files Atlas could list locally. Browse shows the filesystem directly.</p>' : ''}` : '<p class="muted">Resources are unavailable until Atlas can read the Project folder.</p>'}</section>
     </main>
-    <aside class="decision-rail"><div class="decision-heading"><div><h2>Decision inbox</h2><p>Approvals and conflicts across Projects.</p></div><span class="count-badge">${model.projects.reduce((sum, entry) => sum + attentionCount(entry), 0)}</span></div>${decisionInbox(model.projects)}<a class="decision-all" href="/tasks?status=action_required">View full inbox</a></aside>
-    ${runtimeFooter(model.runtime, options)}
+    <aside class="decision-rail"><div class="decision-heading"><div><h2>Needs your attention</h2><p>Reviews and conflicts for this Project.</p></div><span class="count-badge">${attentionCount(selected)}</span></div>${attentionItems([selected])}</aside>
+    ${sessionFooter(options)}
   </div></body></html>`;
 }
 
@@ -244,7 +219,7 @@ export function renderContextView(model, options = {}) {
 </head>
 <body>
   <div class="app-shell" style="${escapeHtml(options.railStyle ?? '')}">
-    ${renderNav('Workspace', { interactive: Boolean(options.interactive), workspaceHref: options.workspaceHref ?? '/', settingsHref: options.settingsHref })}
+    ${renderNav('Projects', { interactive: Boolean(options.interactive), workspaceHref: options.workspaceHref ?? '/projects', settingsHref: options.settingsHref })}
     <div class="workspace">
       <header class="topbar">
         <div><span class="label">Atlas Desktop</span><strong>${escapeHtml(options.projectDetail ? model.projects[0]?.project.name : 'Local workspace')}</strong></div>

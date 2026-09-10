@@ -9,7 +9,7 @@ import { renderStatus, statusPresentation } from '../src/ui/components.js';
 test('UI status vocabulary explains the recorded state instead of exposing only raw codes', () => {
   assert.deepEqual(statusPresentation('blocked'), {
     label: 'Blocked',
-    meaning: 'Atlas stopped the Task because a conflict or policy condition needs attention.',
+    meaning: 'Atlas stopped the work because a conflict or policy condition needs attention.',
   });
   assert.match(renderStatus('not_checked'), />Not checked<\/span>/u);
   assert.match(renderStatus('completed'), /title="The Task output was recorded and verified\."/u);

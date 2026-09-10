@@ -105,7 +105,7 @@ export class ProjectContextRepository {
       }
       this.db.prepare(`
         UPDATE portfolio_roots
-        SET governance_status = 'adopted', root_type = ?, content_policy = ?,
+        SET status = 'active', governance_status = 'adopted', root_type = ?, content_policy = ?,
             adopted_at = ?, updated_at = ?
         WHERE id = ?
       `).run(rootType, contentPolicy, adoptedAt, adoptedAt, row.id);
@@ -254,6 +254,34 @@ export class ProjectContextRepository {
         VALUES (?, ?, ?, ?)
       `).run(rootId, currentPath, relocatedAt, reason);
       return this.getRoot(rootId);
+    });
+  }
+
+  releaseRoot({ rootId, reason, releasedAt }) {
+    return this.transaction(() => {
+      const root = this.db.prepare('SELECT * FROM portfolio_roots WHERE id = ?').get(rootId);
+      if (!root) throw new Error(`Workspace Root not found: ${rootId}`);
+      if (root.governance_status !== 'adopted') return publicRoot(root);
+      const activeProject = this.db.prepare(`
+        SELECT p.id, p.name
+        FROM project_locations pl
+        JOIN projects p ON p.id = pl.project_id
+        WHERE pl.root_id = ? AND pl.status = 'active' AND p.status = 'active'
+        LIMIT 1
+      `).get(rootId);
+      if (activeProject) {
+        throw new Error(`Workspace Root still has an active Project: ${activeProject.id} (${activeProject.name})`);
+      }
+      this.db.prepare(`
+        UPDATE portfolio_roots
+        SET governance_status = 'released', status = 'inactive', updated_at = ?
+        WHERE id = ?
+      `).run(releasedAt, rootId);
+      this.db.prepare(`
+        INSERT INTO portfolio_root_path_history(root_id, path, valid_from, valid_to, reason)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(rootId, root.current_path, releasedAt, releasedAt, `workspace_root_released: ${reason}`);
+      return publicRoot(this.db.prepare('SELECT * FROM portfolio_roots WHERE id = ?').get(rootId));
     });
   }
 

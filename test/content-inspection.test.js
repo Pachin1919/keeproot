@@ -5,6 +5,8 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
+import { runDataWork } from '../src/content-inspection.js';
+
 const projectRoot = path.resolve('.');
 const tempRoot = path.join(projectRoot, 'test', '.tmp', 'content-inspection');
 const cliPath = path.join(projectRoot, 'bin', 'atlas.js');
@@ -222,6 +224,84 @@ test('content inspect reads workbook structure locally without browser, Office, 
   assert.equal(fs.existsSync(path.join(stateDir, 'ledger.sqlite')), false);
 });
 
+test('Host content inspect records one visible saving point with caller and cache reuse facts', {
+  skip: pythonPath ? false : `No local Python is available on ${os.platform()}.`,
+}, () => {
+  const root = fs.mkdtempSync(path.join(tempRoot, 'host-saving-point-'));
+  try {
+    const stateDir = path.join(root, 'state');
+    const source = path.join(root, 'campaign.csv');
+    fs.writeFileSync(source, 'campaign,spend\nA,10\n', 'utf8');
+
+    const first = invoke(
+      stateDir,
+      'content', 'inspect',
+      '--file', source,
+      '--purpose', 'data',
+      '--actor', 'agent',
+      '--agent', 'Codex',
+      '--tool', 'codex-desktop',
+      '--client-run-id', 'host-test-1',
+    );
+    assert.equal(first.coordination.saving_point_recorded, true);
+    assert.equal(first.coordination.initiated_by.agent, 'Codex');
+    assert.equal(first.coordination.project, null);
+
+    const saved = JSON.parse(fs.readFileSync(path.join(stateDir, 'ui', 'recent-work.json'), 'utf8'));
+    assert.equal(saved.items.length, 1);
+    assert.equal(saved.items[0].file_path, path.resolve(source));
+    assert.equal(saved.items[0].initiated_by.channel, 'host');
+    assert.equal(saved.items[0].initiated_by.agent, 'Codex');
+    assert.equal(saved.items[0].result_summary.rows, 1);
+    assert.equal(saved.items[0].result_summary.columns, 2);
+    assert.equal(saved.items[0].inspection_cache_hit, false);
+
+    const second = invoke(
+      stateDir,
+      'content', 'inspect',
+      '--file', source,
+      '--purpose', 'data',
+      '--actor', 'agent',
+      '--agent', 'Codex',
+      '--tool', 'codex-desktop',
+      '--client-run-id', 'host-test-2',
+    );
+    assert.equal(second.cache_hit, true);
+    const reused = JSON.parse(fs.readFileSync(path.join(stateDir, 'ui', 'recent-work.json'), 'utf8'));
+    assert.equal(reused.items.length, 1);
+    assert.equal(reused.items[0].inspection_cache_hit, true);
+    assert.equal(reused.items[0].initiated_by.client_run_id, 'host-test-2');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Host content inspect compact response keeps coordination and summary without expanded columns', {
+  skip: pythonPath ? false : `No local Python is available on ${os.platform()}.`,
+}, () => {
+  const root = fs.mkdtempSync(path.join(tempRoot, 'host-compact-'));
+  try {
+    const stateDir = path.join(root, 'state');
+    const source = path.join(root, 'campaign.csv');
+    fs.writeFileSync(source, 'campaign,spend,date\nA,10,2026-08-01\n', 'utf8');
+    const result = invoke(
+      stateDir,
+      'content', 'inspect', '--file', source, '--purpose', 'data', '--compact',
+      '--actor', 'agent', '--agent', 'Codex', '--tool', 'codex-desktop',
+      '--client-run-id', 'host-compact-1',
+    );
+    assert.equal(result.compact, true);
+    assert.equal(result.summary.rows, 1);
+    assert.equal(result.summary.columns, 3);
+    assert.equal(result.coordination.saving_point_recorded, true);
+    assert.equal(result.model_visible_body_bytes, 0);
+    assert.equal(Object.hasOwn(result, 'extraction'), false);
+    assert.ok(Buffer.byteLength(JSON.stringify(result), 'utf8') < 5000);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('content inspect profiles one workbook sheet with Pandas and SQL without returning row values', {
   skip: pythonPath ? false : `No local Python is available on ${os.platform()}.`,
 }, () => {
@@ -248,6 +328,123 @@ test('content inspect profiles one workbook sheet with Pandas and SQL without re
   assert.doesNotMatch(JSON.stringify(profile), /13800138000/);
   assert.equal(profile.attention.screenshots_used, 0);
   assert.equal(profile.processor.browser_used, false);
+});
+
+test('Host, Data Work, and Data Workspace share one robust delimited-file reading path', {
+  skip: pythonPath ? false : `No local Python is available on ${os.platform()}.`,
+}, () => {
+  const caseRoot = path.join(tempRoot, 'utf16-tab-export');
+  const stateDir = path.join(caseRoot, 'state');
+  fs.rmSync(caseRoot, { recursive: true, force: true });
+  fs.mkdirSync(caseRoot, { recursive: true });
+  const source = path.join(caseRoot, 'creative-performance.csv');
+  const text = [
+    '日期\t名称\t数值\t转化量\t是否启用\r',
+    '2026-08-01\t"多行\r\n名称"\t1\t0\t1\n',
+    '2026-08-02\t普通\t2\t1\t0\r',
+  ].join('');
+  fs.writeFileSync(source, Buffer.from(text, 'utf16le'));
+  const before = fs.readFileSync(source);
+
+  const inspected = invoke(
+    stateDir,
+    'content', 'inspect',
+    '--file', source,
+    '--purpose', 'data',
+  );
+  assert.equal(inspected.extraction.row_count, 2);
+  assert.equal(inspected.extraction.column_count, 5);
+  assert.equal(inspected.extraction.encoding, 'utf-16-le');
+  assert.equal(inspected.extraction.delimiter, '\t');
+  assert.equal(inspected.extraction.columns.find((item) => item.name === '转化量').inferred_type, 'integer');
+  assert.equal(inspected.extraction.columns.find((item) => item.name === '是否启用').inferred_type, 'boolean');
+
+  const prepared = invoke(
+    stateDir,
+    'content', 'prepare-data',
+    '--file', source,
+  );
+  assert.equal(prepared.summary.rows, 2);
+  assert.equal(prepared.summary.columns, 5);
+
+  const preview = runDataWork({
+    projectRoot,
+    installationRoot: process.env.LOCALAPPDATA
+      ? path.join(process.env.LOCALAPPDATA, 'Atlas')
+      : projectRoot,
+    filePath: source,
+    action: 'preview',
+    pythonPath,
+  });
+  assert.equal(preview.source_summary.rows, 2);
+  assert.equal(preview.source_summary.columns, 5);
+  assert.equal(preview.detail.encoding, 'utf-16-le');
+  assert.equal(preview.detail.delimiter, '\t');
+  assert.equal(preview.column_types['转化量'], 'integer');
+  assert.equal(preview.column_types['是否启用'], 'boolean');
+  assert.deepEqual(fs.readFileSync(source), before);
+});
+
+test('content prepare-data creates a cached human-readable local review without changing the source', {
+  skip: pythonPath ? false : `No local Python is available on ${os.platform()}.`,
+}, () => {
+  const stateDir = path.join(tempRoot, 'data-workspace-state');
+  fs.rmSync(stateDir, { recursive: true, force: true });
+  fs.mkdirSync(tempRoot, { recursive: true });
+  const source = path.join(tempRoot, '月报数据.csv');
+  fs.writeFileSync(source, [
+    '月份,平台,展示量,互动量,备注',
+    '2026-06,LinkedIn,1000,40, 正常 ',
+    '2026-07,LinkedIn,1200,60,',
+    '2026-07,LinkedIn,1200,60,',
+  ].join('\n'), 'utf8');
+  const before = fs.readFileSync(source);
+
+  const first = invoke(
+    stateDir,
+    'content', 'prepare-data',
+    '--file', source,
+  );
+  assert.equal(first.schema, 'atlas.data-workspace.v1');
+  assert.equal(Object.hasOwn(first, 'processor'), false);
+  assert.equal(first.summary.rows, 3);
+  assert.equal(first.summary.columns, 5);
+  assert.equal(first.summary.missing_cells, 2);
+  assert.equal(first.summary.duplicate_rows, 1);
+  assert.equal(first.summary.quality, 'WARN');
+  assert.equal(first.model_visible_body_bytes, 0);
+  assert.equal(first.cache_hit, false);
+  assert.deepEqual(fs.readFileSync(source), before);
+  assert.equal(fs.existsSync(path.join(stateDir, 'ledger.sqlite')), false);
+
+  const receiptPath = path.join(
+    stateDir, 'work', 'data-workspaces', first.workspace_id, 'receipt.json',
+  );
+  const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+  const transform = JSON.parse(fs.readFileSync(receipt.files.transform_plan.path, 'utf8'));
+  assert.equal(transform.applied_safe_normalization[0].affected_cells, 1);
+  assert.equal(transform.not_applied_without_business_rule.includes('remove_duplicates'), true);
+  const quality = JSON.parse(fs.readFileSync(receipt.files.quality.path, 'utf8'));
+  assert.deepEqual(
+    quality.issues.find((item) => item.type === 'duplicate_rows').sample_source_rows,
+    [4],
+  );
+  const review = fs.readFileSync(first.review_path, 'utf8');
+  assert.match(review, /Filter visible rows/);
+  assert.match(review, /Click a column heading to sort/);
+  assert.match(review, /original file unchanged/);
+
+  const second = invoke(
+    stateDir,
+    'content', 'prepare-data',
+    '--file', source,
+  );
+  assert.equal(second.workspace_id, first.workspace_id);
+  assert.equal(second.cache_hit, true);
+  assert.equal(second.normalized_path, first.normalized_path);
+  assert.equal(Object.hasOwn(second, 'files'), false);
+  assert.equal(Object.hasOwn(second, 'manifest_path'), false);
+  assert.equal(JSON.stringify(second).length < 1800, true);
 });
 
 test('content inspect extracts PDF text locally and identifies image-only pages without screenshots', {

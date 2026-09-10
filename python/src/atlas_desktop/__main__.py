@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 
 import webview
 
@@ -41,19 +44,134 @@ def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(prog="atlas-desktop")
     command.add_argument("--url", required=True, type=loopback_url)
     command.add_argument("--storage-path", required=True)
+    command.add_argument("--picker-registration-url", type=loopback_url)
+    command.add_argument("--picker-token")
     command.add_argument("--width", type=int, default=1180)
     command.add_argument("--height", type=int, default=760)
     return command
 
 
+class DesktopBridge:
+    def __init__(self, registration_url: str | None, token: str | None) -> None:
+        self.registration_url = registration_url
+        self.token = token
+        # pywebview recursively exposes every public object on js_api.  Keeping the
+        # Window public makes it traverse the entire native window graph on every
+        # page load, consuming a CPU core and unbounded memory.
+        self._window = None
+
+    def _register_selection(
+        self,
+        paths: tuple[str, ...],
+        *,
+        kind: str,
+        mode: str,
+        flow: str | None = None,
+        queue_id: str | None = None,
+    ) -> dict[str, object]:
+        if not self._window or not self.registration_url or not self.token:
+            return {"status": "unavailable"}
+        try:
+            data = [("file_path", selected) for selected in paths]
+            data.extend([("kind", kind), ("mode", mode)])
+            if flow:
+                data.append(("flow", flow))
+            if queue_id:
+                data.append(("queue_id", queue_id))
+            request = Request(
+                self.registration_url,
+                data=urlencode(data).encode("utf-8"),
+                method="POST",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "X-Atlas-Desktop-Token": self.token,
+                },
+            )
+            with urlopen(request, timeout=10) as response:  # nosec B310: loopback_url validates the endpoint
+                payload = json.loads(response.read().decode("utf-8"))
+            if not payload.get("ok"):
+                return {"status": "failed", "message": payload.get("error", "Atlas could not register this selection.")}
+            if payload.get("queue_id"):
+                return {"status": "selected", "queue_id": payload["queue_id"], "count": payload.get("count", 0)}
+            if not payload.get("selection_id"):
+                return {"status": "failed"}
+            return {
+                "status": "selected",
+                "selection_id": payload["selection_id"],
+                "name": payload.get("name", "Selected file"),
+            }
+        except HTTPError as error:
+            try:
+                payload = json.loads(error.read().decode("utf-8"))
+                message = payload.get("error")
+            except (OSError, ValueError, json.JSONDecodeError):
+                message = None
+            return {"status": "failed", "message": message or "Atlas rejected this desktop selection."}
+        except (OSError, URLError, ValueError, json.JSONDecodeError) as error:
+            return {"status": "failed", "message": f"Desktop selection registration failed: {error}"}
+
+    @staticmethod
+    def _selection_paths(selected: object) -> tuple[str, ...]:
+        if isinstance(selected, (str, Path)):
+            return (str(selected),)
+        return tuple(str(selected_path) for selected_path in selected)  # type: ignore[union-attr]
+
+    def _pick(
+        self,
+        *,
+        kind: str,
+        mode: str,
+        allow_multiple: bool,
+        flow: str | None = None,
+        queue_id: str | None = None,
+    ) -> dict[str, object]:
+        if not self._window:
+            return {"status": "unavailable", "message": "The Atlas Desktop window is not ready."}
+        dialog = webview.FileDialog.FOLDER if kind == "folder" else webview.FileDialog.OPEN
+        try:
+            selected = self._window.create_file_dialog(dialog, allow_multiple=allow_multiple)
+            if not selected:
+                return {"status": "cancelled"}
+            return self._register_selection(
+                self._selection_paths(selected), kind=kind, mode=mode, flow=flow, queue_id=queue_id
+            )
+        except (OSError, TypeError, ValueError) as error:
+            return {"status": "failed", "message": f"The desktop file picker failed: {error}"}
+
+    def pick_file(self) -> dict[str, object]:
+        return self._pick(kind="file", mode="single", allow_multiple=False)
+
+    def pick_files(self) -> dict[str, object]:
+        return self._pick(kind="file", mode="multiple", allow_multiple=True)
+
+    def pick_folder(self) -> dict[str, object]:
+        return self._pick(kind="folder", mode="single", allow_multiple=False)
+
+    def pick_import_files(self, queue_id: str | None = None) -> dict[str, object]:
+        return self._pick(
+            kind="file", mode="multiple", allow_multiple=True, flow="import", queue_id=queue_id
+        )
+
+    def pick_import_folder(self, queue_id: str | None = None) -> dict[str, object]:
+        return self._pick(
+            kind="folder", mode="single", allow_multiple=False, flow="import", queue_id=queue_id
+        )
+
+    def picker_ready(self) -> dict[str, object]:
+        return {"ready": bool(self._window and self.registration_url and self.token)}
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if bool(args.picker_registration_url) != bool(args.picker_token):
+        parser().error("--picker-registration-url and --picker-token must be provided together")
     mutex = acquire_instance_mutex()
     if mutex is False:
         print("ATLAS_DESKTOP_UI_ALREADY_RUNNING", file=sys.stderr, flush=True)
         return 2
     storage_path = Path(args.storage_path).resolve()
     storage_path.mkdir(parents=True, exist_ok=True)
+    bridge = DesktopBridge(args.picker_registration_url, args.picker_token)
     window = webview.create_window(
         "Atlas",
         url=args.url,
@@ -63,8 +181,10 @@ def main(argv: list[str] | None = None) -> int:
         resizable=True,
         background_color="#f4f6f5",
         text_select=True,
-        zoomable=False,
+        zoomable=True,
+        js_api=bridge,
     )
+    bridge._window = window
 
     def shown() -> None:
         print("ATLAS_DESKTOP_UI_READY", flush=True)

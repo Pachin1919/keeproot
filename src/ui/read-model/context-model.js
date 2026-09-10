@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { browseProjectFiles, projectDirectory } from '../project-files.js';
 
 function rulesForProject(activeRules, projectId) {
   return activeRules.filter((rule) => (
@@ -96,9 +97,31 @@ function tasksForProject(registry, projectId) {
   return all.map(normalizeTask);
 }
 
-function projectEntry(registry, activeRules, ruleHistory, project, location, relationship) {
+function recentWorkForProject(recentWork, projectId) {
+  return recentWork
+    .filter((item) => item.project?.id === projectId)
+    .sort((left, right) => String(right.last_continued_at ?? right.inspected_at ?? '')
+      .localeCompare(String(left.last_continued_at ?? left.inspected_at ?? '')))
+    .slice(0, 6)
+    .map((item) => ({
+      work_id: item.work_id,
+      file_path: item.file_path,
+      file_name: path.basename(item.file_path),
+      inspected_at: item.inspected_at,
+      last_continued_at: item.last_continued_at,
+      sheet: item.inspect?.sheet ?? null,
+      result_status: 'check_on_continue',
+    }));
+}
+
+function projectEntry(registry, activeRules, ruleHistory, project, location, relationship, recentWork) {
   const tasks = tasksForProject(registry, project.id);
   const pending = tasks.filter((task) => !['completed', 'rolled_back', 'rejected', 'cancelled', 'blocked'].includes(task.task_status));
+  let file_preview = [];
+  try {
+    const root = projectDirectory(location);
+    file_preview = browseProjectFiles(root).items.slice(0, 6);
+  } catch {}
   return {
     relationship,
     project,
@@ -109,6 +132,8 @@ function projectEntry(registry, activeRules, ruleHistory, project, location, rel
     task_history_truncated: tasks.length >= 500,
     routes: rulesForProject(activeRules, project.id),
     rule_history: ruleHistorySummary(ruleHistory, project.id),
+    recent_work: recentWorkForProject(recentWork, project.id),
+    file_preview,
   };
 }
 
@@ -125,12 +150,14 @@ function processorCapabilities(runtime) {
   ];
 }
 
-export function buildContextModel({ currentPath, registry, rules, runtime = null }) {
-  if (!currentPath || !registry || !rules) {
+export function buildContextModel({ currentPath, registry, rules, runtime = null, recentWork = [] }) {
+  if (!registry || !rules) {
     throw new Error('Atlas UI context model requires currentPath, Registry and rules.');
   }
-  const resolvedPath = path.resolve(currentPath);
-  const resolution = registry.resolvePath(resolvedPath);
+  const resolvedPath = currentPath ? path.resolve(currentPath) : null;
+  const resolution = resolvedPath ? registry.resolvePath(resolvedPath) : {
+    status: 'overview', root: null, project: null, location: null, project_candidates: [],
+  };
   const activeRules = resolution.root
     ? rules.active({ root: resolution.root.current_path })
     : [];
@@ -141,11 +168,11 @@ export function buildContextModel({ currentPath, registry, rules, runtime = null
   let overview = false;
   if (resolution.status === 'resolved') {
     projects = [projectEntry(
-      registry, activeRules, ruleHistory, resolution.project, resolution.location, 'Current Project',
+      registry, activeRules, ruleHistory, resolution.project, resolution.location, 'Current Project', recentWork,
     )];
-  } else {
+  } else if (resolvedPath) {
     projects = (resolution.project_candidates ?? []).slice(0, 8).map(({ project, location }) => (
-      projectEntry(registry, activeRules, ruleHistory, project, location, 'Candidate')
+      projectEntry(registry, activeRules, ruleHistory, project, location, 'Candidate', recentWork)
     ));
   }
   if (!projects.length && typeof registry.list === 'function' && typeof registry.show === 'function') {
@@ -157,7 +184,7 @@ export function buildContextModel({ currentPath, registry, rules, runtime = null
       const history = typeof rules.history === 'function'
         ? rules.history({ root: detail.location.root_path })
         : projectRules;
-      return [projectEntry(registry, projectRules, history, project, detail.location, 'Managed Project')];
+      return [projectEntry(registry, projectRules, history, project, detail.location, 'Managed Project', recentWork)];
     });
   }
   return {
@@ -167,11 +194,13 @@ export function buildContextModel({ currentPath, registry, rules, runtime = null
     resolution_status: overview ? 'overview' : resolution.status,
     status_label: resolution.status === 'resolved'
       ? 'Atlas resolved the current Project.'
-      : (projects.length
+      : (!resolvedPath
+        ? (projects.length ? 'Atlas shows managed Projects.' : 'No managed Project is available yet.')
+        : (projects.length
         ? (resolution.root
           ? 'Atlas found Project candidates under this Workspace Root.'
           : 'Atlas shows managed Projects because the launch directory is not registered.')
-        : 'Atlas needs Root or Project Location setup.'),
+        : 'Atlas needs Root or Project Location setup.')),
     root: resolution.root ? { id: resolution.root.id, current_path: resolution.root.current_path } : null,
     projects,
     runtime: runtime ? { ...runtime, processors: processorCapabilities(runtime) } : null,

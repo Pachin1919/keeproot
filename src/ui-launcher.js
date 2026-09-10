@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 
 function assertLocalUrl(value) {
   const url = new URL(value);
@@ -30,4 +32,24 @@ export function openLocalUi(value, { platform = process.platform, spawnProcess =
   child.once?.('error', () => {});
   child.unref();
   return { status: 'requested', url, command };
+}
+
+export function openLocalFile(filePathInput, { platform = process.platform, spawnProcess = spawn } = {}) {
+  const filePath = path.resolve(filePathInput);
+  const stat = fs.lstatSync(filePath);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error('Atlas can open only a registered regular local file.');
+  }
+  let command;
+  if (platform === 'win32') command = 'explorer.exe';
+  else if (platform === 'darwin') command = 'open';
+  else command = 'xdg-open';
+  const child = spawnProcess(command, [filePath], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.once?.('error', () => {});
+  child.unref();
+  return { status: 'requested', file_path: filePath, command };
 }

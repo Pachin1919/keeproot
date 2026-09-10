@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
 import {
   doctorDesktopUiComponent,
   removeDesktopUiComponent,
@@ -81,4 +82,38 @@ test('Removing the Desktop UI keeps Atlas state', () => {
   assert.equal(result.node_governance_preserved, true);
   assert.equal(fs.existsSync(componentRoot), false);
   assert.equal(fs.readFileSync(stateFile, 'utf8'), 'state');
+});
+
+test('Desktop client checks the requested picker method independently', async () => {
+  const client = fs.readFileSync(path.join(projectRoot, 'src', 'ui', 'client.js'), 'utf8');
+  const pickFiles = async () => ({ status: 'selected', queue_id: 'BQS-test' });
+  let submitListener = null;
+  let processingStatus = null;
+  class FakeForm {
+    constructor() { this.dataset = {}; this.attributes = {}; }
+    setAttribute(name, value) { this.attributes[name] = value; }
+  }
+  const context = {
+    Date,
+    HTMLFormElement: FakeForm,
+    document: {
+      body: { append: (item) => { processingStatus = item; } },
+      createElement: () => ({ className: '', attributes: {}, setAttribute(name, value) { this.attributes[name] = value; } }),
+      addEventListener: (name, listener) => { if (name === 'submit') submitListener = listener; },
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    },
+    sessionStorage: { getItem: () => null, removeItem: () => {}, setItem: () => {} },
+    window: { pywebview: { api: { pick_files: pickFiles } }, setTimeout },
+  };
+  vm.runInNewContext(client, context);
+
+  const picker = await context.desktopPickerMethod('pick_files');
+
+  assert.equal(typeof picker, 'function');
+  assert.deepEqual(await picker(), { status: 'selected', queue_id: 'BQS-test' });
+  const form = new FakeForm();
+  submitListener({ target: form, submitter: { textContent: 'Inspect' }, preventDefault: () => assert.fail('first submit was stopped') });
+  assert.equal(form.attributes['aria-busy'], 'true');
+  assert.match(processingStatus.textContent, /Inspect.*working locally/u);
 });

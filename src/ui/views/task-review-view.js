@@ -3,12 +3,17 @@ import {
 } from '../components.js';
 import { uiStyles } from '../styles.js';
 
+function technicalDetails(rows) {
+  return `<details class="details-panel technical-details technical-id"><summary>Technical details</summary>${renderFacts(rows)}</details>`;
+}
+
 function sourceList(sources) {
   if (!sources.length) return '<p class="muted">No source selected.</p>';
   return `<ul class="path-list">${sources.map((source) => `
     <li class="path-item">
       <strong class="mono">${escapeHtml(source.path)}</strong><br>
-      <span class="muted">${escapeHtml(source.byte_size)} bytes / ${escapeHtml(source.content_hash)}</span>
+      <span class="muted">${escapeHtml(source.byte_size)} bytes</span>
+      ${technicalDetails([['Source Hash', source.content_hash, true]])}
     </li>`).join('')}</ul>`;
 }
 
@@ -32,7 +37,7 @@ function policyPanel(model) {
   if (!decision) return '<p class="muted">No PolicyDecision recorded.</p>';
   return `${renderStatus(decision.decision)}
     <p>${escapeHtml(decision.reason)}</p>
-    ${renderFacts([
+    ${technicalDetails([
     ['Decision ID', decision.id, true],
     ['RuleVersion', decision.rule_version_id, true],
   ])}`;
@@ -43,18 +48,24 @@ function attentionPanel(attention) {
   const conflicts = attention.conflicts ?? [];
   const gaps = attention.gaps ?? [];
   return `${renderStatus(attention.status)}${renderFacts([
-    ['Applied rules', attention.applied_rule_ids.join(', ') || 'None'],
-    ['Eligible rules', attention.eligible_rule_ids.join(', ') || 'None'],
+    ['Rules used', attention.applied_rule_ids.length],
+    ['Rules considered', attention.eligible_rule_ids.length],
     ['Conflicts', conflicts.length],
     ['Gaps', gaps.length],
   ])}${conflicts.length || gaps.length
-    ? `<p class="muted">${escapeHtml([...conflicts, ...gaps].join(' / '))}</p>` : ''}`;
+    ? `<p class="muted">${escapeHtml([...conflicts, ...gaps].join(' / '))}</p>` : ''}
+    ${technicalDetails([
+    ['Applied rule IDs', attention.applied_rule_ids.join(', ') || 'None'],
+    ['Eligible rule IDs', attention.eligible_rule_ids.join(', ') || 'None'],
+  ])}`;
 }
 
 function diffPanel(model) {
   if (!model.write?.candidate) return '<p class="muted">The Agent has not staged a Candidate yet.</p>';
   return `${renderFacts([
     ['Target', model.write.candidate.target, true],
+  ])}
+  ${technicalDetails([
     ['ChangeSet', model.write.candidate.change_set_id, true],
     ['Candidate Hash', model.write.candidate.content_hash, true],
     ['Diff Hash', model.write.candidate.diff_hash, true],
@@ -70,9 +81,15 @@ function receiptPanel(model) {
     ${renderFacts([
     ['Verified', receipt.verified === true ? 'yes' : 'not recorded'],
     ['Target', receipt.target, true],
-    ['Run', receipt.write_run_id ?? receipt.run_id, true],
-  ])}
+  ])}${technicalDetails([['Run', receipt.write_run_id ?? receipt.run_id, true]])}
   </div>`;
+}
+
+function diagnosticDetails(model) {
+  return technicalDetails([
+    ['Project ID', model.project.id, true],
+    ['Task ID', model.task.id, true],
+  ]);
 }
 
 function actionForm(action, options) {
@@ -133,7 +150,7 @@ export function renderTaskReviewView(model, options = {}) {
   })}
     <div class="workspace">
       <header class="topbar">
-        <div><span class="label">${escapeHtml(model.project.id)}</span><strong class="mono">${escapeHtml(model.task.id)}</strong></div>
+        <div><span class="label">Task review</span><strong>${escapeHtml(model.task.intent)}</strong><small class="mono technical-id">${escapeHtml(model.project.id)} / ${escapeHtml(model.task.id)}</small></div>
         ${renderStatus(model.ui_state.state)}
       </header>
       <main class="page">
@@ -154,9 +171,10 @@ export function renderTaskReviewView(model, options = {}) {
           </div>
           <aside class="side-column">
             ${actionPanel(model, options)}
-            <section class="surface"><h2>Effective rules</h2>${attentionPanel(model.attention)}</section>
-            <section class="surface"><h2>Atlas PolicyDecision</h2>${policyPanel(model)}</section>
+            <section class="surface"><h2>Rules used for this task</h2>${attentionPanel(model.attention)}</section>
+            <section class="surface"><h2>Safety decision</h2>${policyPanel(model)}</section>
             <section class="surface"><h2>Recovery</h2>${renderStatus(model.rollback.status)}<p class="muted">${escapeHtml(model.rollback.precondition ?? 'Recovery is not available in the current state.')}</p></section>
+            ${diagnosticDetails(model)}
             <section class="callout"><strong>Responsibility boundary</strong><br>The Agent produced the Candidate. Atlas measured the scope, applied policy, recorded the exact Diff, and controls execution and recovery.</section>
           </aside>
         </div>

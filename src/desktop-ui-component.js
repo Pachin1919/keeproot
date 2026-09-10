@@ -277,6 +277,8 @@ export async function startDesktopUi({
   url,
   installationRoot,
   runtimeRoot,
+  pickerRegistrationUrl,
+  pickerToken,
   configuredPath = process.env.ATLAS_DESKTOP_PYTHON,
   spawnProcess = spawn,
   readyTimeoutMs = 15_000,
@@ -294,6 +296,9 @@ export async function startDesktopUi({
   fs.mkdirSync(storageRoot, { recursive: true });
   const child = spawnProcess(capability.python_path, [
     '-m', 'atlas_desktop', '--url', url, '--storage-path', storageRoot,
+    ...(pickerRegistrationUrl && pickerToken
+      ? ['--picker-registration-url', pickerRegistrationUrl, '--picker-token', pickerToken]
+      : []),
   ], {
     cwd: runtimeRoot,
     env: pythonEnvironment(runtimeRoot),

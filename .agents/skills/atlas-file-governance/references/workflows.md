@@ -6,9 +6,8 @@ Define the CLI path in PowerShell without changing global environment configurat
 
 ```powershell
 $located = & '<USER_SKILL_ROOT>\scripts\locate-atlas.ps1' | ConvertFrom-Json
-# Require status=ready, then invoke $located.node_path with node_args, $located.cli_path, and --json.
-$env:ATLAS_HOME = $located.install_root
-$env:ATLAS_STATE_DIR = $located.state_path
+# Require status=ready. Always use the installed launcher so Host and Desktop share one Runtime and state.
+$atlasCli = $located.launcher_path
 ```
 
 ## Browser Capture → Intake
@@ -16,7 +15,7 @@ $env:ATLAS_STATE_DIR = $located.state_path
 For a public static page, try the bounded local HTTP path first:
 
 ```powershell
-& $located.node_path @($located.node_args) $located.cli_path capture fetch `
+& $atlasCli capture fetch `
   --url <PUBLIC_HTTP_URL> --json
 ```
 
@@ -36,13 +35,13 @@ const captured = await captureBrowserPage({
 Then use the installed Runtime:
 
 ```powershell
-& $located.node_path @($located.node_args) $located.cli_path capture localize `
+& $atlasCli capture localize `
   --input-file $captured.capture_file --json
 
-& $located.node_path @($located.node_args) $located.cli_path capture sample <work_id> `
+& $atlasCli capture sample <work_id> `
   --start-character 0 --characters 1200 --json
 
-& $located.node_path @($located.node_args) $located.cli_path intake prepare `
+& $atlasCli intake prepare `
   --root <AUTHORIZED_ROOT> --candidate-file <candidate_path> --origin download `
   --kind source --project <project_id> --target <new_path> `
   --actor agent --agent <agent> --model <model> --tool <tool> --client-run-id <task_id> --json
@@ -53,11 +52,26 @@ Do not request a full DOM snapshot or emit the localized body. Stop after two fa
 For chat captures, `capture localize` also returns a managed message-level JSONL path using `atlas.chat-message.v1`. Keep the readable Markdown for review; use the JSONL for deterministic message-ID, timestamp, overlap, and incremental comparison. For multiple branches of one chat, run once:
 
 ```powershell
-& $located.node_path @($located.node_args) $located.cli_path content branches `
+& $atlasCli content branches `
   --file <BRANCH_1_JSONL> --file <BRANCH_2_JSONL> --file <BRANCH_3_JSONL> --json
 ```
 
 Read each returned segment once and reconstruct each source from its `segment_chain`; do not load every duplicated branch body.
+
+## Selected conversation → bounded Project handoff
+
+The primary Agent, not Atlas, selects confirmed decisions and prepares one UTF-8 `atlas.conversation-selection.v1` JSON file under `.atlas/work/`. It must contain at least one selected decision plus bounded completed/pending facts and an optional task packet. Do not put the raw transcript or Codex session history in this file.
+
+```powershell
+& $atlasCli content localize-conversation `
+  --input '<PROJECT>\.atlas\work\selected-context.json' `
+  --project '<ACTIVE_PROJECT_ID>' `
+  --output-relative 'docs/<NEW_CONTEXT_FILE>.md' `
+  --actor agent --agent '<PRIMARY_AGENT>' --model '<MODEL>' `
+  --tool '<TOOL>' --client-run-id '<TASK_ID>' --json
+```
+
+Require `verified=true`. The output must be a new `.md` inside the active Project and the parent directory must already exist. Atlas refuses overwrite and Project escape. Spawn a delegated worker with no inherited conversation turns and provide only this Markdown, the bounded task packet, and explicitly named source/test files.
 
 ## Workspace Inspect
 
@@ -237,13 +251,15 @@ Create a request JSON under Atlas runtime state; do not put it in the governed l
 
 If same-series inputs have different hashes but lack reliable coverage, expect `coverage_unknown` and `preserve_both`. Keep both in `read.selected`, state that the relation cannot be proved, and continue with the reviewed output strategy. Do not infer coverage from a filename, creation time, modification time, or export time.
 
-For binary inputs, use `read.requires_local_extraction` to select a local parser. `read.estimated_tokens` covers only directly readable text bytes; it is not a raw binary-size estimate. Do not send the binary file or a full-resolution render set into model context. Presentation comparison is text/object/layout extraction first, compact local diff second, and at most eight explicitly selected 768×432 JPEG renders only when unresolved visual evidence remains.
+For binary inputs, use `read.requires_local_extraction` to select a local parser. `read.estimated_tokens` is `null` unless the host reports real usage. `read.direct_text_payload_estimate` is only a rough byte-based planning hint; it excludes locally extracted binary content and is not proof of Token use or savings. Do not send the binary file or a full-resolution render set into model context. Presentation comparison is text/object/layout extraction first, compact local diff second, and at most eight explicitly selected 768×432 JPEG renders only when unresolved visual evidence remains.
 
 When a provided attachment determines a directory, routing, or split design, “environment setup only” forbids premature writes but does not forbid the minimum read-only structural extraction needed for the decision. Use the appropriate content Skill. For spreadsheets, inspect worksheet names, used ranges, relevant header rows, and merged or multi-level headers before proposing folders or a split model. Atlas validates the authorized path and later governs the accepted change; it does not replace the Agent's semantic interpretation.
 
-Start with `atlas content inspect --file <EXACT_PATH> --purpose structure --json`. If `next_action.mode` is `use_local_extraction`, do not launch Office, a browser, or a screenshot workflow.
+Start with `atlas content inspect --file <EXACT_PATH> --purpose structure --actor agent --agent <HOST_NAME> --model <MODEL> --tool <HOST_TOOL> --client-run-id <CURRENT_TASK_ID> [--project <PROJECT_ID>] --json`. If `next_action.mode` is `use_local_extraction`, do not launch Office, a browser, or a screenshot workflow.
 
-For CSV/TSV or one exact XLSX Sheet whose structure is already known, use `atlas content inspect --file <EXACT_PATH> --purpose data [--sheet <XLSX_SHEET>] --json`. Treat its Pandas/SQLite counts as facts and let the Agent interpret business meaning. It returns no raw data rows; merged or multi-level headers remain an explicit warning rather than an invented flat schema.
+For CSV/TSV or one exact XLSX Sheet whose structure is already known, use `atlas content inspect --file <EXACT_PATH> --purpose data [--sheet <XLSX_SHEET>] --actor agent --agent <HOST_NAME> --model <MODEL> --tool <HOST_TOOL> --client-run-id <CURRENT_TASK_ID> [--project <PROJECT_ID>] --json`. Treat its Pandas/SQLite counts as facts and let the Agent interpret business meaning. It returns no raw data rows; merged or multi-level headers remain an explicit warning rather than an invented flat schema. On success, require `coordination.saving_point_recorded=true`; this makes the current Host work visible and continuable in Atlas Desktop without copying the full result.
+
+For a repeated unchanged-file check or a Host that only needs the saving point and bounded summary, add `--compact`. The compact response keeps source identity, cache reuse, row/field summary, type counts, warnings, limits, and coordination, but omits expanded extraction fields. Omit `--compact` when the task needs exact Sheet, field, page, paragraph, or slide details.
 
 ## Reusable cross-Project context
 

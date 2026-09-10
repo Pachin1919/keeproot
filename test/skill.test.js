@@ -70,16 +70,13 @@ test('repository Agent Skill is a complete user-installable source and reference
   assert.match(protocol, /ATLAS_ROLLBACK_CONFLICT/);
   assert.match(protocol, /ATLAS_CONTEXT_SETUP_REQUIRED/);
   assert.match(skill, /--scan-mode structure/);
-  assert.match(skill, /Attachment-dependent structure decisions/);
-  assert.match(skill, /worksheet names/);
-  assert.match(skill, /used ranges/);
-  assert.match(skill, /merged or multi-level header structure/);
-  assert.match(skill, /does not prohibit read-only structural inspection/);
+  assert.match(skill, /local content command/);
+  assert.match(skill, /Sheet names/);
+  assert.match(skill, /merged headers/);
+  assert.match(skill, /Do not ask the model to count rows/);
   assert.match(skill, /atlas content inspect/);
-  assert.match(skill, /review_path/);
-  assert.match(skill, /root relocate/);
   assert.match(skill, /agent prepare/);
-  assert.match(skill, /approval_token/);
+  assert.match(skill, /single review path/);
   assert.match(protocol, /root relocate/);
   assert.match(protocol, /agent fulfill/);
   assert.match(workflows, /root relocate/);
@@ -97,7 +94,7 @@ test('repository Agent Skill is a complete user-installable source and reference
   ]) {
     assert.match(workflows, new RegExp(command.replace(' ', '\\s+')));
   }
-  assert.ok(skill.split(/\r?\n/).length < 500);
+  assert.ok(Buffer.byteLength(skill, 'utf8') < 5000);
   assert.equal(path.dirname(skillRoot), path.join(projectRoot, '.agents', 'skills'));
 });
 
@@ -359,7 +356,7 @@ test('Skill command sequence completes Agent Bootstrap, Derived, Tracked Direct,
   assert.equal(agentCli(stateDir, ['doctor']).status, 'ok');
   const capabilities = agentCli(stateDir, ['capabilities']);
   assert.ok(capabilities.workflows.bootstrap.includes('scan'));
-  assert.deepEqual(capabilities.workflows.content, ['inspect', 'compare', 'branches']);
+  assert.deepEqual(capabilities.workflows.content, ['inspect', 'compare', 'branches', 'prepare-data']);
   assert.deepEqual(capabilities.bootstrap_scan_modes, ['structure', 'metadata']);
   assert.ok(capabilities.workflows.tracked_direct.includes('rollback'));
   assert.ok(capabilities.workflows.guarded.includes('execute'));

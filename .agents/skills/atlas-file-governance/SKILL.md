@@ -1,106 +1,51 @@
 ---
 name: atlas-file-governance
-description: Use the installed Atlas local Runtime for project identity, bounded file intake, cross-project context, local document or spreadsheet facts, governed Agent writes, verification, and recovery. Trigger for attached files, project/workspace inspection, Atlas, rollback, Vault organization, Excel/CSV/PDF/PPT/DOCX, or durable Agent outputs.
+description: Use the installed Atlas coordination Runtime for bounded Workspace facts, file intake, local document/data processing, governed writes, verification, and recovery. Trigger for Atlas, attached files, rollback, workspace organization, durable Agent outputs, and Excel/CSV/PDF/PPT/DOCX work.
 ---
 
 # Atlas File Governance
 
-Atlas is the deterministic local control layer. The Agent understands meaning and writes content; Atlas resolves Project/Root identity, returns active rules and bounded facts, validates paths, executes supported changes, verifies Hashes, and protects rollback.
+Atlas is the local coordination Runtime between User Intent, Execution Host, and Local Workspace. The Host interprets meaning and creates content; Atlas maintains bounded facts, supported file operations, verification, and recovery. Desktop and Host are ports into the same Runtime.
 
-## Start once
+## Fast start
 
-Run `scripts/locate-atlas.ps1`. It checks the installed Runtime directly; do not scan the target or disk for Atlas. If it returns `runtime_required`, stop and recommend `install-atlas.ps1 install`.
+Run `scripts/locate-atlas.ps1` once with a 15-second timeout. On `runtime_required`, stop and recommend `install-atlas.ps1 install`. Invoke its `launcher_path`, never `bin/atlas.js` directly; reuse that installed-state launcher for the task. Do not repeat successful discovery or source inspection.
 
-Set process-local `ATLAS_HOME` and `ATLAS_STATE_DIR` from the locator result. For the first Atlas call in a task, require the `atlas-cli.v1` JSON envelope and use a 15-second timeout. Do not repeat `version`, `capabilities`, and `doctor` for every file in the same task. Read [references/cli-protocol.md](references/cli-protocol.md) only when constructing a new command or handling an error.
+Use the shortest applicable route:
 
-When the SessionStart Hook identifies a managed Project, use its injected Task status. If it reports idle, do not call `agent status` again. If it reports one pending Task, resume that exact ID before starting another. If Hook output is absent, use `agent context` or `project resolve`; do not repeat shallow scans.
+- Exact attachment with known destination: Intake fast path; several: one `intake batch-execute`.
+- Spreadsheet, PDF, PPTX, DOCX, webpage, or chat: one local content command before any model reading.
+- Subagent handoff: the primary Agent selects confirmed context into `atlas.conversation-selection.v1`; Atlas writes one new Project Markdown with `content localize-conversation`. Never pass the raw parent conversation.
+- Workspace organization requested by the user: start with one `bootstrap scan --scan-mode structure`; do not repeat it when targeted control-file inspection is needed.
+- Ordinary edit: `begin → Agent edit → close`; important update: `agent prepare → one UI review → approve/apply`.
+- New declared output: Task/Derived. Supported move or directory change: Evolution. Recovery: the recorded rollback command; never overwrite a conflict.
 
-Codex Desktop auto-context uses a reviewed project-local `.codex/hooks.json`; the Atlas Runtime and Ledger remain user-level. Do not tell the user to type `/hooks` into chat. If the exact Project Root has no trusted Atlas hook, report that setup fact once and continue through the ordinary Skill path.
+Read `references/workflows.md` only for exact syntax and `references/cli-protocol.md` only for a new integration or error.
 
-When the user asks to open Atlas or control Tasks visually, start `atlas ui --path <CURRENT_WORKING_DIRECTORY> --no-open` and return its loopback URL. The Workspace lists managed Projects and Tasks; the user opens a Task without copying its ID. The server listens only on `127.0.0.1`, can be stopped from the Workspace, and calls existing Atlas services for actions. Omit `--no-open` when the user launches Atlas directly and wants the default browser opened.
+Open Atlas with `atlas ui`; open a current Project with `atlas ui --path <EXPLICIT_PROJECT_PATH>`.
 
-`ui context --path` and `ui operation --task` create audit Snapshots, not interactive UI. Use them only when the user asks for a saved, read-only state. They remain under Atlas state and must not be copied into the user project.
+## Local-first content path
 
-When the user asks whether a persistent cross-Project Task still uses current sources, add `--refresh-sources`. This refreshes only the Projects in that Task's Source Set and hashes only the selected files. Do not add it to ordinary page opens or Tasks without a Source Set.
+Before sending bodies or images to a model, use local work:
 
-When the user wants to open one known Task directly, add `--task <TASK_ID>` to `atlas ui`. Add `--refresh-sources` only when the user asks to recheck a persistent Source Set. Atlas revalidates the Task, write run, ChangeSet, Candidate/Diff Hashes and existing review before every action. Execute and rollback require an explicit confirmation in the page. Do not replace the action bridge with a button that runs an unbound CLI string.
+- Spreadsheet: `atlas content inspect --purpose data`; inspect Sheet names, merged headers, types, missing values and duplicates. Do not ask the model to count rows.
+- PDF: extract the text layer and image-only page list. Render only unresolved visual pages.
+- PPTX/DOCX: extract text, notes, objects, and structure before preview.
+- Public static page: `capture fetch`. For login-only/client-rendered pages, ask for an export or selection.
+- Chat versions or branches: `content compare` or one `content branches` call. Read each deduplicated segment once.
 
-## Choose the shortest path
+Host `content inspect` must include caller fields in `workflows.md`; add `--project` only for a file inside that Project. Success updates Desktop Recent Work without copying the result or creating permanent history.
 
-The main routes are **Intake**, **Task Contract**, **Tracked Direct**, **Guarded**, and **Evolution**. Choose only one route for the current operation.
+Use `--compact` only for repeat status/reuse. Do not call a model to prove local processing; report the local result and limits. For data work, stop after preparation until the user continues.
 
-- Exact attached file plus known Project and absent target: use **Intake fast path**.
-- Two or more authorized attachments with known targets: use one `intake batch-execute`; never run the single-file script once per attachment.
-- Attachment semantics affect placement: run one local `atlas content inspect`, then Intake.
-- Public static webpage: use one `atlas capture fetch`; for login-only or client-rendered pages, ask for an export or explicit selection instead of repeatedly driving a browser.
-- Read-only project diagnosis: use `inspect`.
-- Existing library recognition or optional structure advice: use Bootstrap `--scan-mode structure`.
-- Recurring cross-Project work: reuse Root, Project Location and Context Link; do not scan sibling roots ad hoc.
-- Ordinary narrow edit: Tracked Direct.
-- Important existing-file update: `agent prepare`/Guarded and one review through `review_path`.
-- Generated new output with selected inputs: Task Contract or Derived.
-- Supported directory create/move/migration, including one exact cross-Root file or directory: Evolution.
-- Recovery request: use the recorded Task/Run rollback; never overwrite a later-change conflict.
+## Project context
 
-Read only the matching section of [references/workflows.md](references/workflows.md). Do not load unrelated workflows.
+Use injected Project context when present; otherwise one `agent context` or `project resolve`. Use active rules only. For recurring cross-Project work, reuse a reviewed Context Link; Atlas freezes inputs and write boundary.
 
-## Attachment fast path
+## Writes and review
 
-Treat a supplied attachment path as `human_submitted`. The Agent supplies semantic `kind`, Project and target from the task and current rules; Atlas validates them.
-
-For one exact attachment, use `scripts/intake-attached-file.ps1` only when Project and target are already known. It performs the whole placement and returns one compact receipt. Do not call `intake show` after verified success.
-
-For multiple attachments, write one request under Atlas state:
-
-```json
-{
-  "items": [
-    {
-      "candidateFile": "C:/attachments/report-april.pdf",
-      "origin": "human_submitted",
-      "kind": "report",
-      "projectId": "PRJ-...",
-      "target": "ClientCampaign/Reports/monthly-report-april.pdf",
-      "intent": "Keep the submitted monthly report."
-    }
-  ]
-}
-```
-
-Call once:
-
-```text
-atlas intake batch-execute --root <ROOT> --request-file <JSON> --reason <USER_TASK_AUTHORIZATION> <caller metadata> --json
-```
-
-The command preflights every item, creates and verifies all ready targets in one Runtime process, and returns all run IDs and rollback entries. If any item needs classification or a target, stop before execution and ask one combined question.
-
-## Attachment-dependent structure decisions
-
-“Environment setup only” does not prohibit read-only structural inspection when the attachment determines the structure. Run `atlas content inspect --file <EXACT_PATH> --purpose <structure|content|data|visual> --json` before proposing folders.
-
-For spreadsheets, inspect worksheet names, used ranges, relevant headers, and merged or multi-level header structure. Use `purpose=data --sheet <NAME>` for Pandas/SQLite quality facts without raw rows. For PDF, use the text layer and image-only page list before screenshots. Do not launch a browser, Office, or rendering flow when local extraction is sufficient.
-
-For a captured chat, keep the readable Markdown Candidate and the returned message-level JSONL Work item. Use `content compare` on two versions. For two or more branches of one conversation, use one `content branches --file ...` call and read each returned segment once; do not reread duplicated prefixes.
-
-## Project and rule context
-
-Project ID is stable; names and locations can change. If a known Project has no Location, adopt the authorized Root once and attach the Project once. Use `root relocate` or `project relocate` only for a user-supplied exact new location; Atlas does not search disks or move files through those commands.
-
-Use current active rules, not rule history. The Hook may inject a few Project-scoped placement rules. If Atlas has no rule, the Agent proposes one from minimal control-file evidence; only explicit user approval creates a reusable immutable RuleVersion.
-
-For recurring cross-Project work, reuse the reviewed Context Link and use bounded `task discover-context --compact`. The Agent chooses relevant candidates; Atlas freezes the Source Set and restricts writing to one target Root.
-
-For a physical cross-Root move, use `migrate_cross_root` with explicit source and target Roots. Atlas copies to a technical sibling stage, verifies the full Manifest, atomically claims the target inside its Root, and removes the source last. Do not use PowerShell as the mover. If the entry is a registered Project, run `project relocate` after verified execution; if identity reconciliation fails, roll back the Evolution run instead of editing Registry paths manually.
-
-## Writes and approval
-
-Use exact paths and caller metadata. Save returned IDs. Stop on `deny`, `setup_required`, `stale`, `conflict`, or unsupported operations; do not bypass Atlas with PowerShell.
-
-For an important update, `agent prepare` returns one review path. After explicit approval, call `agent approve`, preserve its `approval_token`, then call `agent fulfill`. Do not repeat Inspect, Preview, source reads, broad tests, Git checks, or another Hash command after a verified fast-path receipt.
-
-For a normal edit, use `begin → Agent edit → close`. Require `policy=pass`. Use rollback only when requested; it must stop if the current file no longer matches the recorded end state.
+Keep IDs internal. Stop on `deny`, `setup_required`, `stale`, `conflict`, or unsupported work. Do not bypass Atlas. Use a single review path; after approval run only the bound action and report verification.
 
 ## Report
 
-Return one short receipt: Project, changed targets, verification, elapsed time, and rollback availability. Mention unresolved or unsupported items plainly. Do not paste full Ledger history, complete Diff, file bodies, or internal command output unless requested.
+Return what changed/was inspected, useful result or review, verification, recovery availability, and one unresolved limit. Omit Ledger history, full JSON, Diff, hashes, IDs, and bodies unless diagnostics are requested. Do not claim Token savings without comparable host usage data.

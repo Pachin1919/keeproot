@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import csv
 import hashlib
-import io
 import json
 import mimetypes
 import posixpath
@@ -13,25 +11,25 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from .common import CharacterBudget, validate_office_package, xml_root, zip_entry_names
+from .delimited import choose_header, indexed_rows, read_delimited_file, unique_headers
 from .document_readers import read_docx, read_pdf, read_pptx
 
-PROCESSOR_VERSION = "0.3.0"
+PROCESSOR_VERSION = "0.3.4"
 SCHEMA = "atlas.content-inspection.v1"
 OFFICE_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 OFFICE_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PACKAGE_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 MAX_PROFILE_ROWS = 10_000
-MAX_PROFILE_COLUMNS = 80
-HEADER_HINT = re.compile(
-    r"(name|date|time|month|year|country|category|activity|platform|campaign|status|"
-    r"姓名|名称|日期|时间|月份|国家|分类|活动|平台|渠道|项目|岗位|职责|联系方式|账号|链接|文案)",
-    re.IGNORECASE,
-)
+MAX_PROFILE_COLUMNS = 200
 SENSITIVE_HEADER_RULES = (
     (re.compile(r"(phone|mobile|tel|contact|电话|手机|联系方式)", re.IGNORECASE), "contact_number"),
     (re.compile(r"(email|mail|邮箱|邮件)", re.IGNORECASE), "email"),
     (re.compile(r"(name|姓名|联系人)", re.IGNORECASE), "person_name"),
     (re.compile(r"(身份证|证件|passport|id.number)", re.IGNORECASE), "identity_number"),
+)
+BOOLEAN_HEADER_HINT = re.compile(
+    r"(^|[_\s])(is|has|flag|boolean|enabled|disabled)([_\s]|$)|是否|启用状态|禁用状态|开关|布尔",
+    re.IGNORECASE,
 )
 
 
@@ -73,37 +71,32 @@ def read_text_file(file_path: Path, budget: CharacterBudget) -> dict:
 
 def read_delimited(file_path: Path, budget: CharacterBudget, *, purpose: str) -> dict:
     byte_limit = 16 * 1024 * 1024
-    with file_path.open("rb") as stream:
-        raw = stream.read(byte_limit + 1)
-    input_truncated = len(raw) > byte_limit
-    raw = raw[:byte_limit]
-    text = raw.decode("utf-8-sig", errors="replace")
-    sample = text[:8192]
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
-        delimiter = dialect.delimiter
-    except csv.Error:
-        delimiter = "\t" if file_path.suffix.lower() == ".tsv" else ","
-    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    table = read_delimited_file(
+        file_path,
+        max_bytes=byte_limit,
+        max_rows=MAX_PROFILE_ROWS + 13 if purpose == "data" else 100_001,
+    )
+    input_truncated = table.truncated
     if purpose == "data":
-        raw_rows: list[tuple[int, dict[int, str]]] = []
-        for row_number, row in enumerate(reader, start=1):
-            raw_rows.append((
-                row_number,
-                {
-                    index: value[:2000]
-                    for index, value in enumerate(row[:MAX_PROFILE_COLUMNS])
-                    if value != ""
-                },
-            ))
-            if row_number >= MAX_PROFILE_ROWS + 12:
-                input_truncated = True
-                break
-        return profile_rows(raw_rows, file_path.name, input_truncated)
+        raw_rows = indexed_rows(
+            table,
+            maximum_columns=MAX_PROFILE_COLUMNS,
+            maximum_cell_characters=2000,
+        )
+        if len(raw_rows) >= MAX_PROFILE_ROWS + 12:
+            input_truncated = True
+        profile = profile_rows(raw_rows, file_path.name, input_truncated)
+        return {
+            **profile,
+            "encoding": table.encoding,
+            "delimiter": table.delimiter,
+            "delimiter_detection": table.delimiter_detection,
+            "decode_warning": table.decode_warning,
+        }
     rows = []
     row_count = 0
     maximum_columns = 0
-    for row in reader:
+    for row in table.rows:
         row_count += 1
         maximum_columns = max(maximum_columns, len(row))
         if len(rows) < 12:
@@ -114,7 +107,10 @@ def read_delimited(file_path: Path, budget: CharacterBudget, *, purpose: str) ->
     return {
         "kind": "delimited_text",
         "status": "partial" if input_truncated or row_count > len(rows) or budget.truncated else "complete",
-        "delimiter": delimiter,
+        "encoding": table.encoding,
+        "delimiter": table.delimiter,
+        "delimiter_detection": table.delimiter_detection,
+        "decode_warning": table.decode_warning,
         "row_count": row_count,
         "maximum_columns": maximum_columns,
         "header": rows[0] if rows else [],
@@ -215,49 +211,6 @@ def worksheet_rows_with_strings(
     return rows, truncated
 
 
-def header_score(row: dict[int, str], position: int) -> float:
-    values = [value.strip() for value in row.values() if value.strip()]
-    if not values:
-        return float("-inf")
-    hint_count = sum(1 for value in values if HEADER_HINT.search(value))
-    phone_like = sum(1 for value in values if re.fullmatch(r"\+?\d[\d\s-]{8,}", value))
-    long_values = sum(1 for value in values if len(value) > 80)
-    uniqueness = len(set(values)) / len(values)
-    return (
-        hint_count * 6
-        + min(len(values), 12)
-        + uniqueness * 2
-        - phone_like * 8
-        - long_values * 3
-        - position * 0.15
-    )
-
-
-def choose_header(
-    rows: list[tuple[int, dict[int, str]]],
-) -> tuple[int, int, dict[int, str]]:
-    if not rows:
-        return 0, 0, {}
-    candidates = rows[:12]
-    best_index = max(
-        range(len(candidates)),
-        key=lambda index: header_score(candidates[index][1], index),
-    )
-    row_number, values = candidates[best_index]
-    return best_index, row_number, values
-
-
-def unique_headers(header: dict[int, str], width: int) -> list[str]:
-    result = []
-    used: dict[str, int] = {}
-    for index in range(width):
-        base = header.get(index, "").strip() or f"column_{column_label(index)}"
-        count = used.get(base, 0) + 1
-        used[base] = count
-        result.append(base if count == 1 else f"{base}_{count}")
-    return result
-
-
 def sensitive_reason(column_name: str, values: list[object]) -> str | None:
     for pattern, reason in SENSITIVE_HEADER_RULES:
         if pattern.search(column_name):
@@ -278,17 +231,29 @@ def infer_column(series, column_name: str) -> tuple[str, dict | None]:
     if non_empty.empty:
         return "empty", None
     lowered = set(non_empty.str.lower().unique())
-    if lowered.issubset({"true", "false", "yes", "no", "0", "1", "是", "否"}):
+    if lowered.issubset({"true", "false", "yes", "no", "是", "否"}):
+        return "boolean", None
+    if lowered.issubset({"0", "1"}) and BOOLEAN_HEADER_HINT.search(column_name):
         return "boolean", None
     if re.search(r"(date|time|month|year|日期|时间|月份|年月)", column_name, re.IGNORECASE):
         parsed = pd.to_datetime(non_empty, errors="coerce")
         if parsed.notna().mean() >= 0.6:
-            return "datetime", {
+            parsed_values = parsed.dropna()
+            inferred_type = (
+                "date"
+                if not parsed_values.empty
+                and parsed_values.eq(parsed_values.dt.normalize()).all()
+                else "datetime"
+            )
+            return inferred_type, {
                 "minimum": parsed.min().isoformat(),
                 "maximum": parsed.max().isoformat(),
             }
     numeric = pd.to_numeric(non_empty, errors="coerce")
     if numeric.notna().mean() >= 0.9 and sensitive_reason(column_name, non_empty.tolist()) is None:
+        numeric_values = numeric.dropna()
+        if not numeric_values.empty and numeric_values.mod(1).abs().le(1e-12).all():
+            return "integer", None
         return "number", None
     if non_empty.str.match(r"https?://", case=False).mean() >= 0.8:
         return "url", None

@@ -10,15 +10,18 @@ export const UI_PREFERENCE_DEFAULTS = Object.freeze({
   density: 'comfortable',
   project_rail_width: 282,
   app_rail_width: 228,
-  show_technical_ids: true,
+  context_card_delay: 'normal',
+  reduce_motion: false,
+  show_technical_ids: false,
 });
 
 const ALLOWED = Object.freeze({
   theme: new Set(['slate', 'graphite', 'warm_charcoal']),
-  accent: new Set(['green', 'blue', 'amber']),
+  accent: new Set(['green', 'vermilion', 'amber']),
   contrast: new Set(['standard', 'high']),
   text_size: new Set(['compact', 'comfortable', 'large']),
   density: new Set(['compact', 'comfortable']),
+  context_card_delay: new Set(['fast', 'normal', 'deliberate']),
 });
 
 function boundedInteger(value, fallback, minimum, maximum) {
@@ -29,14 +32,17 @@ function boundedInteger(value, fallback, minimum, maximum) {
 
 export function normalizeUiPreferences(input = {}) {
   const defaults = UI_PREFERENCE_DEFAULTS;
+  const accent = input.accent === 'blue' ? 'vermilion' : input.accent;
   return {
     theme: ALLOWED.theme.has(input.theme) ? input.theme : defaults.theme,
-    accent: ALLOWED.accent.has(input.accent) ? input.accent : defaults.accent,
+    accent: ALLOWED.accent.has(accent) ? accent : defaults.accent,
     contrast: ALLOWED.contrast.has(input.contrast) ? input.contrast : defaults.contrast,
     text_size: ALLOWED.text_size.has(input.text_size) ? input.text_size : defaults.text_size,
     density: ALLOWED.density.has(input.density) ? input.density : defaults.density,
     project_rail_width: boundedInteger(input.project_rail_width, defaults.project_rail_width, 220, 420),
-    app_rail_width: boundedInteger(input.app_rail_width, defaults.app_rail_width, 180, 360),
+    app_rail_width: boundedInteger(input.app_rail_width, defaults.app_rail_width, 68, 360),
+    context_card_delay: ALLOWED.context_card_delay.has(input.context_card_delay) ? input.context_card_delay : defaults.context_card_delay,
+    reduce_motion: input.reduce_motion === true || input.reduce_motion === 'yes',
     show_technical_ids: input.show_technical_ids === true || input.show_technical_ids === 'yes',
   };
 }
@@ -75,12 +81,15 @@ export function resetUiPreferences(stateDir) {
 
 export function preferenceHtmlAttributes(preferences) {
   const value = normalizeUiPreferences(preferences);
+  const contextDelay = { fast: 250, normal: 650, deliberate: 1200 }[value.context_card_delay];
   return [
     `data-theme="${value.theme}"`,
     `data-accent="${value.accent}"`,
     `data-contrast="${value.contrast}"`,
     `data-text-size="${value.text_size}"`,
     `data-density="${value.density}"`,
+    `data-context-delay="${contextDelay}"`,
+    `data-reduce-motion="${value.reduce_motion ? 'true' : 'false'}"`,
     `data-technical-ids="${value.show_technical_ids ? 'shown' : 'hidden'}"`,
   ].join(' ');
 }

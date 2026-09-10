@@ -1,24 +1,49 @@
 :root {
-  color-scheme: dark;
-  --canvas: #161a1f;
-  --surface: #20252b;
-  --surface-muted: #282e35;
-  --ink: #e7ece9;
-  --muted: #b8c1bc;
-  --line: #414950;
-  --accent: #72b18c;
-  --accent-strong: #9bd0af;
-  --accent-soft: #243a2d;
-  --accent-line: #4d745c;
-  --warning: #e1ae63;
-  --warning-soft: #40331f;
-  --danger: #e58a84;
-  --danger-soft: #432a2b;
-  --shadow-soft: 0 1px 2px rgba(0, 0, 0, .18), 0 14px 34px rgba(0, 0, 0, .16);
+  color-scheme: light;
+  --canvas: #d8d1c5;
+  --surface: rgb(245 241 232 / 92%);
+  --surface-muted: #e4dccd;
+  --surface-raised: #f7f3ea;
+  --ink: #26221d;
+  --muted: #655d52;
+  --line: #aea28f;
+  --accent: #647d62;
+  --accent-strong: #344b37;
+  --accent-soft: #d4e0cf;
+  --accent-line: #718871;
+  --warning: #9b6e08;
+  --warning-soft: #efe0af;
+  --danger: #a94230;
+  --danger-soft: #efd2c9;
+  --safe-action: #55745c;
+  --safe-action-hover: #45624d;
+  --safe-action-text: #fbf6eb;
+  --danger-action: #a94230;
+  --danger-action-hover: #873326;
+  --danger-action-text: #fff6ef;
+  --nav-bg: #292722;
+  --nav-panel: #35312a;
+  --nav-text: #f3ecdf;
+  --nav-muted: #c2b7a6;
+  --nav-line: #5d564a;
+  --nav-active-bg: #d2a629;
+  --nav-active-text: #241f17;
+  --topbar-bg: #b94b38;
+  --topbar-text: #fff4e9;
+  --topbar-muted: #f0c9bc;
+  --block-one: #e4cf82;
+  --block-two: #c8d8c5;
+  --block-three: #df8a70;
+  --tree-focus: #ead9a1;
+  --body-background:
+    linear-gradient(112deg, rgb(246 241 230 / 62%), rgb(213 196 166 / 18%) 58%, rgb(177 74 55 / 12%)),
+    radial-gradient(circle at 84% 10%, rgb(199 77 57 / 20%), transparent 24%),
+    url('/ui/atlas-paper-texture.png');
+  --shadow-soft: 0 12px 34px rgb(62 47 28 / 10%);
   --radius-surface: 12px;
   --radius-control: 8px;
-  --font-sans: Satoshi, Aptos, "Segoe UI Variable", "Segoe UI", sans-serif;
-  --font-mono: "Geist Mono", "Cascadia Code", Consolas, monospace;
+  --font-sans: Aptos, "Segoe UI Variable", "Segoe UI", sans-serif;
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
   --font-size-base: 16px;
   --font-size-work: 14px;
   --font-size-small: 13px;
@@ -27,33 +52,73 @@
 }
 
 html[data-theme="graphite"] {
-  --canvas: #101317;
-  --surface: #191d22;
-  --surface-muted: #23282e;
-  --ink: #edf1ef;
-  --muted: #bdc5c1;
-  --line: #3f474f;
+  --canvas: #bdb0b5;
+  --surface: rgb(244 238 230 / 93%);
+  --surface-muted: #d8cbc9;
+  --surface-raised: #f8f1e8;
+  --ink: #2a1825;
+  --muted: #685662;
+  --line: #9d8992;
+  --nav-bg: #321a2d;
+  --nav-panel: #45243e;
+  --nav-text: #fff2e7;
+  --nav-muted: #d8bfcf;
+  --nav-line: #6d4962;
+  --nav-active-bg: #d96b52;
+  --nav-active-text: #2a1523;
+  --topbar-bg: #b9d8c2;
+  --topbar-text: #241725;
+  --topbar-muted: #594657;
+  --block-one: #d97057;
+  --block-two: #b8d5c1;
+  --block-three: #c49aaf;
+  --tree-focus: #d8c1c7;
+  --body-background:
+    linear-gradient(118deg, rgb(243 235 228 / 70%), rgb(105 58 90 / 16%) 60%, rgb(215 100 78 / 18%)),
+    radial-gradient(circle at 76% 4%, rgb(185 216 194 / 44%), transparent 25%),
+    url('/ui/atlas-paper-texture.png');
+  --shadow-soft: 0 14px 38px rgb(48 20 40 / 14%);
 }
 html[data-theme="warm_charcoal"] {
-  --canvas: #181714;
-  --surface: #24221f;
-  --surface-muted: #2d2a26;
-  --ink: #eeeae2;
-  --muted: #c3bbb0;
-  --line: #49443d;
+  --canvas: #cbc9be;
+  --surface: rgb(244 241 232 / 94%);
+  --surface-muted: #dcd9cc;
+  --surface-raised: #faf6ec;
+  --ink: #242722;
+  --muted: #5e645b;
+  --line: #9da096;
+  --nav-bg: #222821;
+  --nav-panel: #30382f;
+  --nav-text: #f5f0e4;
+  --nav-muted: #bdc6b9;
+  --nav-line: #535d51;
+  --nav-active-bg: #c6523e;
+  --nav-active-text: #fff4e9;
+  --topbar-bg: #d2a629;
+  --topbar-text: #242117;
+  --topbar-muted: #65521b;
+  --block-one: #c8d1bb;
+  --block-two: #e0bb4f;
+  --block-three: #cc6954;
+  --tree-focus: #d9dfcc;
+  --body-background:
+    linear-gradient(100deg, rgb(245 242 234 / 72%), rgb(91 105 86 / 12%) 64%, rgb(208 166 41 / 18%)),
+    radial-gradient(circle at 82% 8%, rgb(208 166 41 / 30%), transparent 23%),
+    url('/ui/atlas-paper-texture.png');
+  --shadow-soft: 0 12px 34px rgb(34 40 33 / 12%);
 }
-html[data-contrast="standard"] { --muted: #9ba5a0; --line: #353c43; }
-html[data-accent="blue"] {
-  --accent: #7fa7c3;
-  --accent-strong: #acd0e7;
-  --accent-soft: #253746;
-  --accent-line: #4e7188;
+html[data-contrast="standard"] { --muted: #81776c; --line: #bbb09f; }
+html[data-accent="vermilion"] {
+  --accent: #b94b38;
+  --accent-strong: #7f3025;
+  --accent-soft: #efd3ca;
+  --accent-line: #b85a47;
 }
 html[data-accent="amber"] {
-  --accent: #d3a766;
-  --accent-strong: #e7c48f;
-  --accent-soft: #3d3221;
-  --accent-line: #765f3c;
+  --accent: #b98612;
+  --accent-strong: #765407;
+  --accent-soft: #eee0ad;
+  --accent-line: #ae831f;
 }
 html[data-text-size="compact"] {
   --font-size-base: 14px;
