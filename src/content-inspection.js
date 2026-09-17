@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { locateAnalyticsPython } from './analytics-evaluation.js';
+import { locateContentPython } from './python-runtime.js';
 
 // Coordination boundary: Desktop UI and Execution Hosts call these same Node
 // application services. Node binds local resource identity and state; Python
@@ -267,10 +267,10 @@ export function inspectContent({
     };
   }
 
-  const executable = pythonPath ?? locateAnalyticsPython({ installationRoot });
+  const executable = pythonPath ?? locateContentPython({ installationRoot });
   if (!executable) {
     const error = new Error(
-      'Atlas local content inspection requires the optional Python component. Run atlas analytics install first.',
+      'Atlas local content inspection requires the installed Desktop Python component. Run atlas ui install first.',
     );
     error.code = 'ATLAS_CAPABILITY_UNAVAILABLE';
     throw error;
@@ -358,7 +358,7 @@ export function runDataWork({
     error.code = 'ATLAS_STATE_CONFLICT';
     throw error;
   }
-  const executable = pythonPath ?? locateAnalyticsPython({ installationRoot });
+  const executable = pythonPath ?? locateContentPython({ installationRoot });
   if (!executable) {
     const error = new Error('Atlas Data Work requires the installed local Python component.');
     error.code = 'ATLAS_CAPABILITY_UNAVAILABLE';
@@ -458,10 +458,10 @@ export function compareContent({
     };
   }
 
-  const executable = pythonPath ?? locateAnalyticsPython({ installationRoot });
+  const executable = pythonPath ?? locateContentPython({ installationRoot });
   if (!executable) {
     const error = new Error(
-      'Atlas local content comparison requires the optional Python component. Run atlas analytics install first.',
+      'Atlas local content comparison requires the installed Desktop Python component. Run atlas ui install first.',
     );
     error.code = 'ATLAS_CAPABILITY_UNAVAILABLE';
     throw error;
@@ -580,10 +580,10 @@ export function compareContentBranches({
   const cached = fs.existsSync(cachePath) ? validBranchCache(cachePath, sources) : null;
   if (cached) return { ...cached, branch_set_id: branchSetId, cache_hit: true, cache_path: cachePath };
 
-  const executable = pythonPath ?? locateAnalyticsPython({ installationRoot });
+  const executable = pythonPath ?? locateContentPython({ installationRoot });
   if (!executable) {
     const error = new Error(
-      'Atlas local chat branch analysis requires the optional Python component. Run atlas analytics install first.',
+      'Atlas local chat branch analysis requires the installed Desktop Python component. Run atlas ui install first.',
     );
     error.code = 'ATLAS_CAPABILITY_UNAVAILABLE';
     throw error;

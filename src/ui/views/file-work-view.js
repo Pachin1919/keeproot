@@ -122,6 +122,7 @@ function resultActions(work, csrfToken, {
     ${projectLink ? `<a class="action-button action-button-secondary" href="${escapeHtml(projectLink)}">Open Project</a>` : canUseSource ? `<a class="action-button action-button-secondary" href="/files/add-to-project?work_id=${encodeURIComponent(work.work_id)}">Add to Project</a>` : ''}
     ${dataWorkLink}
     ${work.project_transfer?.undo_available ? `<form method="post" action="/files/add-to-project/undo"><input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="work_id" value="${escapeHtml(work.work_id)}"><button class="action-button action-button-secondary" type="submit">Undo Add to Project</button></form>` : ''}
+    ${work.project_transfer?.redo_available ? `<form method="post" action="/files/add-to-project/redo"><input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="work_id" value="${escapeHtml(work.work_id)}"><button class="action-button" type="submit">Redo Add to Project</button></form>` : ''}
     <form method="post" action="/files/remove"><input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="work_id" value="${escapeHtml(work.work_id)}"><button class="action-button action-button-remove" type="submit">Remove from Recent Work</button></form>
     <a class="action-button action-button-secondary" href="${escapeHtml(backHref)}">Back</a>
   </div>`;

@@ -1,4 +1,3 @@
-import fs from 'node:fs';
 import path from 'node:path';
 import { describeFileReadFailure } from '../file-read-failure.js';
 
@@ -87,18 +86,14 @@ export function createBatchWorkService({ fileWork, projectImport, inspectionFact
     return results;
   }
 
-  function prepareImports({ workIds, projectId, folder }) {
+  function prepareImports({ workIds, projectId, folder, attemptKey = null }) {
     return workIds.map((workId) => {
       const work = fileWork.recentWorkById(workId);
       if (!work || work.project?.id || projectImport.projectForFile(work?.file_path)?.id) {
         return { work_id: workId, name: work ? path.basename(work.file_path) : 'Unavailable file', status: 'Not available' };
       }
       try {
-        const destination = projectImport.destinationForFolder(projectId, folder, work.file_path);
-        if (fs.existsSync(destination.target_path)) {
-          return { work_id: workId, name: path.basename(work.file_path), target_path: destination.target_path, status: 'Conflict — already exists' };
-        }
-        const prepared = projectImport.prepare({ work, projectId, folder });
+        const prepared = projectImport.prepare({ work, projectId, folder, attemptKey: `${attemptKey ?? 'batch'}:${workId}` });
         return {
           work_id: workId,
           name: path.basename(work.file_path),
@@ -107,7 +102,7 @@ export function createBatchWorkService({ fileWork, projectImport, inspectionFact
           prepared,
         };
       } catch (error) {
-        return { work_id: workId, name: path.basename(work.file_path), status: error.message };
+        return { work_id: workId, name: path.basename(work.file_path), target_path: error.target?.target_path ?? null, status: error.message };
       }
     });
   }
@@ -117,7 +112,7 @@ export function createBatchWorkService({ fileWork, projectImport, inspectionFact
       try {
         return { work_id: item.work_id, status: 'saved', work: projectImport.save(item.prepared) };
       } catch (error) {
-        return { work_id: item.work_id, status: 'failed', error: error.message };
+        return { work_id: item.work_id, status: 'failed', error: error.message, error_code: error.code ?? null };
       }
     });
   }
@@ -128,7 +123,7 @@ export function createBatchWorkService({ fileWork, projectImport, inspectionFact
       try {
         results.push({ work_id: item.work_id, status: 'saved', work: await projectImport.saveAsync(item.prepared) });
       } catch (error) {
-        results.push({ work_id: item.work_id, status: 'failed', error: error.message });
+        results.push({ work_id: item.work_id, status: 'failed', error: error.message, error_code: error.code ?? null });
       }
     }
     return results;

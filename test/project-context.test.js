@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
+import { LATEST_SCHEMA_VERSION } from '../src/ledger.js';
 import { Registry } from '../src/registry.js';
 
 const tempRoot = path.resolve('test', '.tmp');
@@ -17,12 +19,12 @@ function setup(name) {
   return { stateDir, vaultRoot, websiteRoot };
 }
 
-test('schema v20 keeps Project context and identity tables outside ledger.js', (t) => {
+test('current schema keeps Project context, identity, and Resource tables outside ledger.js', (t) => {
   const { stateDir } = setup('project-context-schema');
   const registry = new Registry({ stateDir });
   t.after(() => registry.dispose());
 
-  assert.equal(registry.ledger.db.prepare('PRAGMA user_version').get().user_version, 20);
+  assert.equal(registry.ledger.db.prepare('PRAGMA user_version').get().user_version, LATEST_SCHEMA_VERSION);
   const tables = new Set(
     registry.ledger.db.prepare(`
       SELECT name FROM sqlite_master WHERE type = 'table'
@@ -31,6 +33,10 @@ test('schema v20 keeps Project context and identity tables outside ledger.js', (
   assert.ok(tables.has('project_locations'));
   assert.ok(tables.has('project_context_links'));
   assert.ok(tables.has('project_identity_signatures'));
+  assert.ok(tables.has('resources'));
+  assert.ok(tables.has('resource_locations'));
+  assert.ok(tables.has('resource_save_links'));
+  assert.ok(tables.has('resource_relationships'));
   const rootColumns = new Set(
     registry.ledger.db.prepare('PRAGMA table_info(portfolio_roots)').all().map((row) => row.name),
   );
@@ -38,6 +44,25 @@ test('schema v20 keeps Project context and identity tables outside ledger.js', (
   assert.ok(rootColumns.has('root_type'));
   assert.ok(rootColumns.has('content_policy'));
   assert.ok(rootColumns.has('adopted_at'));
+});
+
+test('a v20 Ledger reopen backs up and applies the current Resource schema', (t) => {
+  const { stateDir } = setup('project-context-v20-reopen'); const registry = new Registry({ stateDir });
+  // Registry creates its Ledger lazily; force the current schema to disk before
+  // making the bounded v20 fixture below.
+  void registry.ledger;
+  registry.dispose();
+  const db = new DatabaseSync(path.join(stateDir, 'ledger.sqlite'));
+  try {
+    for (const table of ['resource_actions', 'resource_relationships', 'resource_save_links', 'resource_locations', 'resources']) db.exec(`DROP TABLE ${table}`);
+    db.prepare('DELETE FROM schema_migrations WHERE version >= 21').run(); db.exec('PRAGMA user_version = 20');
+  } finally { db.close(); }
+  const reopened = new Registry({ stateDir });
+  try {
+    assert.equal(reopened.ledger.db.prepare('PRAGMA user_version').get().user_version, LATEST_SCHEMA_VERSION);
+    assert.equal(fs.existsSync(path.join(stateDir, 'backups', `ledger-pre-migration-v20-to-v${LATEST_SCHEMA_VERSION}.sqlite`)), true);
+    assert.ok(reopened.ledger.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='resources'`).get());
+  } finally { reopened.dispose(); }
 });
 
 test('Registry adopts real roots and binds each Project to one active location', (t) => {

@@ -138,10 +138,10 @@ for (const legacyVersion of [8, 10, 11, 18]) {
     try {
       legacy.exec(`
         DROP TABLE catalog_fts;
-        DROP TABLE source_set_items;
-        DROP TABLE source_sets;
-        DROP TABLE context_candidate_items;
-        DROP TABLE context_candidate_sets;
+        DROP TABLE IF EXISTS source_set_items;
+        DROP TABLE IF EXISTS source_sets;
+        DROP TABLE IF EXISTS context_candidate_items;
+        DROP TABLE IF EXISTS context_candidate_sets;
         DROP TABLE catalog_entries;
         DROP TABLE catalog_generations;
         DROP TABLE project_context_links;
@@ -149,7 +149,7 @@ for (const legacyVersion of [8, 10, 11, 18]) {
       `);
       if (legacyVersion < 11) legacy.exec('DROP TABLE evolution_operations;');
       if (legacyVersion < 12) {
-        legacy.exec('DROP TABLE task_inputs; DROP TABLE task_contracts;');
+        legacy.exec('DROP TABLE IF EXISTS task_inputs; DROP TABLE IF EXISTS task_contracts;');
       }
       legacy.exec(`PRAGMA user_version = ${legacyVersion};`);
     } finally {

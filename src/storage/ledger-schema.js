@@ -5,8 +5,17 @@ import {
   applyProjectIdentityMigration,
   PROJECT_IDENTITY_SCHEMA_VERSION,
 } from './migrations/v20-project-identity.js';
+import { applyResourceControlMigration, RESOURCE_CONTROL_SCHEMA_VERSION } from './migrations/v21-resource-control.js';
+import {
+  applyLegacyTaskRemovalMigration,
+  LEGACY_TASK_REMOVAL_SCHEMA_VERSION,
+} from './migrations/v22-remove-legacy-task-storage.js';
+import {
+  applyLegacyContextSelectionRemovalMigration,
+  LEGACY_CONTEXT_SELECTION_REMOVAL_SCHEMA_VERSION,
+} from './migrations/v23-retire-legacy-context-selection.js';
 
-export const LATEST_SCHEMA_VERSION = PROJECT_IDENTITY_SCHEMA_VERSION;
+export const LATEST_SCHEMA_VERSION = LEGACY_CONTEXT_SELECTION_REMOVAL_SCHEMA_VERSION;
 
 function now() {
   return new Date().toISOString();
@@ -371,51 +380,6 @@ export function initializeLedgerSchema(db, transaction) {
         executed_at TEXT
       );
 
-      CREATE TABLE IF NOT EXISTS task_contracts (
-        run_id TEXT PRIMARY KEY REFERENCES runs(id),
-        contract_id TEXT NOT NULL UNIQUE,
-        project_id TEXT NOT NULL REFERENCES projects(id),
-        project_path TEXT NOT NULL,
-        environment_rule_version_id TEXT NOT NULL REFERENCES rule_versions(id),
-        contract_hash TEXT NOT NULL,
-        request_json TEXT NOT NULL,
-        contract_json TEXT NOT NULL,
-        underlying_run_id TEXT REFERENCES runs(id),
-        completion_receipt_json TEXT,
-        completed_at TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS task_inputs (
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        ordinal INTEGER NOT NULL,
-        path TEXT NOT NULL,
-        artifact_id TEXT REFERENCES artifacts(id),
-        material_id TEXT REFERENCES materials(id),
-        prepared_hash TEXT NOT NULL,
-        byte_size INTEGER NOT NULL,
-        selected INTEGER NOT NULL,
-        selection_reason TEXT,
-        series_id TEXT,
-        temporal_mode TEXT,
-        coverage_start TEXT,
-        coverage_end TEXT,
-        required INTEGER NOT NULL,
-        priority INTEGER NOT NULL,
-        PRIMARY KEY(run_id, ordinal),
-        UNIQUE(run_id, path)
-      );
-
-      CREATE TABLE IF NOT EXISTS task_fulfillment_claims (
-        task_run_id TEXT PRIMARY KEY REFERENCES task_contracts(run_id),
-        claim_token TEXT NOT NULL UNIQUE,
-        process_id INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        planned_write_run_id TEXT,
-        write_run_id TEXT REFERENCES runs(id),
-        claimed_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
       CREATE TABLE IF NOT EXISTS routing_corrections (
         id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
@@ -570,7 +534,6 @@ export function initializeLedgerSchema(db, transaction) {
       ensureColumn(db, 'artifacts', 'status', "TEXT NOT NULL DEFAULT 'active'");
       ensureColumn(db, 'artifacts', 'updated_at', 'TEXT');
       ensureColumn(db, 'derived_operations', 'revised_from_run_id', 'TEXT REFERENCES runs(id)');
-      ensureColumn(db, 'task_fulfillment_claims', 'planned_write_run_id', 'TEXT');
       ensureColumn(db, 'portfolio_inventories', 'expanded_json', "TEXT NOT NULL DEFAULT '[]'");
       db.exec(`
         UPDATE artifacts
@@ -604,6 +567,9 @@ export function initializeLedgerSchema(db, transaction) {
       insertMigration.run(18, 'scoped_effective_preference_rules', appliedAt);
       applyProjectContextMigration(db, appliedAt);
       applyProjectIdentityMigration(db, appliedAt);
+      applyResourceControlMigration(db, appliedAt);
+      applyLegacyTaskRemovalMigration(db, appliedAt);
+      applyLegacyContextSelectionRemovalMigration(db, appliedAt);
       db.exec(`PRAGMA user_version = ${LATEST_SCHEMA_VERSION};`);
     });
 }

@@ -74,6 +74,23 @@ function normalizeTrustedInput(targetRoot, input) {
   };
 }
 
+function realTargetParent(root, parent, targetInput) {
+  const lexicalRoot = path.resolve(root);
+  const realRoot = fs.realpathSync.native(lexicalRoot);
+  if (!isPathInside(lexicalRoot, parent) && parent !== lexicalRoot) throw new Error(`Derived target escapes the root: ${targetInput}`);
+  let cursor = lexicalRoot;
+  const rootStat = fs.lstatSync(cursor);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error(`Derived target parent must be a real directory: ${cursor}`);
+  for (const part of path.relative(lexicalRoot, parent).split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, part);
+    const stat = fs.lstatSync(cursor);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Derived target parent must be a real directory: ${cursor}`);
+    const realCursor = fs.realpathSync.native(cursor);
+    if (!isPathInside(realRoot, realCursor) && realCursor !== realRoot) throw new Error(`Derived target parent resolves outside the root: ${targetInput}`);
+  }
+  return fs.realpathSync.native(parent);
+}
+
 function normalizeNewTarget(root, targetInput) {
   if (typeof targetInput !== 'string' || !targetInput.trim()) {
     throw new Error('Derived prepare requires a target file path.');
@@ -89,11 +106,7 @@ function normalizeNewTarget(root, targetInput) {
   if (!fs.existsSync(parent)) {
     throw new Error(`Derived target parent directory does not exist: ${parent}`);
   }
-  const parentStat = fs.lstatSync(parent);
-  if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
-    throw new Error(`Derived target parent must be a real directory: ${parent}`);
-  }
-  const realParent = fs.realpathSync.native(parent);
+  const realParent = realTargetParent(root, parent, targetInput);
   if (!isPathInside(root, realParent)) {
     throw new Error(`Derived target resolves outside the root: ${targetInput}`);
   }
@@ -102,6 +115,18 @@ function normalizeNewTarget(root, targetInput) {
     throw new Error(`Derived target resolves outside the root: ${targetInput}`);
   }
   return { absolute, relative: toPortablePath(path.relative(root, absolute)) };
+}
+
+function resolveCurrentTarget(root, targetInput) {
+  const recordedRoot = path.resolve(root);
+  const lexical = path.resolve(recordedRoot, ...String(targetInput).split('/'));
+  if (!isPathInside(recordedRoot, lexical) || lexical === recordedRoot) throw new Error(`Derived target escapes the root: ${targetInput}`);
+  const parent = path.dirname(lexical);
+  if (!fs.existsSync(parent)) throw new Error(`Derived target parent directory does not exist: ${parent}`);
+  const realRoot = fs.realpathSync.native(recordedRoot);
+  const realParent = realTargetParent(recordedRoot, parent, targetInput);
+  if (!isPathInside(realRoot, realParent)) throw new Error(`Derived target parent resolves outside the root: ${targetInput}`);
+  return path.join(realParent, path.basename(lexical));
 }
 
 function isTargetInsideProject(targetPath, projectPath) {
@@ -296,15 +321,34 @@ function currentHash(filePath) {
   return sha256File(filePath);
 }
 
-function atomicCreate(targetPath, blobPath) {
-  const tempPath = path.join(path.dirname(targetPath), `.atlas-${crypto.randomUUID()}.tmp`);
+function publishOwnership(targetPath) {
+  const publish_token = crypto.randomUUID();
+  return { publish_token, temp_path: path.join(path.dirname(targetPath), `.atlas-derived-${publish_token}.publish.tmp`) };
+}
+
+function regularFileIdentity(filePath) {
   try {
-    fs.copyFileSync(blobPath, tempPath, fs.constants.COPYFILE_EXCL);
-    if (fs.existsSync(targetPath)) throw new Error('Derived target was claimed before the protected create.');
-    fs.linkSync(tempPath, targetPath);
-  } finally {
-    fs.rmSync(tempPath, { force: true });
+    const stat = fs.lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) return null;
+    return { dev: stat.dev, ino: stat.ino };
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
   }
+}
+
+function sameFile(leftPath, rightPath) {
+  const left = regularFileIdentity(leftPath);
+  const right = regularFileIdentity(rightPath);
+  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);
+}
+
+function atomicCreate(targetPath, blobPath, tempPath) {
+  if (!fs.existsSync(tempPath)) fs.copyFileSync(blobPath, tempPath, fs.constants.COPYFILE_EXCL);
+  if (currentHash(tempPath) !== sha256File(blobPath)) {
+    throw new Error('Derived publish temporary file does not match the approved Candidate.');
+  }
+  fs.linkSync(tempPath, targetPath);
 }
 
 export class Derived {
@@ -512,7 +556,7 @@ export class Derived {
       ? {
           status: 'ready',
           decision: 'allow',
-          reason: 'The Agent proposed one absent target inside the selected Project and the user task authorized its placement.',
+          reason: 'The Agent proposed one absent target inside the selected Project and the current request authorized its placement.',
           configured: false,
           rule_version_id: null,
           environment_policy_id: null,
@@ -696,7 +740,19 @@ export class Derived {
 
   #execute(runId) {
     const detail = this.preview(runId);
-    if (detail.execution_receipt) return detail.execution_receipt;
+    if (detail.execution_receipt) {
+      const targetPath = resolveCurrentTarget(detail.run.root_path, detail.candidate.target_path);
+      const ownership = detail.events.find((event) => event.type === 'derived_execution_started')?.payload?.ownership;
+      const tempPath = ownership?.temp_path;
+      if (typeof tempPath === 'string'
+          && path.dirname(tempPath) === path.dirname(targetPath)
+          && currentHash(targetPath) === detail.candidate.content_hash
+          && currentHash(tempPath) === detail.candidate.content_hash
+          && sameFile(targetPath, tempPath)) {
+        fs.rmSync(tempPath, { force: true });
+      }
+      return detail.execution_receipt;
+    }
     if (detail.run.status !== 'approved') {
       throw new Error(`Derived execution requires approval; current status is ${detail.run.status}.`);
     }
@@ -721,13 +777,21 @@ export class Derived {
       }
     }
 
-    const targetPath = path.resolve(detail.run.root_path, ...detail.candidate.target_path.split('/'));
-    const executionStarted = detail.events.some((event) => event.type === 'derived_execution_started');
+    const targetPath = resolveCurrentTarget(detail.run.root_path, detail.candidate.target_path);
+    const startedEvent = detail.events.find((event) => event.type === 'derived_execution_started');
+    const executionStarted = Boolean(startedEvent);
+    const ownership = startedEvent?.payload?.ownership ?? null;
+    let tempPath = ownership?.temp_path ?? null;
     const observedTarget = currentHash(targetPath);
-    if (observedTarget !== null
-        && !(executionStarted && observedTarget === detail.candidate.content_hash)) {
+    const ownershipProven = executionStarted
+      && observedTarget === detail.candidate.content_hash
+      && typeof tempPath === 'string'
+      && path.dirname(tempPath) === path.dirname(targetPath)
+      && currentHash(tempPath) === detail.candidate.content_hash && sameFile(targetPath, tempPath);
+    if (observedTarget !== null && !ownershipProven) {
       this.ledger.markDerivedStale(runId, {
-        reason: 'target_claimed',
+        reason: executionStarted && observedTarget === detail.candidate.content_hash
+          ? 'ownership_unresolved' : 'target_claimed',
         target_path: detail.candidate.target_path,
         expected_hash: null,
         observed_hash: observedTarget,
@@ -735,12 +799,15 @@ export class Derived {
       throw new Error('Derived target already exists or was claimed after preview; approval is stale.');
     }
     if (observedTarget === null) {
-      this.ledger.startDerivedExecution(runId, timestamp());
+      const started = this.ledger.startDerivedExecution(runId, timestamp(), publishOwnership(targetPath));
+      const publishTemp = started.ownership?.temp_path;
+      if (!publishTemp || path.dirname(publishTemp) !== path.dirname(targetPath)) throw new Error('Derived publish ownership is invalid.');
+      tempPath = publishTemp;
       try {
-        atomicCreate(targetPath, detail.candidate.blob_path);
+        atomicCreate(targetPath, detail.candidate.blob_path, publishTemp);
       } catch (error) {
         const afterFailure = currentHash(targetPath);
-        if (afterFailure === detail.candidate.content_hash) {
+        if (afterFailure === detail.candidate.content_hash && sameFile(targetPath, publishTemp)) {
           // The protected create completed or converged after Atlas recorded its intent.
         } else if (afterFailure !== null) {
           this.ledger.markDerivedStale(runId, {
@@ -760,7 +827,7 @@ export class Derived {
       throw new Error('Derived verification failed: target does not match the approved Candidate.');
     }
     const executedAt = timestamp();
-    return this.ledger.finishDerivedExecution(runId, {
+    const receipt = this.ledger.finishDerivedExecution(runId, {
       receipt: {
         run_id: runId,
         status: 'executed',
@@ -777,6 +844,8 @@ export class Derived {
       },
       executedAt,
     });
+    if (tempPath) fs.rmSync(tempPath, { force: true });
+    return receipt;
   }
 
   rollback(runId) {
@@ -786,6 +855,52 @@ export class Derived {
       } catch (error) {
         this.ledger.recordRollbackError(runId, error);
         throw error;
+      }
+    });
+  }
+
+  redo(runId) {
+    return withStateLock(this.stateDir, () => {
+      const detail = this.preview(runId);
+      if (detail.run.status !== 'rolled_back') throw new Error(`Only a rolled back Derived run can be redone; current status is ${detail.run.status}.`);
+      validateMaterial(detail.candidate, 'Candidate');
+      for (const input of detail.inputs) {
+        validateMaterial(input, `Input ${input.path}`);
+        const inputRoot = input.source_root_path ?? detail.run.root_path;
+        const inputPath = input.source_relative_path ?? input.path;
+        if (currentHash(path.resolve(inputRoot, ...inputPath.split('/'))) !== input.content_hash) throw new Error(`Derived input changed after preview: ${input.path}`);
+      }
+      const targetPath = resolveCurrentTarget(detail.run.root_path, detail.candidate.target_path);
+      const startedEvent = detail.events.find((event) => event.type === 'derived_redo_started');
+      const started = startedEvent?.payload ?? null;
+      let tempPath = started?.ownership?.temp_path ?? null;
+      const observedTarget = currentHash(targetPath);
+      const ownershipProven = observedTarget === detail.candidate.content_hash
+        && typeof tempPath === 'string'
+        && path.dirname(tempPath) === path.dirname(targetPath)
+        && currentHash(tempPath) === detail.candidate.content_hash
+        && sameFile(targetPath, tempPath);
+      if (observedTarget !== null && !ownershipProven) throw new Error('Derived redo requires an empty target path.');
+      if (observedTarget === null) {
+        const intent = this.ledger.derived.startDerivedRedo(runId, timestamp(), publishOwnership(targetPath));
+        tempPath = intent.ownership?.temp_path;
+        if (!tempPath || path.dirname(tempPath) !== path.dirname(targetPath)) throw new Error('Derived redo ownership is invalid.');
+        try {
+          atomicCreate(targetPath, detail.candidate.blob_path, tempPath);
+        } catch (error) {
+          const afterFailure = currentHash(targetPath);
+          if (!(afterFailure === detail.candidate.content_hash && sameFile(targetPath, tempPath))) throw error;
+        }
+      }
+      if (currentHash(targetPath) !== detail.candidate.content_hash) throw new Error('Derived redo verification failed: target does not match the approved Candidate.');
+      const redoneAt = timestamp();
+      let committed = false;
+      try {
+        const receipt = this.ledger.derived.finishDerivedRedo(runId, { ...detail.execution_receipt, run_id: runId, status: 'executed', verified: true, rollback_ready: true, after_sha256: detail.candidate.content_hash, redone_at: redoneAt }, redoneAt);
+        committed = true;
+        return receipt;
+      } finally {
+        if (committed && tempPath) fs.rmSync(tempPath, { force: true });
       }
     });
   }
@@ -809,7 +924,7 @@ export class Derived {
         downstream_runs: consumers,
       }]);
     }
-    const targetPath = path.resolve(detail.run.root_path, ...detail.candidate.target_path.split('/'));
+    const targetPath = resolveCurrentTarget(detail.run.root_path, detail.candidate.target_path);
     const observed = currentHash(targetPath);
     const rollbackStarted = detail.events.some((event) => event.type === 'derived_rollback_started');
     if (observed !== detail.output.content_hash && !(observed === null && rollbackStarted)) {

@@ -26,8 +26,6 @@ function storageRemove(kind, key) {
   try { window[kind]?.removeItem(key); } catch {}
 }
 
-let pageZoom = 1;
-
 const topbar = document.querySelector('.topbar[data-current-project-id]');
 const currentProjectId = topbar?.dataset.currentProjectId;
 const currentResourcePath = topbar?.dataset.currentResourcePath;
@@ -101,13 +99,28 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
   const resourceListKey = `atlas-ui-resource-list:${projectId}`;
   const folders = [...tree.querySelectorAll('[data-project-folder]')];
   const folderControls = [...tree.querySelectorAll('[data-folder-select]')];
-  const fileGroups = [...fileList.querySelectorAll('[data-folder-files]')];
+  const folderToggles = [...tree.querySelectorAll('[data-folder-toggle]')];
+  let fileGroups = [...fileList.querySelectorAll('[data-folder-files]')];
+  let reflowPaneWidths = () => {};
+  const folderOpen = (folder) => folder?.dataset.folderOpen === 'true';
+  const setFolderOpen = (folder, open) => {
+    if (!folder) return;
+    folder.dataset.folderOpen = String(open);
+    const toggle = folder.querySelector(':scope > [data-folder-toggle]');
+    const children = folder.querySelector(':scope > .workspace-tree-folder-children');
+    toggle?.setAttribute('aria-expanded', String(open));
+    if (toggle) {
+      const name = folder.querySelector(':scope > [data-folder-select]')?.textContent?.trim() ?? 'folder';
+      toggle.setAttribute('aria-label', `${open ? 'Collapse' : 'Expand'} ${name}`);
+    }
+    if (children) children.hidden = !open;
+  };
   const saved = storageGet('localStorage', storageKey);
   if (saved != null) {
     let openPaths = [];
     try { openPaths = JSON.parse(saved); } catch { openPaths = []; }
     const openSet = new Set(Array.isArray(openPaths) ? openPaths : []);
-    folders.forEach((folder) => { folder.open = openSet.has(folder.dataset.folderPath ?? ''); });
+    folders.forEach((folder) => setFolderOpen(folder, openSet.has(folder.dataset.folderPath ?? '')));
   }
   const focusedPath = tree.dataset.focusPath;
   const focusedRow = focusedPath ? fileList.querySelector(`[data-resource-path="${CSS.escape(focusedPath)}"]`) : null;
@@ -116,21 +129,23 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
     folders.filter((folder) => {
       const folderPath = folder.dataset.folderPath ?? '';
       return folderPath === focusedFolderPath || focusedFolderPath.startsWith(`${folderPath}/`);
-    }).forEach((folder) => { folder.open = true; });
+    }).forEach((folder) => setFolderOpen(folder, true));
   }
   const saveFolders = () => storageSet('localStorage', storageKey, JSON.stringify(
-    folders.filter((folder) => folder.open).map((folder) => folder.dataset.folderPath ?? ''),
+    folders.filter(folderOpen).map((folder) => folder.dataset.folderPath ?? ''),
   ));
   if (focusedRow) saveFolders();
-  folders.forEach((folder) => folder.addEventListener('toggle', saveFolders));
 
-  const controls = [...tree.querySelectorAll('summary, .workspace-tree-root-row')];
+  const controls = folderControls;
   const visibleControls = () => controls.filter((item) => item.getClientRects().length > 0);
+  const ownExpandableFolder = (control) => {
+    const folder = control.closest('.workspace-tree-folder');
+    return folder?.matches('[data-project-folder]') ? folder : null;
+  };
   const parentFolderControl = (control) => {
-    const folder = control.closest('[data-project-folder]');
-    if (control.tagName !== 'SUMMARY') return null;
-    const parent = folder?.parentElement?.closest('[data-project-folder]');
-    return parent?.querySelector(':scope > summary') ?? null;
+    const node = control.closest('.workspace-tree-folder');
+    const parent = node?.parentElement?.closest('[data-project-folder]');
+    return parent?.querySelector(':scope > [data-folder-select]') ?? null;
   };
   const openResource = (row) => {
     const action = tree.dataset.openAction;
@@ -148,10 +163,11 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
     form.requestSubmit();
   };
   controls.forEach((control) => control.addEventListener('keydown', (event) => {
-    const folder = control.closest('[data-project-folder]');
-    if (event.key === 'ArrowRight' && control.tagName === 'SUMMARY') {
-      if (!folder.open) {
-        folder.open = true;
+    const folder = ownExpandableFolder(control);
+    if (event.key === 'ArrowRight' && folder) {
+      if (!folderOpen(folder)) {
+        setFolderOpen(folder, true);
+        saveFolders();
       } else {
         const visible = visibleControls();
         visible[visible.indexOf(control) + 1]?.focus();
@@ -160,8 +176,9 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
       return;
     }
     if (event.key === 'ArrowLeft') {
-      if (control.tagName === 'SUMMARY' && folder.open) {
-        folder.open = false;
+      if (folder && folderOpen(folder)) {
+        setFolderOpen(folder, false);
+        saveFolders();
       } else {
         parentFolderControl(control)?.focus();
       }
@@ -177,13 +194,100 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
     target.focus();
   }));
 
+  const bindFileGroup = (group) => {
+    if (!group || group.dataset.folderBound === 'true') return;
+    group.dataset.folderBound = 'true';
+    group.querySelector('[data-resource-name-sort]')?.addEventListener('click', (event) => {
+      const button = event.currentTarget;
+      const rows = [...group.querySelectorAll('[data-open-resource]')];
+      const direction = button.dataset.sortDirection === 'asc' ? 'desc' : 'asc';
+      rows.sort((left, right) => (left.dataset.resourceName ?? '').localeCompare(right.dataset.resourceName ?? '', undefined, { numeric: true }) * (direction === 'asc' ? 1 : -1));
+      group.append(...rows);
+      button.dataset.sortDirection = direction;
+      button.textContent = direction === 'asc' ? 'Name ↑' : 'Name ↓';
+      button.setAttribute('aria-label', `Sort files by name ${direction === 'asc' ? 'descending' : 'ascending'}`);
+    });
+    group.querySelectorAll('[data-open-resource]').forEach((row) => {
+      row.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          openResource(row);
+          return;
+        }
+        if (event.key === 'ArrowLeft') {
+          event.preventDefault();
+          const folderPath = row.dataset.resourcePath?.split('/').slice(0, -1).join('/') ?? '';
+          const target = folderControls.find((control) => (control.dataset.folderPath ?? '') === folderPath);
+          if (!target) return;
+          folders.filter((folder) => {
+            const candidate = folder.dataset.folderPath ?? '';
+            return candidate === folderPath || folderPath.startsWith(`${candidate}/`);
+          }).forEach((folder) => setFolderOpen(folder, true));
+          saveFolders();
+          target.focus();
+          return;
+        }
+        if (!['ArrowDown', 'ArrowUp'].includes(event.key)) return;
+        const visibleRows = [...fileList.querySelectorAll('[data-open-resource]')]
+          .filter((item) => item.getClientRects().length > 0);
+        const position = visibleRows.indexOf(row);
+        const target = event.key === 'ArrowDown' ? visibleRows[position + 1] : visibleRows[position - 1];
+        if (!target) return;
+        event.preventDefault();
+        target.focus();
+      });
+      row.addEventListener('dblclick', (event) => {
+        event.preventDefault();
+        openResource(row);
+      });
+    });
+  };
+
+  const folderLoadRequests = new Map();
+  const loadFolderGroup = (folderPath) => {
+    const group = fileGroups.find((item) => (item.dataset.folderFiles ?? '') === folderPath);
+    if (!group || group.dataset.folderLoaded === 'true') return Promise.resolve(group);
+    if (folderLoadRequests.has(folderPath)) return folderLoadRequests.get(folderPath);
+    group.setAttribute('aria-busy', 'true');
+    group.querySelector('[data-folder-loading]')?.remove();
+    group.insertAdjacentHTML('beforeend', '<p class="workspace-empty" data-folder-loading>Loading this folder…</p>');
+    const query = new URLSearchParams({ folder: folderPath, fragment: 'folder-files' });
+    const request = fetch(`${projectBase}/resources?${query}`, { headers: { accept: 'text/html' } })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Folder load failed with status ${response.status}.`);
+        const template = document.createElement('template');
+        template.innerHTML = (await response.text()).trim();
+        const replacement = template.content.firstElementChild;
+        if (!replacement || replacement.dataset.folderFiles !== folderPath) throw new Error('Folder response did not match the selected folder.');
+        replacement.hidden = workspace.dataset.selectedFolder !== folderPath;
+        group.replaceWith(replacement);
+        fileGroups = [...fileList.querySelectorAll('[data-folder-files]')];
+        bindFileGroup(replacement);
+        return replacement;
+      })
+      .catch(() => {
+        group.removeAttribute('aria-busy');
+        group.querySelector('[data-folder-loading]')?.remove();
+        if (!group.querySelector('[data-folder-load-error]')) {
+          group.insertAdjacentHTML('beforeend', '<p class="callout warn" data-folder-load-error>This folder could not be loaded. Select it again to retry.</p>');
+        }
+        return group;
+      })
+      .finally(() => folderLoadRequests.delete(folderPath));
+    folderLoadRequests.set(folderPath, request);
+    return request;
+  };
+
   const setSelectedFolder = (requestedPath, { persist = true, clearResource = false } = {}) => {
     const group = fileGroups.find((item) => (item.dataset.folderFiles ?? '') === requestedPath)
       ?? fileGroups.find((item) => (item.dataset.folderFiles ?? '') === '');
     const selectedPath = group?.dataset.folderFiles ?? '';
     fileGroups.forEach((item) => { item.hidden = item !== group; });
     folderControls.forEach((control) => control.classList.toggle('is-selected', (control.dataset.folderPath ?? '') === selectedPath));
-    document.querySelectorAll('[data-selected-folder-label]').forEach((label) => { label.textContent = selectedPath || 'Project root'; });
+    document.querySelectorAll('[data-selected-folder-label]').forEach((label) => {
+      const projectName = workspace.dataset.projectName ?? 'Project';
+      label.textContent = selectedPath ? `${projectName} / ${selectedPath.split('/').join(' / ')}` : projectName;
+    });
     workspace.dataset.selectedFolder = selectedPath;
     if (persist) storageSet('localStorage', selectedFolderKey, selectedPath);
     if (clearResource) {
@@ -201,6 +305,12 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
     return selectedPath;
   };
 
+  const selectFolder = (requestedPath, options = {}) => {
+    const selectedPath = setSelectedFolder(requestedPath, options);
+    setFileListExpanded(true);
+    return loadFolderGroup(selectedPath);
+  };
+
   const savedSelectedFolder = storageGet('localStorage', selectedFolderKey);
   const initialFolder = focusedFolderPath ?? (workspace.dataset.selectedFolderExplicit === 'true'
     ? workspace.dataset.selectedFolder ?? ''
@@ -210,64 +320,127 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
     folders.filter((folder) => {
       const folderPath = folder.dataset.folderPath ?? '';
       return folderPath === selectedFolder || selectedFolder.startsWith(`${folderPath}/`);
-    }).forEach((folder) => { folder.open = true; });
+    }).forEach((folder) => setFolderOpen(folder, true));
     saveFolders();
   }
 
-  folderControls.forEach((control) => control.addEventListener('click', (event) => {
-    if (control.matches('a')) event.preventDefault();
-    setSelectedFolder(control.dataset.folderPath ?? '', { clearResource: true });
-    setFileListExpanded(true);
+  fileGroups.forEach(bindFileGroup);
+  void loadFolderGroup(selectedFolder);
+
+  folderControls.forEach((control) => {
+    control.addEventListener('click', (event) => {
+      event.preventDefault();
+      void selectFolder(control.dataset.folderPath ?? '', { clearResource: true });
+    });
+    const folder = ownExpandableFolder(control);
+    if (folder) control.addEventListener('dblclick', (event) => {
+      event.preventDefault();
+      setFolderOpen(folder, !folderOpen(folder));
+      saveFolders();
+    });
+  });
+
+  folderToggles.forEach((toggle) => toggle.addEventListener('click', () => {
+    const folder = toggle.closest('[data-project-folder]');
+    setFolderOpen(folder, !folderOpen(folder));
+    saveFolders();
   }));
 
   workspace.querySelector('[data-collapse-all-folders]')?.addEventListener('click', () => {
-    folders.forEach((folder) => { folder.open = false; });
+    folders.forEach((folder) => setFolderOpen(folder, false));
     saveFolders();
   });
 
+  const compactResourceWorkspace = () => workspace.getBoundingClientRect().width <= 900;
   const setFileListExpanded = (expanded, { persist = true } = {}) => {
     fileList.hidden = !expanded;
     workspace.classList.toggle('is-file-list-collapsed', !expanded);
     listToggle.setAttribute('aria-expanded', String(expanded));
-    listToggle.textContent = expanded ? 'Hide file list' : 'Show file list';
+    listToggle.textContent = compactResourceWorkspace()
+      ? (expanded ? 'Show resource details' : 'Back to file list')
+      : (expanded ? 'Hide file list' : 'Show file list');
     if (persist) storageSet('localStorage', resourceListKey, expanded ? 'expanded' : 'collapsed');
     if (!expanded && fileList.contains(document.activeElement)) listToggle.focus();
+    window.requestAnimationFrame(reflowPaneWidths);
   };
-  setFileListExpanded(Boolean(focusedPath) || storageGet('localStorage', resourceListKey) !== 'collapsed', { persist: Boolean(focusedPath) });
+  const initialListExpanded = focusedPath
+    ? !compactResourceWorkspace()
+    : storageGet('localStorage', resourceListKey) !== 'collapsed';
+  setFileListExpanded(initialListExpanded, { persist: false });
   listToggle.addEventListener('click', () => setFileListExpanded(listToggle.getAttribute('aria-expanded') !== 'true'));
 
-  const fileRows = [...fileList.querySelectorAll('[data-open-resource]')];
-  fileRows.forEach((row, index) => row.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') {
+  const paneWidthKey = `atlas-ui-resource-pane-widths:${projectId}`;
+  const paneResizers = [...workspace.querySelectorAll('[data-resource-pane-resizer]')];
+  let paneWidths = { folder: 270, list: 500 };
+  try {
+    const storedWidths = JSON.parse(storageGet('localStorage', paneWidthKey) ?? '{}');
+    if (Number.isFinite(storedWidths.folder)) paneWidths.folder = storedWidths.folder;
+    if (Number.isFinite(storedWidths.list)) paneWidths.list = storedWidths.list;
+  } catch {}
+  const applyPaneWidth = (pane, requested) => {
+    const total = workspace.getBoundingClientRect().width;
+    const compact = total <= 900;
+    const minimum = pane === 'folder' ? (compact ? 140 : 170) : 280;
+    const reserved = pane === 'folder'
+      ? (compact ? 240 : (fileList.hidden ? 280 : paneWidths.list + 280 + 12))
+      : paneWidths.folder + 280 + 12;
+    const maximum = Math.max(minimum, Math.min(pane === 'folder' ? 520 : 760, total - reserved));
+    const width = clamp(Math.round(requested), minimum, maximum);
+    paneWidths[pane] = width;
+    workspace.style.setProperty(pane === 'folder' ? '--resource-folder-pane' : '--resource-list-pane', `${width}px`);
+    workspace.querySelector(`[data-resource-pane-resizer="${pane}"]`)?.setAttribute('aria-valuenow', String(width));
+    return width;
+  };
+  const persistPaneWidths = () => storageSet('localStorage', paneWidthKey, JSON.stringify(paneWidths));
+  reflowPaneWidths = () => {
+    applyPaneWidth('folder', paneWidths.folder);
+    applyPaneWidth('list', paneWidths.list);
+  };
+  reflowPaneWidths();
+  paneResizers.forEach((handle) => {
+    const pane = handle.dataset.resourcePaneResizer;
+    if (!['folder', 'list'].includes(pane)) return;
+    handle.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      const startX = event.clientX;
+      const startWidth = paneWidths[pane];
+      handle.setPointerCapture(event.pointerId);
+      workspace.classList.add('is-resizing-pane');
+      const move = (moveEvent) => applyPaneWidth(pane, startWidth + moveEvent.clientX - startX);
+      const finish = () => {
+        persistPaneWidths();
+        workspace.classList.remove('is-resizing-pane');
+        handle.removeEventListener('pointermove', move);
+        handle.removeEventListener('pointerup', finish);
+        handle.removeEventListener('pointercancel', finish);
+      };
+      handle.addEventListener('pointermove', move);
+      handle.addEventListener('pointerup', finish);
+      handle.addEventListener('pointercancel', finish);
+    });
+    handle.addEventListener('keydown', (event) => {
+      let next = null;
+      if (event.key === 'ArrowLeft') next = paneWidths[pane] - 20;
+      else if (event.key === 'ArrowRight') next = paneWidths[pane] + 20;
+      else if (event.key === 'Home') next = Number(handle.getAttribute('aria-valuemin'));
+      else if (event.key === 'End') next = Number(handle.getAttribute('aria-valuemax'));
+      if (next == null) return;
       event.preventDefault();
-      openResource(row);
-      return;
+      applyPaneWidth(pane, next);
+      persistPaneWidths();
+    });
+  });
+  let resourceWorkspaceWasCompact = compactResourceWorkspace();
+  window.addEventListener('resize', () => {
+    const compact = compactResourceWorkspace();
+    if (compact !== resourceWorkspaceWasCompact && focusedPath) {
+      setFileListExpanded(!compact, { persist: false });
+    } else {
+      reflowPaneWidths();
     }
-    if (event.key === 'ArrowLeft') {
-      event.preventDefault();
-      const folderPath = row.dataset.resourcePath?.split('/').slice(0, -1).join('/') ?? '';
-      const target = folderControls.find((control) => (control.dataset.folderPath ?? '') === folderPath);
-      if (!target) return;
-      folders.filter((folder) => {
-        const candidate = folder.dataset.folderPath ?? '';
-        return candidate === folderPath || folderPath.startsWith(`${candidate}/`);
-      }).forEach((folder) => { folder.open = true; });
-      saveFolders();
-      target.focus();
-      return;
-    }
-    if (!['ArrowDown', 'ArrowUp'].includes(event.key)) return;
-    const visibleRows = fileRows.filter((item) => item.getClientRects().length > 0);
-    const position = visibleRows.indexOf(row);
-    const target = event.key === 'ArrowDown' ? visibleRows[position + 1] : visibleRows[position - 1];
-    if (!target) return;
-    event.preventDefault();
-    target.focus();
-  }));
-  fileRows.forEach((row) => row.addEventListener('dblclick', (event) => {
-    event.preventDefault();
-    openResource(row);
-  }));
+    resourceWorkspaceWasCompact = compact;
+  });
+
   if (focusedRow) window.requestAnimationFrame(() => {
     focusedRow.focus({ preventScroll: true });
     focusedRow.scrollIntoView({ block: 'center' });
@@ -451,32 +624,6 @@ document.addEventListener('keydown', (event) => {
     document.querySelector('[data-overlay-open="atlas-search"]')?.click();
   }
 });
-function applyPageZoom(value) {
-  pageZoom = clamp(value, 0.75, 1.5);
-  if (document.body?.style) document.body.style.zoom = String(pageZoom);
-  document.documentElement?.setAttribute?.('data-page-zoom', String(pageZoom));
-}
-
-document.addEventListener('keydown', (event) => {
-  if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
-  if (event.key === '0') {
-    event.preventDefault();
-    applyPageZoom(1);
-  } else if (event.key === '+' || event.key === '=') {
-    event.preventDefault();
-    applyPageZoom(pageZoom + 0.1);
-  } else if (event.key === '-' || event.key === '_') {
-    event.preventDefault();
-    applyPageZoom(pageZoom - 0.1);
-  }
-});
-
-document.addEventListener('wheel', (event) => {
-  if (!(event.ctrlKey || event.metaKey)) return;
-  event.preventDefault();
-  applyPageZoom(pageZoom + (event.deltaY < 0 ? 0.1 : -0.1));
-}, { passive: false });
-
 function clamp(value, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, value));
 }
@@ -756,6 +903,28 @@ document.querySelectorAll('[data-compare-picker]').forEach((button) => {
     const left = button.dataset.leftSelection;
     const query = left ? `?left=${encodeURIComponent(left)}` : '';
     window.location.assign(`/compare/selected/${encodeURIComponent(side)}/${encodeURIComponent(selection.selection_id)}${query}`);
+  });
+});
+
+document.querySelectorAll('[data-resource-relink-picker]').forEach((button) => {
+  button.addEventListener('click', async () => {
+    const form = button.closest('form[data-resource-relink-form]');
+    const selection = await chooseDesktopFile(button, 'pick_file');
+    if (!selection?.selection_id) {
+      if (!['cancelled', 'unavailable'].includes(selection?.status)) {
+        const notice = form?.querySelector('[data-resource-relink-notice]');
+        if (notice) notice.textContent = selection?.message ?? 'Atlas could not register the selected file. Try again.';
+      }
+      return;
+    }
+    const target = form?.querySelector('input[name="selection_id"]');
+    const name = form?.querySelector('[data-resource-relink-name]');
+    const confirm = form?.querySelector('[data-resource-relink-confirm]');
+    const notice = form?.querySelector('[data-resource-relink-notice]');
+    if (target) target.value = selection.selection_id;
+    if (name) name.textContent = selection.name ?? 'File selected';
+    if (confirm) confirm.disabled = false;
+    if (notice) notice.textContent = '';
   });
 });
 

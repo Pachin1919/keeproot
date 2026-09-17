@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { locateAnalyticsPython } from './analytics-evaluation.js';
+import { locateContentPython } from './python-runtime.js';
 import { prepareDataWorkspace } from './data-workspace.js';
 
 export const CONTEXT_PACK_SCHEMA = 'atlas.context-pack.v1';
@@ -47,7 +47,7 @@ export function prepareContextPack({
   pythonPath = null,
   runProcess = spawnSync,
 } = {}) {
-  if (!purpose?.trim()) throw new Error('content prepare-context requires --purpose <task purpose>');
+  if (!purpose?.trim()) throw new Error('content prepare-context requires --purpose <work purpose>');
   const columns = includeColumns.map((item) => item?.trim()).filter(Boolean);
   if (!columns.length) {
     throw new Error('content prepare-context requires one or more --include-column <exact name>');
@@ -82,10 +82,10 @@ export function prepareContextPack({
       // Rebuild an incomplete or stale Context Pack.
     }
   }
-  const executable = pythonPath ?? locateAnalyticsPython({ installationRoot });
+  const executable = pythonPath ?? locateContentPython({ installationRoot });
   if (!executable) {
     const error = new Error(
-      'Atlas Context Pack requires the optional Python component. Run atlas analytics install first.',
+      'Atlas Context Pack requires the installed Desktop Python component. Run atlas ui install first.',
     );
     error.code = 'ATLAS_CAPABILITY_UNAVAILABLE';
     throw error;

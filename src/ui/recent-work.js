@@ -113,7 +113,11 @@ function validTransfer(value) {
     target_path: path.resolve(value.target_path),
     saved_at: value.saved_at,
     undo_available: value.undo_available,
+    redo_available: value.redo_available === true,
+    status: value.status === 'undone' ? 'undone' : 'executed',
+    project: validProject(value.project),
     origin: {
+      resource_id: typeof origin.resource_id === 'string' ? origin.resource_id : null,
       file_path: path.resolve(origin.file_path),
       source_fingerprint: fingerprint,
       inspection_id: origin.inspection_id,
@@ -131,6 +135,7 @@ function validRecord(value) {
   if (!value.inspect || typeof value.inspect !== 'object' || typeof value.cache_reference !== 'string') return null;
   return {
     work_id: value.work_id,
+    resource_id: typeof value.resource_id === 'string' ? value.resource_id : null,
     file_path: path.resolve(value.file_path),
     last_action: value.last_action === 'inspect' ? 'inspect' : 'inspect',
     inspect: {
@@ -222,14 +227,17 @@ export function recentWorkById(stateDir, workId) {
 
 export function upsertRecentWork({
   stateDir, filePath, inspect, sourceFingerprint, inspectionId, cacheReference, project = null,
-  initiatedBy = null, inspectionCacheHit = false, resultSummary = null,
+  initiatedBy = null, inspectionCacheHit = false, resultSummary = null, resourceId = null,
 }) {
   const normalizedPath = path.resolve(filePath);
   const now = new Date().toISOString();
   return mutateRecentWork(stateDir, (existing) => {
-    const previous = existing.find((item) => samePath(item.file_path, normalizedPath));
+    const previous = typeof resourceId === 'string'
+      ? existing.find((item) => item.resource_id === resourceId) ?? existing.find((item) => !item.resource_id && samePath(item.file_path, normalizedPath))
+      : existing.find((item) => samePath(item.file_path, normalizedPath));
     const record = {
       work_id: previous?.work_id ?? `RWK-${crypto.randomUUID()}`,
+      resource_id: typeof resourceId === 'string' ? resourceId : previous?.resource_id ?? null,
       file_path: normalizedPath,
       last_action: 'inspect',
       inspect: {
@@ -249,7 +257,7 @@ export function upsertRecentWork({
       result_summary: validResultSummary(resultSummary) ?? previous?.result_summary ?? null,
     };
     return {
-      records: [record, ...existing.filter((item) => !samePath(item.file_path, normalizedPath))],
+      records: [record, ...existing.filter((item) => item.work_id !== previous?.work_id)],
       value: record,
     };
   });
@@ -283,7 +291,7 @@ export function setRecentWorkProject(stateDir, workId, project) {
 }
 
 export function moveRecentWorkToProjectArtifact({
-  stateDir, workId, targetPath, sourceFingerprint, inspectionId, cacheReference, project, transfer,
+  stateDir, workId, targetPath, sourceFingerprint, inspectionId, cacheReference, project, transfer, resourceId = null,
 }) {
   if (!/^RWK-[a-f0-9-]{36}$/u.test(workId ?? '')) return null;
   const fingerprint = validFingerprint(sourceFingerprint);
@@ -297,6 +305,7 @@ export function moveRecentWorkToProjectArtifact({
     if (index < 0) return { records, value: null, write: false };
     const record = {
       ...records[index],
+      resource_id: resourceId ?? records[index].resource_id ?? null,
       file_path: path.resolve(targetPath),
       source_fingerprint: fingerprint,
       inspection_id: inspectionId,
@@ -323,10 +332,20 @@ export function restoreRecentWorkProjectTransfer({ stateDir, workId, project = n
       inspection_id: transfer.origin.inspection_id,
       cache_reference: transfer.origin.cache_reference,
       project: validProject(project) ?? transfer.origin.project,
-      project_transfer: null,
+      project_transfer: { ...transfer, status: 'undone', undo_available: false, redo_available: true },
     };
     records[index] = record;
     return { records, value: record };
+  });
+}
+
+export function redoRecentWorkProjectTransfer({ stateDir, workId }) {
+  if (!/^RWK-[a-f0-9-]{36}$/u.test(workId ?? '')) return null;
+  return mutateRecentWork(stateDir, (records) => {
+    const index = records.findIndex((item) => item.work_id === workId); if (index < 0) return { records, value: null, write: false };
+    const transfer = records[index].project_transfer; if (!transfer?.redo_available) return { records, value: null, write: false };
+    const record = { ...records[index], file_path: transfer.target_path, project: transfer.project ?? records[index].project, project_transfer: { ...transfer, status: 'executed', undo_available: true, redo_available: false } };
+    records[index] = record; return { records, value: record };
   });
 }
 

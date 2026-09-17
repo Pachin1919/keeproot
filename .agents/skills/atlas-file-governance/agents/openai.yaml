@@ -1,7 +1,7 @@
 interface:
   display_name: "Atlas File Governance"
-  short_description: "Govern projects, attachments, spreadsheets, writes, and recovery"
-  default_prompt: "Use $atlas-file-governance for this local project, attachment, spreadsheet, cross-project context, durable output, file change, or recovery task. Let Atlas compute bounded local facts and enforce the supported workflow; return one concise factual receipt."
+  short_description: "Operate on real Workspace files through the installed Atlas Runtime"
+  default_prompt: "Use $atlas-file-governance only when this task requires the installed Atlas Runtime to inspect or change real Workspace material. Select one bounded workflow, execute only the authorized action, and return a concise factual receipt."
 
 policy:
   allow_implicit_invocation: true

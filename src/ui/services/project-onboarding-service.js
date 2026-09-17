@@ -21,6 +21,25 @@ function projectFolderName(value) {
 }
 
 export function createProjectOnboardingService({ registry }) {
+  function removeUnavailableProject(projectId) {
+    const project = registry.list().find((item) => item.id === projectId && item.status === 'active');
+    if (!project) throw new Error('This Project is no longer available to remove.');
+    const detail = registry.show(projectId);
+    if (detail?.location) {
+      try {
+        projectDirectory(detail.location);
+        throw new Error('The Project folder is still available. Only unavailable Projects can be removed here.');
+      } catch (error) {
+        if (/still available/u.test(error.message)) throw error;
+      }
+    }
+    const receipt = registry.evolve(projectId, {
+      status: 'archived',
+      reason: 'User removed an unavailable Project record from Atlas Desktop.',
+    });
+    return { project, receipt, source_changes: [] };
+  }
+
   function relinkFolder(projectId, folderPath) {
     const folder = realLocalFolder(folderPath);
     const project = registry.show(projectId);
@@ -119,5 +138,5 @@ export function createProjectOnboardingService({ registry }) {
     }
   }
 
-  return { registerFolder, previewNewProject, createOrUseProject, relinkFolder };
+  return { registerFolder, previewNewProject, createOrUseProject, relinkFolder, removeUnavailableProject };
 }

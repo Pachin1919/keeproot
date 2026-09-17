@@ -4,14 +4,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   installRuntime,
-  locateInstalledRuntime,
   uninstallRuntime,
 } from '../src/runtime-install.js';
-import {
-  codexHookStatus,
-  installCodexHook,
-  removeCodexHook,
-} from '../src/codex-hook-install.js';
 import { handshakeRuntime } from '../src/runtime-location.js';
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -27,22 +21,16 @@ function defaultSkillRoot() {
   return path.join(skillsHome, 'atlas-file-governance');
 }
 
-function defaultCodexHome() {
-  return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
-}
-
 function parse(args) {
   const result = { libraryRoots: [] };
   for (let index = 0; index < args.length; index += 1) {
     const token = args[index];
-    if (['--install-root', '--skill-root', '--node', '--library-root', '--codex-home', '--project-root'].includes(token)) {
+    if (['--install-root', '--skill-root', '--node', '--library-root'].includes(token)) {
       const value = args[++index];
       if (value === undefined) throw new Error(`${token} requires a value.`);
       if (token === '--install-root') result.installRoot = value;
       else if (token === '--skill-root') result.skillRoot = value;
       else if (token === '--node') result.nodePath = value;
-      else if (token === '--codex-home') result.codexHome = value;
-      else if (token === '--project-root') result.projectRoot = value;
       else result.libraryRoots.push(value);
     } else {
       throw new Error(`Unknown Runtime manager argument: ${token}`);
@@ -51,7 +39,6 @@ function parse(args) {
   result.installRoot ??= defaultInstallRoot();
   result.skillRoot ??= defaultSkillRoot();
   result.nodePath ??= process.execPath;
-  result.codexHome ??= defaultCodexHome();
   return result;
 }
 
@@ -63,16 +50,11 @@ Usage:
   node scripts/runtime-manager.js locate [options]
   node scripts/runtime-manager.js upgrade [options]
   node scripts/runtime-manager.js uninstall [options]
-  node scripts/runtime-manager.js hook-install [options]
-  node scripts/runtime-manager.js hook-status [options]
-  node scripts/runtime-manager.js hook-remove [options]
 
 Options:
   --install-root <path>  User Runtime/state root (default: %LOCALAPPDATA%\\Atlas)
   --skill-root <path>    User Skill directory (default: ~/.codex/skills/atlas-file-governance)
   --node <path>          Node.js 24+ executable
-  --codex-home <path>    Codex user config root (default: ~/.codex)
-  --project-root <path>  Install/status/remove a project-local Codex Hook
   --library-root <path>  Reject installation inside this governed Library; repeatable
 `;
 }
@@ -91,24 +73,6 @@ function main() {
     result = handshakeRuntime({ installRoot: options.installRoot });
   } else if (command === 'uninstall') {
     result = uninstallRuntime(options);
-  } else if (['hook-install', 'hook-status', 'hook-remove'].includes(command)) {
-    const located = locateInstalledRuntime(options.installRoot);
-    if (command !== 'hook-remove' && located.status !== 'ready') {
-      throw new Error(`Atlas Runtime must be ready before ${command}; current status is ${located.status}.`);
-    }
-    if (command === 'hook-install') {
-      result = installCodexHook({
-        codexHome: options.codexHome, manifest: located.manifest, projectRoot: options.projectRoot,
-      });
-    } else if (command === 'hook-status') {
-      result = codexHookStatus({
-        codexHome: options.codexHome, manifest: located.manifest, projectRoot: options.projectRoot,
-      });
-    } else {
-      result = removeCodexHook({
-        codexHome: options.codexHome, manifest: located.manifest, projectRoot: options.projectRoot,
-      });
-    }
   } else {
     throw new Error(`Unknown Runtime manager command: ${command}`);
   }

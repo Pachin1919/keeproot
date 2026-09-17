@@ -6,9 +6,10 @@ const MAX_SEARCH_ENTRIES = 5000;
 const MAX_SEARCH_RESULTS = 150;
 const MAX_FOLDER_CHOICES = 500;
 const TECHNICAL_DIRECTORIES = new Set([
-  '.atlas', '.cache', '.git', '.npm-cache', '.pytest_cache', '.venv',
+  '.atlas', '.cache', '.codex', '.git', '.npm-cache', '.playwright-cli', '.pytest_cache', '.venv',
   '__pycache__', 'node_modules', 'venv',
 ]);
+const BOUNDED_LEAF_DIRECTORIES = new Set(['.tmp']);
 
 function technicalDirectory(name) {
   return TECHNICAL_DIRECTORIES.has(String(name).toLowerCase());
@@ -68,10 +69,10 @@ export function browseProjectFiles(root, relativePath = '') {
 export function listProjectFolders(root) {
   regularDirectory(root);
   const items = [];
-  const stack = [root];
+  const queue = [root];
   let scanned = 0;
-  while (stack.length && scanned < MAX_SEARCH_ENTRIES && items.length < MAX_FOLDER_CHOICES) {
-    const directory = stack.pop();
+  while (queue.length && scanned < MAX_SEARCH_ENTRIES && items.length < MAX_FOLDER_CHOICES) {
+    const directory = queue.shift();
     regularDirectory(directory);
     const folders = fs.readdirSync(directory, { withFileTypes: true })
       .filter((item) => item.isDirectory() && !item.isSymbolicLink() && !technicalDirectory(item.name))
@@ -86,9 +87,9 @@ export function listProjectFolders(root) {
         relative_path: value.relative_path,
         depth: value.relative_path.split('/').length,
       });
-      children.push(absolute);
+      if (!BOUNDED_LEAF_DIRECTORIES.has(dirent.name.toLowerCase())) children.push(absolute);
     }
-    for (let index = children.length - 1; index >= 0; index -= 1) stack.push(children[index]);
+    queue.push(...children);
   }
   items.sort((a, b) => a.relative_path.localeCompare(b.relative_path));
   return { items, truncated: scanned >= MAX_SEARCH_ENTRIES || items.length >= MAX_FOLDER_CHOICES };
@@ -105,7 +106,7 @@ export function searchProjectFiles(root, query, { acceptFile = null } = {}) {
       const absolute = path.join(directory, dirent.name);
       if (dirent.isSymbolicLink()) continue;
       const value = entry(root, absolute, dirent);
-      if (value.kind === 'folder') queue.push(absolute);
+      if (value.kind === 'folder' && !BOUNDED_LEAF_DIRECTORIES.has(dirent.name.toLowerCase())) queue.push(absolute);
       if (value.kind === 'file'
           && (!term || `${value.name}\n${value.relative_path}\n${value.extension}`.toLowerCase().includes(term))
           && (!acceptFile || acceptFile(value))) items.push(value);

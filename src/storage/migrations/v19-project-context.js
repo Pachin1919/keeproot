@@ -12,14 +12,6 @@ export function applyProjectContextMigration(db, appliedAt) {
   ensureColumn(db, 'portfolio_roots', 'root_type', 'TEXT');
   ensureColumn(db, 'portfolio_roots', 'content_policy', "TEXT NOT NULL DEFAULT 'none'");
   ensureColumn(db, 'portfolio_roots', 'adopted_at', 'TEXT');
-  ensureColumn(db, 'task_contracts', 'candidate_set_id', 'TEXT');
-  ensureColumn(db, 'task_contracts', 'source_set_id', 'TEXT');
-  ensureColumn(db, 'task_contracts', 'write_root_id', 'TEXT');
-  ensureColumn(db, 'task_inputs', 'source_root_id', 'TEXT');
-  ensureColumn(db, 'task_inputs', 'source_project_id', 'TEXT');
-  ensureColumn(db, 'task_inputs', 'source_root_path', 'TEXT');
-  ensureColumn(db, 'task_inputs', 'source_relative_path', 'TEXT');
-  ensureColumn(db, 'task_inputs', 'catalog_entry_id', 'TEXT');
   ensureColumn(db, 'derived_inputs', 'source_root_id', 'TEXT');
   ensureColumn(db, 'derived_inputs', 'source_project_id', 'TEXT');
   ensureColumn(db, 'derived_inputs', 'source_root_path', 'TEXT');

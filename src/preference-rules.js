@@ -19,21 +19,21 @@ const RULE_KINDS = new Set([
 const SCOPE_TYPES = new Set(['artifact', 'project', 'library']);
 const BASIS_TYPES = new Set(['observed', 'default']);
 const ROLE_IDS = new Set(ARTIFACT_ROLES.map((item) => item.id));
-const TASK_STRATEGIES = new Set(['create', 'delta', 'new_version', 'supersede']);
+const WRITE_STRATEGIES = new Set(['create', 'delta', 'new_version', 'supersede']);
 const OPERATION_NEEDS = Object.freeze({
   intake: ['placement', 'naming', 'agent_output'],
-  content_task: ['content_versioning', 'naming', 'agent_output'],
+  content_work: ['content_versioning', 'naming', 'agent_output'],
   organize: ['directory_role', 'naming', 'storage'],
   project_inspect: ['project_type', 'directory_role', 'storage'],
 });
 const IMPACT_CONSUMERS = Object.freeze({
-  naming: ['rule.context', 'intake', 'task'],
+  naming: ['rule.context', 'intake', 'save'],
   placement: ['rule.context', 'intake'],
   directory_role: ['rule.context'],
   storage: ['rule.context'],
-  content_versioning: ['rule.context', 'task'],
+  content_versioning: ['rule.context', 'save'],
   project_type: ['rule.context'],
-  agent_output: ['rule.context', 'intake', 'task'],
+  agent_output: ['rule.context', 'intake', 'save'],
 });
 const DEFAULT_ADVICE = Object.freeze({
   naming: {
@@ -71,10 +71,10 @@ const DEFAULT_ADVICE = Object.freeze({
   agent_output: {
     id: 'default.agent-output.governed-handoff.v1',
     kind: 'agent_output',
-    summary: 'Stage Agent candidates in Atlas Work and create durable outputs only through Intake or Task Contract.',
+    summary: 'Stage Agent candidates in Atlas Work and create durable outputs only through Save.',
     value: {
       candidate_area: 'atlas_work',
-      durable_handoff: 'intake_or_task',
+      durable_handoff: 'save',
       final_requires_verified_receipt: true,
     },
   },
@@ -140,8 +140,8 @@ function validateRuleValue(kind, value) {
       'Placement target_subdirectory',
     );
   }
-  if (kind === 'content_versioning' && value.strategy !== 'auto' && !TASK_STRATEGIES.has(value.strategy)) {
-    throw new Error(`Content versioning strategy must be auto or one of: ${[...TASK_STRATEGIES].join(', ')}.`);
+  if (kind === 'content_versioning' && value.strategy !== 'auto' && !WRITE_STRATEGIES.has(value.strategy)) {
+    throw new Error(`Content versioning strategy must be auto or one of: ${[...WRITE_STRATEGIES].join(', ')}.`);
   }
   if (kind === 'naming' && value.rename_on_content_edit === true) {
     throw new Error('V1 naming preferences cannot rename a file merely because its content changed.');
@@ -228,7 +228,7 @@ function normalizeProposal(ledger, root, proposal) {
     throw new Error('Rule confidence must be between 0 and 1.');
   }
   if (basis === 'observed' && confidence < 0.75) {
-    throw new Error('Observed evidence is not sufficient to propose a reusable rule; keep it as task-local advice.');
+    throw new Error('Observed evidence is not sufficient to propose a reusable rule; keep it as local advice.');
   }
   if (typeof proposal.summary !== 'string' || !proposal.summary.trim() || proposal.summary.length > 500) {
     throw new Error('Rule proposal requires a bounded summary.');
@@ -342,8 +342,8 @@ function proposalImpact(kind, scope) {
     future_behavior: kind === 'placement'
       ? 'Matching Intake requests can reuse the reviewed destination without another placement question.'
       : kind === 'content_versioning'
-        ? 'Matching Task Contracts can reuse the reviewed write strategy; prepared Tasks become stale when it changes.'
-        : 'Matching Agent tasks receive this rule in their compact effective context.',
+        ? 'Matching Save or Work requests can reuse the reviewed write strategy.'
+        : 'Matching Host work receives this rule in compact effective context.',
     source_changes: [],
   };
 }

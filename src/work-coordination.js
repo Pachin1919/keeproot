@@ -56,7 +56,9 @@ export function recordInspectionWork({
   project = null,
   caller = {},
   channel = 'host',
+  resourceControl = null,
 }) {
+  const identified = resourceControl ? resourceControl.identify({ filePath, project }) : null;
   return upsertRecentWork({
     stateDir,
     filePath,
@@ -68,5 +70,6 @@ export function recordInspectionWork({
     initiatedBy: inspectionInitiator(caller, channel),
     inspectionCacheHit: inspection.cache_hit === true,
     resultSummary: inspectionResultSummary(inspection),
+    resourceId: identified?.resource_id ?? null,
   });
 }

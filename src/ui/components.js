@@ -13,8 +13,8 @@ const STATUS_PRESENTATION = Object.freeze({
   available: { label: 'Available', meaning: 'The optional local capability is installed and responding.' },
   awaiting_review: { label: 'Awaiting review', meaning: 'A proposal exists and is waiting for a user decision.' },
   blocked: { label: 'Blocked', meaning: 'Atlas stopped the work because a conflict or policy condition needs attention.' },
-  cancelled: { label: 'Cancelled', meaning: 'The Task ended without applying the proposed work.' },
-  completed: { label: 'Completed', meaning: 'The Task output was recorded and verified.' },
+  cancelled: { label: 'Cancelled', meaning: 'The operation ended without applying the proposed work.' },
+  completed: { label: 'Completed', meaning: 'The result was recorded and verified.' },
   conflict: { label: 'Conflict', meaning: 'Current files no longer match the state Atlas expected.' },
   current: { label: 'Current', meaning: 'The checked source still matches the recorded source.' },
   deferred: { label: 'Deferred', meaning: 'This capability is not included in the current release.' },
@@ -24,7 +24,7 @@ const STATUS_PRESENTATION = Object.freeze({
   moved_same_content: { label: 'Source moved', meaning: 'Matching content was found at a different location.' },
   needs_approval: { label: 'Needs approval', meaning: 'Atlas needs a user decision before applying the change.' },
   needs_candidate: { label: 'Candidate needed', meaning: 'The Agent has not supplied the proposed output yet.' },
-  needs_input: { label: 'Input needed', meaning: 'The Task is missing a required user decision or input.' },
+  needs_input: { label: 'Input needed', meaning: 'The operation is missing a required user decision or input.' },
   not_checked: { label: 'Not checked', meaning: 'The check has not been run; Atlas is not claiming the source is current.' },
   ok: { label: 'Healthy', meaning: 'The local integrity check passed.' },
   partial: { label: 'Partial', meaning: 'Only part of the required historical fact is available.' },
@@ -34,8 +34,8 @@ const STATUS_PRESENTATION = Object.freeze({
   rolled_back: { label: 'Restored', meaning: 'The prior Atlas-controlled change was restored.' },
   selection_required: { label: 'Select project', meaning: 'More than one Project is possible; choose the intended boundary.' },
   setup_required: { label: 'Setup required', meaning: 'Root or Project Location has not been established.' },
-  stale: { label: 'Out of date', meaning: 'The reviewed Task or Candidate changed and must be prepared again.' },
-  stale_source: { label: 'Source changed', meaning: 'A selected source changed after the Task recorded it.' },
+  stale: { label: 'Out of date', meaning: 'The reviewed operation or Candidate changed and must be prepared again.' },
+  stale_source: { label: 'Source changed', meaning: 'A selected source changed after Atlas recorded it.' },
   running: { label: 'In progress', meaning: 'Atlas is still working. The result is not complete yet.' },
   in_progress: { label: 'In progress', meaning: 'Atlas is still working. The result is not complete yet.' },
   unavailable: { label: 'Unavailable', meaning: 'The fact or optional local capability is not available.' },
@@ -47,7 +47,7 @@ export function statusPresentation(status) {
   const key = String(status ?? 'unavailable');
   return STATUS_PRESENTATION[key] ?? {
     label: key.replaceAll('_', ' '),
-    meaning: 'Open the related Task or fact view for the recorded detail.',
+    meaning: 'Open the related operation or fact view for the recorded detail.',
   };
 }
 

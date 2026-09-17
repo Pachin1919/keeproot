@@ -33,7 +33,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $script:AtlasCalls = 0
-$script:RequestPath = $null
 $utf8 = [Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = $utf8
 [Console]::OutputEncoding = $utf8
@@ -140,62 +139,35 @@ try {
     }
   }
 
-  $requestDirectory = Join-Path $env:ATLAS_STATE_DIR 'tmp'
-  [IO.Directory]::CreateDirectory($requestDirectory) | Out-Null
-  $script:RequestPath = Join-Path $requestDirectory "$ClientRunId.json"
-  $request = [ordered]@{
-    items = @([ordered]@{
-      candidateFile = $candidate
-      origin = $Origin
-      kind = $(if ($Kind) { $Kind } else { $null })
-      projectId = $ProjectId
-      target = $Target
-      intent = $Intent
-    })
-  }
-  [IO.File]::WriteAllText(
-    $script:RequestPath,
-    ($request | ConvertTo-Json -Depth 6 -Compress),
-    $utf8
-  )
-
-  $batch = Invoke-AtlasJson @(
-    'intake', 'batch-execute',
+  $saveArguments = @(
+    'save', 'prepare',
     '--root', $rootPath,
-    '--request-file', $script:RequestPath,
-    '--reason', $Reason,
+    '--candidate-file', $candidate,
+    '--origin', $Origin,
+    '--project', $ProjectId,
+    '--target', $Target,
+    '--intent', $Intent,
+    '--channel', 'host',
+    '--request-key', $ClientRunId,
     '--actor', 'agent',
     '--agent', $Agent,
     '--model', $Model,
     '--tool', $Tool,
-    '--client-run-id', $ClientRunId,
-    '--json'
+    '--client-run-id', $ClientRunId
   )
-  $receipt = $batch.data
-
-  if ($receipt.status -ne 'executed' -or $receipt.summary.executed -ne 1) {
-    $item = @($receipt.items)[0]
-    Write-CompactJson ([ordered]@{
-      schema = 'atlas-skill-intake-file.v1'
-      ok = $true
-      status = $receipt.status
-      executed = $false
-      reason = $item.reason
-      project = $item.project
-      target = $item.target
-      questions = $receipt.questions
-      atlas_calls = $script:AtlasCalls
-      runtime_processes = $receipt.runtime_processes
-      elapsed_ms = $receipt.elapsed_ms
-      content_body_reads = 0
-      model_visible_body_bytes = 0
-    })
-    exit 0
+  if ($Kind) { $saveArguments += @('--kind', $Kind) }
+  $saveArguments += '--json'
+  $prepared = (Invoke-AtlasJson $saveArguments).data
+  if ($prepared.status -ne 'prepared' -and $prepared.status -ne 'executed') {
+    throw "Atlas did not prepare the attachment Save: $($prepared.status)"
   }
-
-  $item = @($receipt.items)[0]
+  $item = if ($prepared.status -eq 'executed') {
+    $prepared
+  } else {
+    (Invoke-AtlasJson @('save', 'execute', $prepared.save_id, '--reason', $Reason, '--json')).data
+  }
   $sourceHash = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant()
-  $targetRelative = $item.target
+  $targetRelative = $item.target.relative_path
   $targetPath = [IO.Path]::GetFullPath((Join-Path $rootPath $targetRelative))
   if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf)) {
     throw "Atlas reported execution but the target is absent: $targetPath"
@@ -213,21 +185,20 @@ try {
     project = [ordered]@{
       id = $ProjectId
       name = $item.project.name
-      path = $item.project.path
+      path = $ProjectPath
       created = $projectCreated
     }
-    classification = $item.classification
+    classification = [ordered]@{ origin = $Origin; kind = $(if ($Kind) { $Kind } else { $null }) }
     run_id = $item.run_id
     target = $targetRelative
     bytes = (Get-Item -LiteralPath $targetPath).Length
     sha256 = $targetHash
     hash_match = $true
     verified = $item.verified
-    rollback_ready = $item.rollback_ready
+    rollback_ready = $item.undo_available
     atlas_version = $manifest.atlas_version
     atlas_calls = $script:AtlasCalls
-    runtime_processes = $receipt.runtime_processes
-    elapsed_ms = $receipt.elapsed_ms
+    runtime_processes = 2
     content_body_reads = 0
     model_visible_body_bytes = 0
     ppt_body_reads = 0
@@ -243,8 +214,4 @@ try {
     model_visible_body_bytes = 0
   })
   exit 1
-} finally {
-  if ($script:RequestPath -and (Test-Path -LiteralPath $script:RequestPath -PathType Leaf)) {
-    Remove-Item -LiteralPath $script:RequestPath -Force
-  }
 }

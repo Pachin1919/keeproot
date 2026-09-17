@@ -1,121 +1,29 @@
-# Atlas CLI Agent Protocol
+# Atlas CLI Protocol
 
-Locate the user Runtime with `../scripts/locate-atlas.ps1`, then invoke its returned `launcher_path`. Add `--json` to every Agent call and apply a 15-second timeout to handshake calls. Directly launching the returned Node/CLI files is a protocol failure because it can omit the installed state binding and create an unintended second state directory.
+Use this reference only for an unfamiliar JSON response or Runtime error.
 
-The locator has four terminal categories: `ready`, `runtime_required`, `incompatible_protocol`, and `invalid_installation`. Do not fall back to a project-local copy after any non-ready result unless the user explicitly chose that development Runtime.
+Run the installed launcher returned by `scripts/locate-atlas.ps1`. Add `--json`, require `protocol_version: atlas-cli.v1`, require boolean `ok`, and preserve the full error envelope when reporting an unexpected failure. Never run Runtime source files directly because that can bypass installed-state binding.
 
-## Envelope
+## Current product namespaces
 
-Success:
+- `ui`: local Desktop surface and its install/doctor/remove lifecycle.
+- `save`: prepare, show, execute, undo, and redo one new result.
+- `content`: deterministic inspection or comparison of exact authorized files.
+- `resource relationships submit`: persist Host-proposed relationships after Atlas validates identities and Project boundaries.
 
-```json
-{
-  "protocol_version": "atlas-cli.v1",
-  "atlas_version": "0.1.0",
-  "ok": true,
-  "command": "begin",
-  "data": {}
-}
-```
+`capabilities --json` is authoritative. A missing namespace is unsupported; do not reconstruct it through an internal service.
 
-Failure:
+## Error handling
 
-```json
-{
-  "protocol_version": "atlas-cli.v1",
-  "atlas_version": "0.1.0",
-  "ok": false,
-  "command": "rollback",
-  "error": {
-    "code": "ATLAS_ROLLBACK_CONFLICT",
-    "message": "...",
-    "retryable": false,
-    "details": {}
-  }
-}
-```
+- `ATLAS_PATH_BOUNDARY`: the path escaped an authorized Root or crossed a link/junction. Correct the path or stop.
+- `ATLAS_NOT_FOUND`: verify the exact Resource, Save ID, Project, or path once.
+- `ATLAS_INVALID_ARGUMENT`: compare the call with current capabilities and syntax.
+- `ATLAS_STATE_CONFLICT`: stop writes and report the changed state.
+- `ATLAS_ROLLBACK_CONFLICT`: preserve the later file state; never overwrite it manually.
+- `ATLAS_COMMAND_FAILED`: inspect the message and current state before deciding anything.
 
-Require a recognized protocol version and boolean `ok`. Do not treat parse failure, missing fields, stderr prose, or a nonzero exit as success. Preserve the full envelope when reporting an unexpected failure.
+Exit `0` means the command returned successfully; still check its status and verification fields. Exit `1` is a failed command or health check. Exit `2` records a tracked scope/risk violation. Exit `3` is a recovery conflict.
 
-## Error Categories
+Caller fields (`--actor`, `--agent`, `--model`, `--tool`, `--client-run-id`) are audit metadata, not authentication. Reuse the caller run ID for related calls and preserve Atlas-generated operation IDs.
 
-- `ATLAS_PATH_BOUNDARY`: path or state directory escaped an authorized boundary. Correct scope or path; do not retry unchanged.
-- `ATLAS_NOT_FOUND`: run, target, Candidate, or material was not found. Reconcile with status/show and verify the exact ID/path.
-- `ATLAS_INVALID_ARGUMENT`: command contract was invalid. Check `capabilities` and command syntax.
-- `ATLAS_STATE_CONFLICT`: current file/run state or approval precondition no longer matches. Stop writes and report the conflict.
-- `ATLAS_CONTEXT_SETUP_REQUIRED`: cross-Project discovery is missing an adopted Root, target Project location, or matching Context Link. Follow only `error.details.required_actions`; do not fall back to broad scans or a guessed single-root task.
-- `ATLAS_ROLLBACK_CONFLICT`: recovery would overwrite a later file state. Stop and preserve the conflict details; never restore manually over it.
-- `ATLAS_COMMAND_FAILED`: another deterministic command failure. Inspect the message and current run state before deciding anything.
-
-## Exit Codes
-
-- `0`: command completed; still inspect `data.policy` and verification fields.
-- `1`: command or health check failed.
-- `2`: `close` completed and recorded a scope or risk violation.
-- `3`: rollback conflict; no blind overwrite is allowed.
-
-## Caller Trace Fields
-
-Run-producing commands, including `bootstrap scan`, `bootstrap propose`, and `derive prepare`, accept `--actor`, `--agent`, `--model`, `--tool`, and `--client-run-id`. They are audit metadata, not authentication. Reuse one task ID across related Atlas runs, but always preserve the Atlas-generated run ID as the authoritative operation identity.
-
-`portfolio inventory` is structure-only and returns multiple root candidates without opening file bodies. Depth 1 is the safe disk-level default. Depth 2 fails closed unless one or more exact `--expand` relative directories are supplied; this prevents Atlas from recursively probing installed-software or unknown branches. Root type and PachinStudio relation are separate Predictions. `portfolio review` records the user's type/relation Labels. `portfolio plan` persists a deterministic, read-only map with `source_changes: []`; it is not an Evolution approval and never makes software, Runtime, cache, backup, special, or unknown roots movable.
-
-`inspect --root` is the bounded read-only entry for one known workspace. It skips generated dependencies, caches, toolchains, build outputs, Git internals, and Skill package bodies while reporting those boundaries. A managed Obsidian Library uses `content_policy: root_control_files_only`; ordinary note bodies are not opened. A `.obsidian` marker inside an AGENTS-described website/project is reported as `project_contains_obsidian_config` instead of turning the whole Project into a Vault. Inspect returns top-level role hints, Git marker health, manifests, Skill collections, absolute Windows path references with target existence, reparse points, technical exclusions, verification-command candidates, read counts, access errors, and `source_changes: []`. It creates no Ledger run and makes no source change; the Agent remains responsible for semantic judgment.
-
-Use `capabilities --json` to discover Bootstrap Profiles, the closed V1 Derived role vocabulary, relation types, Work, and storage maintenance. Bootstrap proposal files and Derived Candidate files belong under `.atlas/work`, never inside the governed target. A staged Work item is not disposable merely because its TTL elapsed; prepare/propose must capture it or the user must explicitly release it before cleanup.
-
-`task discover` returns a bounded Project/role/time/extension candidate set without opening file bodies; registered candidates include Artifact, Material, and lineage counts. One stable explicit Project is sufficient for project-scoped structure discovery even when no whole-Library Contract is active; Profile route inference is empty in that mode, while registered Artifact roles remain available. `task prepare` accepts a bounded JSON request file with explicit inputs and/or discovery criteria and returns no input bodies. `read.selected` is the complete permitted read set for that content task; `read.excluded` must not be opened by the calling Skill. Budget exclusions retain `reason: read_budget` and distinguish `single_file_too_large`, `file_count_limit`, or `total_byte_limit` in `budget_reason`. The `contract_id` binds input hashes, read budget, Project path, the active environment RuleVersion or task-scoped environment marker, target, and strategy. `attention.eligible_rules` records rules applicable before the Task; `attention.applied_rules` records rules actually selected. `registration` states the required Artifact, Material, lineage, actual Hash, write-run, and rollback records. `task fulfill` auto-completes absent-target Derived creation under the current task authorization, but an append-only existing target returns a Guarded run requiring one exact Candidate approval followed by `task complete`. `task review-rule <task_id> --rule-id <rule_id> --decision <accepted|corrected> --reason <reason> --json` stores an independent Task Label without changing the immutable eligibility/application fact. A changed selected input, Project path, or active Library Contract returns `ATLAS_STATE_CONFLICT`. Concurrent fulfillment has one Ledger claim. Archive produces a reviewed organization plan; delete and arbitrary overwrite are denied.
-
-For different Materials in the same declared series, missing reliable coverage produces `coverage_unknown` with `decision=preserve_both`; it does not silently return zero relations. Both sources remain selected unless the byte budget is too small. Atlas never derives temporal coverage from filenames or modification times.
-
-`intake prepare` may return a plan without a `run_id` when classification, Project, structure, or route is unresolved. This is a successful bounded response, not permission to guess. An Agent may instead provide one explicit absent `--target` with an explicit stable `--project`; Atlas validates the exact task-scoped placement without requiring a whole-library Contract. Only `status: prepared` plus `auto_execute: true` and confidence at least `0.9` allows the Skill to call `intake execute` under the user's current task authorization. `intake show` is a Derived-detail envelope because Intake deliberately reuses the same Candidate, PolicyDecision, lineage, execution, and rollback machinery; it includes the complete Diff and should be reserved for reconciliation or explicit audit after a successful execute receipt.
-
-`guarded prepare` and `guarded preview` return `candidate.review_path`, a user-openable read-only copy under Atlas Work. The Ledger Candidate Blob remains authoritative; changing the review copy never changes the Candidate, and Preview recreates a missing or changed review copy from the verified Blob. `guarded apply-approved <run_id> --reason <user_approval>` is the post-review fast path. It records the accepted Label and executes under one state lock, revalidates the approved Candidate and current target, verifies the final Hash, and returns a compact receipt without the Diff. Repeated calls return the existing execution receipt; a stale, rejected, revised, or rolled-back run cannot be replayed. The receipt reports `elapsed_ms` and `within_10_second_budget`.
-
-`intake correct` stores one reviewed route at artifact, Project, or global scope as a new RuleVersion; later matching Intake must reuse it. `intake batch-plan` creates no write runs and coalesces questions across a batch. `intake batch-execute --root <ROOT> --request-file <JSON> --reason <AUTHORIZATION> <caller metadata> --json` is the fast path when every attachment already has an exact Candidate, Project and absent target. It preflights the whole batch, then prepares, executes and verifies all items in one Runtime process. A non-ready item returns one combined `needs_input` result before any run is created.
-
-`rule context` returns only effective matching preferences for one structured task request, plus conflicts, gaps, default advice, `context_hash`, and attention budget. It does not return historical RuleVersions. `rule propose` accepts an Agent-authored candidate with `kind`, `scope`, `condition`, `value`, `summary`, `basis`, `confidence`, `priority`, and bounded evidence paths inside the governed root. `rule preview` shows current/candidate values and actual consumers. `rule approve` creates one immutable RuleVersion and supersedes only the matching active preference; `rule reject` leaves no active preference. Task and Intake bind the effective context Hash and fail closed when it changes.
-
-`capture fetch --url <public_url>` downloads at most 8 MiB of public HTTP/HTTPS HTML or plain text, refuses embedded credentials and private/local network targets, strips non-content markup, and writes the result to managed Work without a browser or body-bearing receipt. Static fetch does not prove client-rendered completeness. `capture localize` accepts a browser-capture JSON envelope produced by the installed Skill helper or a plain selected-text file. It writes the cleaned result to managed Work and the JSON receipt contains no page body. Chat captures also produce `atlas.chat-message.v1` JSONL with stable IDs, roles, timestamps when available, and coverage facts. `capture sample` is the only default model-visible content handoff and rejects excerpts above 4,000 characters. A Browser capture must report `capture_scope` and `completeness`; `rendered_message_dom` and `rendered_document_text` do not prove a lazy page is complete.
-
-`content inspect --file <exact_path> --purpose <structure|content|data|visual> [--sheet <xlsx_sheet>]` invokes the optional local Python worker without opening a browser or desktop application. It returns `atlas.content-inspection.v1`, a bounded extraction, the input Hash, cache status, and `next_action`. Text, CSV/TSV, XLSX, PDF, PPTX and DOCX use direct local parsing. XLSX reports hidden Sheets, formulas, merged headers and used ranges; `purpose=data` requires one exact Sheet and returns Pandas/SQLite row counts, types, missingness, duplicates, date ranges when determinable, sensitivity flags, and a cross-check without raw rows. PDF reports per-page text size and image-only gaps through pypdf; it does not run OCR. Only `purpose=visual` may recommend a later bounded preview; the inspection command itself always returns `screenshots_used: 0`.
-
-`content compare --left <exact_path> --right <exact_path>` invokes the optional Python worker for two explicit text or JSONL files. It returns `atlas.content-relationship.v1` with Hash, line/message counts, `identical|left_contained_by_right|right_contained_by_left|overlap|independent`, record-timestamp coverage when available, and bounded changed/new message IDs. It returns no file bodies and makes no semantic supersede/delete decision.
-
-`content branches --file <jsonl> --file <jsonl> [...]` accepts 2–12 normalized chat JSONL inputs. Python builds a deterministic prefix tree from message ID and semantic message Hash, writes common and branch-only segments under Atlas state, and returns segment chains without bodies. Source URL and conversation ID do not make identical messages appear changed.
-
-`content localize-conversation --input <selection.json> --project <project_id> --output-relative <new_file.md> <caller metadata>` accepts `atlas.conversation-selection.v1`, not a raw conversation dump. The primary Agent remains responsible for semantic selection. Atlas validates bounded fields, active Project containment, parent existence, target absence and input stability, then atomically writes and Hash-verifies one plain Markdown handoff. The receipt uses `atlas.conversation-localization.v1` and contains no raw transcript.
-
-`evolve prepare` supports only the operations returned by `capabilities`: `create_directory`, `move_file`, `migrate_project`, `migrate_directory`, `migrate_cross_root`, and `remove_empty_directory`. The last operation requires one real directory with zero entries; it cannot delete files or non-empty trees, and rollback stops if another process reclaimed the path. `migrate_cross_root` requires distinct, non-nested `--root` and `--target-root` values plus one exact ordinary file or directory. It records free-space evidence, copies to a technical sibling stage, verifies the full Manifest, renames the stage within the target Root, and removes the source last. Interrupted execution resumes from verified filesystem state. It rejects links and special files, never overwrites a target, and does not silently update Project Location; reconcile a registered Project with `project relocate` after execution. Every Evolution operation returns `requires_approval: true`. For directory migrations, Preview includes the library/workspace classification, inspected control files, exact old-path references, generated-cache findings, current package-store evidence when available, reparse-point target validity, a recommendation, warnings, and blockers. A nested generated cache or stale internal Junction blocks approval until it has a separate disposition. The Skill must inspect `evolve preview`, present `plan.source_changes`, and pass an explicit reason to `evolve approve` before execution. A stale source/target/Registry state returns `ATLAS_STATE_CONFLICT`; rollback conflicts return `ATLAS_ROLLBACK_CONFLICT`. Neither result authorizes a manual move over the conflicting state.
-
-An organization plan may combine the same implemented operations under one immutable plan and one user approval. `evolve plan-reject` records a declined or superseded prepared plan without source changes. Reject and rebuild a prepared plan when its inspection evidence is known to be incomplete; do not approve an obsolete plan.
-
-A Library Contract ID binds the scan fingerprint, selected Profile, semantic zones, routes, and underlying Profile Prediction IDs. `bootstrap adopt` must receive the exact ID shown to the user and is idempotent; a stale or invented ID is a state conflict. Unrelated unreviewed Predictions become `deferred`, not rejected. An adopted Bootstrap scan and its RuleVersion are immutable. Use `bootstrap scan --new` for a corrected Profile/routing Contract. Storage maintenance is three-phase: `status` and `plan` are read-only; `execute` is the only deletion command and must preserve every protected class returned by the plan.
-
-Ledger restore is Hash-gated: list verified backups with `ledger backups`, then pass the exact returned `current_hash` to `ledger restore`. Atlas validates the source database and writes a safety backup before replacing the current Ledger. Never guess or bypass the Hash.
-
-`doctor analytics --json` reports the optional Python component independently from Node file governance. `analytics install [--python <path>] --json` creates a managed Python 3.11+ venv and installs the pinned Pandas dependency; installation needs network access, evaluation does not. `analytics remove --json` removes that venv while preserving state and Node governance. `analytics export [--name <export_name>] --json` creates a versioned, read-only `atlas.analytics.v1` dataset under the installed state directory. `analytics evaluate --export <export_name> [--name <evaluation_id>] --json` passes only that export to the configured Python component and publishes an `atlas.analytics.evaluation.v1` directory. `analytics show <evaluation_id> --json` verifies every output Hash before returning quality, the contracted `context_selection_text_byte_rate`, `recovery_outcome_distribution`, and `rule_reuse_rate` metrics, no more than five anomaly samples, and local report paths. Historical Recovery/Rule data without explicit events remains partial; missing facts remain unavailable/null. If Python is absent, evaluate fails with `ATLAS_CAPABILITY_UNAVAILABLE`, while export and file governance remain available.
-
-`root adopt` creates a stable local Root identity for an explicitly authorized directory. `root release <root_id> --reason <text>` stops governing a Root only when no active Project depends on it; it preserves Registry/path history and never deletes or moves files. If the old Root path disappears, `root relocate <root_id> --path <exact_new_root> --reason <text>` verifies the relative locations of all active Projects and at least one saved Git/manifest Project identity before appending Root path history. It never searches for or physically moves the Root, and rejection leaves Registry state unchanged. `project attach-root` binds a stable Project ID to one current Root-relative location, keeps prior locations as history, and stores bounded local identity evidence when a Git remote or manifest name is available. If one Project directory later disappears while its Root remains available, `project relocate <project_id> --root <root_id> --path <relative_path> --reason <text>` compares one exact user/Agent-supplied candidate with the saved evidence. It updates Location history only on a verified match; it does not search a drive or move files. `project resolve --path <directory>` performs a read-only longest-location match and returns the active Root, Project, Location, and Context Links; when none match it returns `setup_required` without scanning another disk or creating state. `project link-context` creates an immutable RuleVersion for one recurring target→source relationship and purpose; updating filters supersedes the old link instead of editing it.
-
-`agent context --path <directory> --request-file <json>` is the first V1.4 host-facing adapter. It composes read-only Project resolution with the existing effective-rule query, injects the resolved stable Project ID, and returns active Context Links plus compact rule attention. It performs no content discovery or write. A mismatched request Project fails closed; an unresolved path returns `setup_required`.
-
-`ui [--path <directory>] [--task <task_id>] [--port <port>] [--no-open] [--refresh-sources]` starts the V1.5.1 user interface on `127.0.0.1`. It opens the default browser unless `--no-open` is present. The Workspace lists managed Projects and recent Tasks even when launched from an unregistered directory. Project and Task links remain inside the same session. Execute and rollback require an explicit confirmation, and every action is bound to the current Task, write run, ChangeSet and Candidate/Diff Hashes. The Workspace Stop action closes the local server.
-
-`ui context --path <directory>` writes one self-contained, read-only Workspace Snapshot and one versioned Context JSON under Atlas state. It is an audit artifact, not the interactive UI. The Context model contains bounded Project candidates, recent Tasks, active routes, compact active/superseded rule history, local processor availability, Node, optional Python and Ledger health. The command does not open a browser, use the network, modify a governed Project, refresh a Source Set, or expose either body in the JSON receipt.
-
-`ui operation --task <task_id> [--refresh-sources]` writes one versioned, read-only Task Snapshot. It combines the existing Task intent, selected and excluded sources, effective rule IDs, Agent proposal, PolicyDecision, Guarded or Derived Candidate, full local Diff, execution Receipt, rollback precondition and next action. Without the flag, Source Set freshness is `not_checked`; with the flag, Atlas refreshes only linked source Projects and hashes the exact selected files, then returns `current`, `stale_source`, `missing_source`, or `moved_same_content`. The CLI response returns only compact status and the snapshot path, with `model_visible_body_bytes: 0`.
-
-`ui serve --task <task_id>` remains a compatibility entry for one Task. New user flows use `atlas ui`. Both use the same AgentLifecycle/Guarded/Task services, random session token and state binding. A changed binding returns a stale-state stop and performs no action. `approve` and `reject` require a reason; `execute` and `rollback` require explicit confirmation; rollback keeps the underlying conflict checks.
-
-`agent start --path <directory> --request-file <task_json> <caller fields>` resolves the current Project, injects its stable ID, and prepares one existing Task Contract in a compact response. `agent status --path <directory>` lists only non-terminal Tasks for that Project and their next action. `agent resume <task_id>` returns the existing review when approval is still missing, continues an already approved Guarded write, or reconciles an executed child run; it does not create a replacement Task or approval.
-
-The V1.4 operation adapter is `agent prepare <task_id> --candidate-file <path> [--reason <task_authorization>]` → `agent approve <task_id> --reason <user_approval>` → `agent fulfill <task_id> --approval-token <token>` or `agent rollback <task_id>`. Prepare reuses Task fulfillment and returns either a completed absent-target Derived write with no extra approval, or one Guarded `review_path` with Candidate/Baseline/Diff Hashes. Approve stores the existing Guarded user Label and returns a deterministic token bound to the Task's current Candidate and approval receipt. Fulfill recomputes the token, executes the existing Guarded run, completes the Task, and returns a compact verified receipt. The token correlates a host approval with one Candidate; it is not authentication, does not replace Hash/state checks, and cannot make a stale target executable. No parallel write or recovery model is created.
-
-`task discover-context` refreshes each linked source Project through the incremental local Catalog and persists one bounded Candidate Set. The direct-text processor currently indexes `.md`, `.markdown`, and `.txt`, reads at most 2 MiB per changed file, skips links, special files, and technical directories, and reuses unchanged entries. The JSON response contains bounded snippets and no full body. Use `--compact` for the Agent-facing first pass; it omits bulk headings, tags, snippets, Hashes, and repeated Root metadata. `task context-candidates <candidate_set_id> --compact` retrieves the compact set without another scan. If one title or path is ambiguous, `task context-candidates <candidate_set_id> --entry <catalog_entry_id>` returns only that full candidate. These response flags do not change the saved Candidate Set.
-
-`task prepare-context` validates selected Catalog entry IDs, captures an immutable Source Set, then prepares the existing Task Contract with multiple read Roots and one write Root. Its `--compact` response retains selected paths, Hashes, read/write boundaries, effective rules, conflicts, budgets, and the Source Set ID while omitting repeated registration and expanded Contract fields. `task show <task_id> --compact` and `show <run_id> --compact` omit event history and full Diff text during ordinary reconciliation. `task source-set` retrieves selected paths, Hashes, Project IDs, and Root IDs when more detail is required. `task fulfill` uses the existing Derived create path; it does not introduce a parallel writer. Source Hash drift, target claims, and path or link violations stop execution. Historical Task and Derived rows remain valid because cross-Root fields are nullable.
-
-`task source-status <task_id> ...caller metadata...` refreshes only the Projects in the Task's persistent Source Set and re-hashes the exact selected files instead of trusting size/mtime cache metadata. It returns `current`, `stale_source`, `missing_source`, or `moved_same_content`, affected paths, compact refresh counts, and one next-action line. It does not send source bodies to the Agent or modify user files.
-
-V1.3 Context Links support extension and maximum-candidate filters. Role filters fail closed because the direct-text Catalog does not yet enforce a complete Artifact-role index. Candidate and Source Set fields are discovery-time snapshots. A disabled/superseded Context Link or a changed source/target Project Root invalidates an old selection or prepared Task.
+Historical SQLite tables may exist after upgrades. They have no product or Skill command route and must not be interpreted as pending user work.

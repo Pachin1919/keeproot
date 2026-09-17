@@ -6,7 +6,6 @@ import test from 'node:test';
 import { Intake } from '../src/intake.js';
 import { PreferenceRules } from '../src/preference-rules.js';
 import { Registry } from '../src/registry.js';
-import { TaskContract } from '../src/task-contract.js';
 
 const tempRoot = path.resolve('test', '.tmp');
 
@@ -60,7 +59,7 @@ test('general rule context offers defaults, learns one reviewed rule, and supers
   const initial = rules.context({
     root,
     request: {
-      operation: 'content_task',
+      operation: 'content_work',
       project_id: projectId,
       artifact_role: 'report',
       needs: ['naming'],
@@ -78,7 +77,7 @@ test('general rule context offers defaults, learns one reviewed rule, and supers
   assert.equal(proposed.status, 'prepared');
   const preview = rules.preview(proposed.rule_change_id);
   assert.equal(preview.current_rule, null);
-  assert.ok(preview.impact.consumers.includes('task'));
+  assert.ok(preview.impact.consumers.includes('save'));
   assert.ok(preview.impact.consumers.includes('intake'));
 
   const approved = rules.approve(proposed.rule_change_id, {
@@ -88,7 +87,7 @@ test('general rule context offers defaults, learns one reviewed rule, and supers
   const learned = rules.context({
     root,
     request: {
-      operation: 'content_task',
+      operation: 'content_work',
       project_id: projectId,
       artifact_role: 'report',
       needs: ['naming'],
@@ -167,119 +166,13 @@ test('a reviewed placement preference routes repeated Intake without a Library C
   }
 });
 
-test('Task applies a learned version strategy and becomes stale when the effective rule changes', (t) => {
-  const { root, stateDir, projectId } = setup('general-rule-task-stale');
-  fs.writeFileSync(path.join(root, 'Projects', 'PPTgen', 'Sources', 'base.md'), '# Base\n', 'utf8');
-  const rules = new PreferenceRules({ stateDir });
-  const first = rules.propose({
-    root,
-    proposal: {
-      kind: 'content_versioning',
-      scope: { type: 'project', project_id: projectId },
-      condition: { data_class: 'temporal_snapshot' },
-      value: { strategy: 'new_version', preserve_prior: true, date_basis: 'coverage' },
-      summary: 'PPTgen 时间快照保留旧版并创建新版本。',
-      basis: 'observed',
-      confidence: 0.9,
-      priority: 100,
-      evidence: [{
-        path: 'Projects/PPTgen/AGENTS.md',
-        fact: '项目要求保留历史报告，不覆盖来源。',
-      }],
-    },
-  });
-  rules.approve(first.rule_change_id, { reason: '确认保留时间快照旧版。' });
-
-  const task = new TaskContract({ stateDir });
-  t.after(() => task.dispose());
-  const prepared = task.prepare({
-    root,
-    request: {
-      intent: 'Create the next governed report snapshot.',
-      project_id: projectId,
-      inputs: [{ path: 'Projects/PPTgen/Sources/base.md', required: true, priority: 1 }],
-      output: {
-        target: 'Projects/PPTgen/Outputs/current.md',
-        role: 'report',
-        data_class: 'temporal_snapshot',
-        action: 'auto',
-      },
-    },
-  });
-  assert.equal(prepared.status, 'ready');
-  assert.equal(prepared.write.strategy, 'new_version');
-  assert.equal(prepared.attention.status, 'advice_available');
-  assert.deepEqual(
-    prepared.attention.applied_rules.map((item) => item.kind),
-    ['content_versioning'],
-  );
-  assert.deepEqual(
-    prepared.attention.eligible_rules.map((item) => item.rule_id),
-    prepared.attention.applied_rules.map((item) => item.rule_id),
-  );
-  assert.deepEqual(prepared.attention.gaps, ['naming', 'agent_output']);
-  assert.deepEqual(
-    prepared.attention.default_advice.map((item) => item.kind),
-    ['naming', 'agent_output'],
-  );
-  const evaluated = task.show(prepared.task_id).events.find(
-    (event) => event.type === 'task_rule_evaluated',
-  );
-  assert.deepEqual(evaluated.payload, {
-    task_id: prepared.task_id,
-    eligible_rule_ids: [prepared.attention.applied_rules[0].rule_id],
-    applied_rule_ids: [prepared.attention.applied_rules[0].rule_id],
-    rule_version_ids: [prepared.attention.applied_rules[0].rule_version_id],
-    evaluated_at: evaluated.occurred_at,
-  });
-  const review = task.reviewRule(prepared.task_id, {
-    ruleId: prepared.attention.applied_rules[0].rule_id,
-    decision: 'corrected',
-    reason: 'The existing rule was eligible and applied, but the user corrected this Task.',
-  });
-  assert.equal(review.task_id, prepared.task_id);
-  assert.equal(review.decision, 'corrected');
-  assert.equal(
-    task.show(prepared.task_id).rule_application_reviews[0].rule_id,
-    prepared.attention.applied_rules[0].rule_id,
-  );
-
-  const replacement = rules.propose({
-    root,
-    proposal: {
-      kind: 'content_versioning',
-      scope: { type: 'project', project_id: projectId },
-      condition: { data_class: 'temporal_snapshot' },
-      value: { strategy: 'delta', preserve_prior: true, date_basis: 'coverage' },
-      summary: 'PPTgen 时间快照改为保存增量。',
-      basis: 'observed',
-      confidence: 0.9,
-      priority: 100,
-      evidence: [{
-        path: 'Projects/PPTgen/AGENTS.md',
-        fact: '用户修正规则：后续只保存明确增量。',
-      }],
-    },
-  });
-  rules.approve(replacement.rule_change_id, { reason: '确认后续使用增量策略。' });
-  rules.dispose();
-
-  const candidate = path.join(stateDir, 'candidate.md');
-  fs.writeFileSync(candidate, '# Candidate\n', 'utf8');
-  assert.throws(
-    () => task.fulfill(prepared.task_id, { candidateFile: candidate, reason: 'Current task authorization.' }),
-    /effective rule context changed/i,
-  );
-  assert.equal(fs.existsSync(path.join(root, 'Projects', 'PPTgen', 'Outputs', 'current.md')), false);
-});
-
 test('CLI exposes the compact propose, preview, approve, and effective-context flow', () => {
   const { caseRoot, root, stateDir, projectId } = setup('general-rule-cli');
   const proposalFile = path.join(caseRoot, 'proposal.json');
   const contextFile = path.join(caseRoot, 'context.json');
   fs.writeFileSync(proposalFile, JSON.stringify(observedProposal(projectId)), 'utf8');
   fs.writeFileSync(contextFile, JSON.stringify({
-    operation: 'content_task',
+    operation: 'content_work',
     project_id: projectId,
     artifact_role: 'report',
     needs: ['naming'],

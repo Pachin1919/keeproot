@@ -640,19 +640,19 @@ createDerivedRun({
     });
   }
 
-  startDerivedExecution(runId, occurredAt) {
+  startDerivedExecution(runId, occurredAt, ownership = null) {
     return this.transaction(() => {
       const run = this.getRun(runId);
       if (run.status !== 'approved') {
         throw new Error(`Derived execution requires approval; current status is ${run.status}.`);
       }
       const existing = this.db.prepare(`
-        SELECT occurred_at FROM operation_events
+        SELECT occurred_at, payload_json FROM operation_events
         WHERE run_id = ? AND event_type = 'derived_execution_started'
         ORDER BY rowid DESC LIMIT 1
       `).get(runId);
-      if (existing) return { run_id: runId, status: 'execution_started', started_at: existing.occurred_at };
-      const receipt = { run_id: runId, status: 'execution_started', started_at: occurredAt };
+      if (existing) return parseJson(existing.payload_json);
+      const receipt = { run_id: runId, status: 'execution_started', started_at: occurredAt, ownership };
       this.insertEvent(runId, 'derived_execution_started', receipt, occurredAt);
       return receipt;
     });
@@ -793,6 +793,37 @@ createDerivedRun({
         reasonCode: 'restored_and_verified',
         details: { removed_files: receipt.removed_files ?? null },
       }, rolledBackAt);
+      return receipt;
+    });
+  }
+
+  startDerivedRedo(runId, occurredAt, ownership = null) {
+    return this.transaction(() => {
+      const run = this.getRun(runId);
+      if (run.status !== 'rolled_back') throw new Error(`Derived redo requires a rolled back run; current status is ${run.status}.`);
+      const existing = this.db.prepare(`
+        SELECT payload_json FROM operation_events
+        WHERE run_id = ? AND event_type = 'derived_redo_started'
+        ORDER BY rowid DESC LIMIT 1
+      `).get(runId);
+      if (existing) return parseJson(existing.payload_json);
+      const receipt = { run_id: runId, status: 'redo_started', started_at: occurredAt, ownership };
+      this.insertEvent(runId, 'derived_redo_started', receipt, occurredAt);
+      return receipt;
+    });
+  }
+
+  finishDerivedRedo(runId, receipt, redoneAt) {
+    return this.transaction(() => {
+      const run = this.getRun(runId);
+      if (run.status !== 'rolled_back') throw new Error(`Only a rolled back Derived run can be redone; current status is ${run.status}.`);
+      const operation = this.db.prepare('SELECT output_artifact_id FROM derived_operations WHERE run_id = ?').get(runId);
+      this.db.prepare("UPDATE runs SET status = 'executed', closed_at = ?, rolled_back_at = NULL, rollback_receipt_json = NULL, receipt_json = ? WHERE id = ?").run(redoneAt, json(receipt), runId);
+      this.db.prepare('UPDATE derived_operations SET execution_receipt_json = ? WHERE run_id = ?').run(json(receipt), runId);
+      this.db.prepare("UPDATE change_sets SET status = 'executed' WHERE run_id = ?").run(runId);
+      this.db.prepare("UPDATE candidate_change_sets SET status = 'executed' WHERE run_id = ?").run(runId);
+      this.db.prepare("UPDATE artifacts SET status = 'active', updated_at = ? WHERE id = ?").run(redoneAt, operation.output_artifact_id);
+      this.insertEvent(runId, 'derived_redone_and_verified', receipt, redoneAt);
       return receipt;
     });
   }

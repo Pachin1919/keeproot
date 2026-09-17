@@ -2,6 +2,6 @@
   "name": "website-demo-source-isolation",
   "user_request": "把 Codex 生成的动画 Demo 放到 Demos，不要混进生产 Source；以后同类 Demo 自动走这里，并且可以恢复。",
   "profile": "project-work",
-  "required_commands": ["intake correct", "intake prepare", "intake execute", "intake rollback"],
+  "required_commands": ["save prepare", "save execute", "save undo", "save redo"],
   "decision_budget": 2
 }

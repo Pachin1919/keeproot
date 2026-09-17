@@ -208,6 +208,24 @@ test('A derived output can become the stable input of a later derived run', (t) 
   assert.equal(derived.preview(second.run_id).lineage[0].input_material_id, firstDetail.output.material_id);
 });
 
+test('Derived refuses an interrupted same-hash target without its ownership temporary file', (t) => {
+  const { vault, stateDir, projectId } = setup('derived-interrupted-external-same-hash');
+  const derived = openDerived(t, stateDir);
+  const target = path.join(vault, 'Projects', 'Atlas', 'result.md');
+  const prepared = derived.prepare({
+    root: vault, inputs: ['allowed-a.md'], target: 'Projects/Atlas/result.md',
+    candidateContent: 'same candidate\\n', projectId, role: 'report',
+  });
+  derived.approve(prepared.run_id, { reason: 'test interrupted ownership' });
+  derived.ledger.startDerivedExecution(prepared.run_id, new Date().toISOString());
+  fs.writeFileSync(target, 'same candidate\\n', 'utf8');
+
+  assert.throws(() => derived.execute(prepared.run_id), /claimed|ownership|stale/i);
+  assert.equal(derived.preview(prepared.run_id).run.status, 'stale');
+  assert.throws(() => derived.rollback(prepared.run_id), /executed/i);
+  assert.equal(fs.readFileSync(target, 'utf8'), 'same candidate\\n');
+});
+
 test('Derived rollback refuses to delete a later external revision', (t) => {
   const { vault, stateDir, projectId } = setup('derived-rollback-conflict');
   const derived = openDerived(t, stateDir);
@@ -248,6 +266,40 @@ test('Derived rollback treats an external deletion as a conflict', (t) => {
   assert.equal(derived.preview(prepared.run_id).run.status, 'executed');
 });
 
+test('Derived redo recreates a rolled back target without overwriting an external claim', (t) => {
+  const { vault, stateDir, projectId } = setup('derived-redo');
+  const derived = openDerived(t, stateDir);
+  const prepared = derived.prepare({
+    root: vault, inputs: ['allowed-a.md'], target: 'Projects/Atlas/redone.md',
+    candidateContent: 'generated again\n', projectId, role: 'report',
+  });
+  derived.approve(prepared.run_id);
+  derived.execute(prepared.run_id);
+  derived.rollback(prepared.run_id);
+  const target = path.join(vault, 'Projects', 'Atlas', 'redone.md');
+  fs.writeFileSync(target, 'external claim\n', 'utf8');
+  assert.throws(() => derived.redo(prepared.run_id), /empty target path/u);
+  assert.equal(fs.readFileSync(target, 'utf8'), 'external claim\n');
+  fs.rmSync(target);
+  const receipt = derived.redo(prepared.run_id);
+  assert.equal(receipt.verified, true);
+  assert.equal(fs.readFileSync(target, 'utf8'), 'generated again\n');
+  assert.equal(derived.preview(prepared.run_id).run.status, 'executed');
+});
+
+test('Derived redo rejects changed inputs before recreating a target', (t) => {
+  const { vault, stateDir, projectId } = setup('derived-redo-input'); const derived=openDerived(t,stateDir);
+  const prepared=derived.prepare({root:vault,inputs:['allowed-a.md'],target:'Projects/Atlas/redone-input.md',candidateContent:'generated\n',projectId,role:'report'});derived.approve(prepared.run_id);derived.execute(prepared.run_id);derived.rollback(prepared.run_id);fs.writeFileSync(path.join(vault,'allowed-a.md'),'changed\n');assert.throws(()=>derived.redo(prepared.run_id),/input changed/u);assert.equal(fs.existsSync(path.join(vault,'Projects','Atlas','redone-input.md')),false);
+});
+
+test('Derived redo rejects a missing Candidate blob', (t) => {
+  const { vault, stateDir, projectId }=setup('derived-redo-blob');const derived=openDerived(t,stateDir);const prepared=derived.prepare({root:vault,inputs:['allowed-a.md'],target:'Projects/Atlas/blob.md',candidateContent:'unique redo blob\n',projectId,role:'report'});derived.approve(prepared.run_id);derived.execute(prepared.run_id);derived.rollback(prepared.run_id);const detail=derived.preview(prepared.run_id);fs.rmSync(detail.candidate.blob_path);assert.throws(()=>derived.redo(prepared.run_id),/Candidate/u);assert.equal(fs.existsSync(path.join(vault,'Projects','Atlas','blob.md')),false);assert.equal(derived.preview(prepared.run_id).run.status,'rolled_back');
+});
+
+test('Derived redo recovers after receipt commit failure without losing ownership', (t) => {
+  const { vault,stateDir,projectId }=setup('derived-redo-receipt-failure');const derived=openDerived(t,stateDir);const prepared=derived.prepare({root:vault,inputs:['allowed-a.md'],target:'Projects/Atlas/retry.md',candidateContent:'retry candidate\n',projectId,role:'report'});derived.approve(prepared.run_id);derived.execute(prepared.run_id);derived.rollback(prepared.run_id);const original=derived.ledger.derived.finishDerivedRedo.bind(derived.ledger.derived);let failed=false;derived.ledger.derived.finishDerivedRedo=(...args)=>{if(!failed){failed=true;throw new Error('receipt unavailable');}return original(...args);};assert.throws(()=>derived.redo(prepared.run_id),/receipt unavailable/u);const target=path.join(vault,'Projects','Atlas','retry.md');const detail=derived.preview(prepared.run_id);const started=detail.events.filter(e=>e.type==='derived_redo_started').at(-1).payload;assert.equal(detail.run.status,'rolled_back');assert.equal(fs.readFileSync(target,'utf8'),'retry candidate\n');assert.equal(fs.statSync(target).ino,fs.statSync(started.ownership.temp_path).ino);derived.ledger.derived.finishDerivedRedo=original;const receipt=derived.redo(prepared.run_id);assert.ok(receipt.redone_at);assert.equal(fs.existsSync(started.ownership.temp_path),false);assert.equal(derived.preview(prepared.run_id).run.status,'executed');derived.rollback(prepared.run_id);assert.equal(fs.existsSync(target),false);
+});
+
 test('Derived execute and rollback resume only after Atlas recorded operation intent', (t) => {
   const { vault, stateDir, projectId } = setup('derived-crash-resume');
   const derived = openDerived(t, stateDir);
@@ -261,12 +313,18 @@ test('Derived execute and rollback resume only after Atlas recorded operation in
   });
   derived.approve(prepared.run_id);
 
-  derived.ledger.startDerivedExecution(prepared.run_id, new Date().toISOString());
-  fs.writeFileSync(path.join(vault, 'Projects', 'Atlas', 'resume.md'), 'generated\n', 'utf8');
+  const target = path.join(vault, 'Projects', 'Atlas', 'resume.md');
+  const temporary = path.join(path.dirname(target), '.atlas-derived-owned.publish.tmp');
+  derived.ledger.startDerivedExecution(prepared.run_id, new Date().toISOString(), { publish_token: 'owned', temp_path: temporary });
+  fs.copyFileSync(derived.preview(prepared.run_id).candidate.blob_path, temporary, fs.constants.COPYFILE_EXCL);
+  fs.linkSync(temporary, target);
   assert.equal(derived.execute(prepared.run_id).status, 'executed');
+  fs.linkSync(target, temporary);
+  assert.equal(derived.execute(prepared.run_id).status, 'executed');
+  assert.equal(fs.existsSync(temporary), false);
 
   derived.ledger.startDerivedRollback(prepared.run_id, new Date().toISOString());
-  fs.rmSync(path.join(vault, 'Projects', 'Atlas', 'resume.md'));
+  fs.rmSync(target);
   assert.equal(derived.rollback(prepared.run_id).status, 'rolled_back');
 });
 
@@ -357,4 +415,60 @@ test('Derived rollback stops when its output is an active downstream input', (t)
       && error.conflicts[0].downstream_runs[0].run_id === second.run_id,
   );
   assert.equal(fs.existsSync(path.join(vault, 'Projects', 'Atlas', 'first-output.md')), true);
+});
+
+test('Derived refuses an execute after the recorded target parent becomes a junction', (t) => {
+  const { caseRoot, vault, stateDir, projectId } = setup('derived-parent-replaced-execute');
+  const derived = openDerived(t, stateDir);
+  const prepared = derived.prepare({ root: vault, inputs: ['allowed-a.md'], target: 'Projects/Atlas/result.md', candidateContent: 'candidate\n', projectId, role: 'draft' });
+  derived.approve(prepared.run_id);
+  const parent = path.join(vault, 'Projects', 'Atlas'); const backup = path.join(caseRoot, 'atlas-backup'); const external = path.join(caseRoot, 'external');
+  fs.renameSync(parent, backup); fs.mkdirSync(external);
+  try { fs.symlinkSync(external, parent, 'junction'); } catch (error) { t.skip(`junction unavailable: ${error.code ?? error.message}`); return; }
+  assert.throws(() => derived.execute(prepared.run_id), /parent.*real directory|outside/u);
+  assert.equal(fs.existsSync(path.join(external, 'result.md')), false);
+});
+
+test('Derived refuses rollback after the recorded target parent becomes a junction', (t) => {
+  const { caseRoot, vault, stateDir, projectId } = setup('derived-parent-replaced-rollback');
+  const derived = openDerived(t, stateDir);
+  const prepared = derived.prepare({ root: vault, inputs: ['allowed-a.md'], target: 'Projects/Atlas/result.md', candidateContent: 'candidate\n', projectId, role: 'draft' });
+  derived.approve(prepared.run_id); derived.execute(prepared.run_id);
+  const parent = path.join(vault, 'Projects', 'Atlas'); const backup = path.join(caseRoot, 'atlas-backup'); const external = path.join(caseRoot, 'external');
+  fs.renameSync(parent, backup); fs.mkdirSync(external); fs.writeFileSync(path.join(external, 'result.md'), 'candidate\n');
+  try { fs.symlinkSync(external, parent, 'junction'); } catch (error) { t.skip(`junction unavailable: ${error.code ?? error.message}`); return; }
+  assert.throws(() => derived.rollback(prepared.run_id), /parent.*real directory|outside/u);
+  assert.equal(fs.readFileSync(path.join(external, 'result.md'), 'utf8'), 'candidate\n');
+});
+
+test('Derived refuses an in-root junction ancestor even when its target parent is ordinary', (t) => {
+  const { vault, stateDir, projectId } = setup('derived-in-root-junction-ancestor');
+  const derived = openDerived(t, stateDir);
+  const project = path.join(vault, 'Projects', 'Atlas'); const actual = path.join(project, 'actual'); const linked = path.join(project, 'linked');
+  fs.mkdirSync(path.join(actual, 'child'), { recursive: true });
+  try { fs.symlinkSync(actual, linked, 'junction'); } catch (error) { t.skip(`junction unavailable: ${error.code ?? error.message}`); return; }
+  assert.throws(
+    () => derived.prepare({ root: vault, inputs: ['allowed-a.md'], target: 'Projects/Atlas/linked/child/result.md', candidateContent: 'candidate\n', projectId, role: 'draft' }),
+    /parent.*real directory|linked/u,
+  );
+  assert.equal(fs.existsSync(path.join(actual, 'child', 'result.md')), false);
+});
+
+test('Derived refuses execute and rollback through an in-root junction ancestor', (t) => {
+  const { caseRoot, vault, stateDir, projectId } = setup('derived-in-root-junction-revalidation');
+  const derived = openDerived(t, stateDir);
+  const project = path.join(vault, 'Projects', 'Atlas'); const linked = path.join(project, 'linked'); const child = path.join(linked, 'child');
+  fs.mkdirSync(child, { recursive: true });
+  const prepared = derived.prepare({ root: vault, inputs: ['allowed-a.md'], target: 'Projects/Atlas/linked/child/result.md', candidateContent: 'candidate\n', projectId, role: 'draft' });
+  derived.approve(prepared.run_id); derived.execute(prepared.run_id);
+  const backup = path.join(caseRoot, 'linked-backup'); const actual = path.join(project, 'actual');
+  fs.renameSync(linked, backup); fs.mkdirSync(path.join(actual, 'child'), { recursive: true }); fs.writeFileSync(path.join(actual, 'child', 'result.md'), 'candidate\n');
+  try { fs.symlinkSync(actual, linked, 'junction'); } catch (error) { t.skip(`junction unavailable: ${error.code ?? error.message}`); return; }
+  assert.throws(() => derived.execute(prepared.run_id), /parent.*real directory|linked/u);
+  assert.throws(() => derived.rollback(prepared.run_id), /parent.*real directory|linked/u);
+  assert.equal(fs.readFileSync(path.join(actual, 'child', 'result.md'), 'utf8'), 'candidate\n');
+});
+
+test('Derived redo refuses a target parent replaced by a junction', (t) => {
+  const { caseRoot, vault, stateDir, projectId } = setup('derived-redo-junction'); const derived=openDerived(t,stateDir); const project=path.join(vault,'Projects','Atlas'); const parent=path.join(project,'redo-parent'); fs.mkdirSync(parent,{recursive:true}); const prepared=derived.prepare({root:vault,inputs:['allowed-a.md'],target:'Projects/Atlas/redo-parent/result.md',candidateContent:'redo candidate\n',projectId,role:'draft'});derived.approve(prepared.run_id);derived.execute(prepared.run_id);derived.rollback(prepared.run_id);const backup=path.join(caseRoot,'redo-backup');const external=path.join(caseRoot,'external');fs.renameSync(parent,backup);fs.mkdirSync(external,{recursive:true});try{fs.symlinkSync(external,parent,'junction');}catch(error){t.skip(`junction unavailable: ${error.code??error.message}`);return;}assert.throws(()=>derived.redo(prepared.run_id),/parent.*real directory|linked/u);assert.equal(fs.existsSync(path.join(external,'result.md')),false);assert.equal(derived.preview(prepared.run_id).run.status,'rolled_back');
 });

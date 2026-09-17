@@ -2,16 +2,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import {
-  doctorAnalyticsComponent,
-  installAnalyticsComponent,
-  removeAnalyticsComponent,
-} from '../src/analytics-component.js';
-import { AgentLifecycle } from '../src/agent-lifecycle.js';
-import {
-  evaluateAnalytics,
-  showAnalyticsEvaluation,
-} from '../src/analytics-evaluation.js';
 import { Bootstrap } from '../src/bootstrap.js';
 import { BrowserCapture } from '../src/browser-capture.js';
 import { Catalog } from '../src/catalog.js';
@@ -24,11 +14,12 @@ import {
 import { prepareDataWorkspace } from '../src/data-workspace.js';
 import { compactContextPackReceipt, prepareContextPack } from '../src/context-pack.js';
 import { localizeConversationSelection } from '../src/conversation-localization.js';
-import { exportAnalytics } from '../src/analytics-export.js';
 import { Derived } from '../src/derived.js';
 import { Evolution } from '../src/evolution.js';
 import { Guarded } from '../src/guarded.js';
 import { Intake } from '../src/intake.js';
+import { SaveService } from '../src/save-service.js';
+import { createResourceControl } from '../src/resource-control.js';
 import { WorkspaceInspector } from '../src/inspect.js';
 import { Portfolio } from '../src/portfolio.js';
 import { PreferenceRules } from '../src/preference-rules.js';
@@ -36,11 +27,6 @@ import { Registry } from '../src/registry.js';
 import { evaluateRisk } from '../src/risk.js';
 import { isPathInside, normalizeStateDir } from '../src/paths.js';
 import { RuntimeStorage } from '../src/runtime-storage.js';
-import { withStateLock } from '../src/state-lock.js';
-import { TaskContract } from '../src/task-contract.js';
-import { createContextView } from '../src/ui-context.js';
-import { createOperationSnapshot } from '../src/ui-operation.js';
-import { applyUiAction } from '../src/ui-action.js';
 import {
   doctorDesktopUiComponent,
   installDesktopUiComponent,
@@ -48,7 +34,7 @@ import {
   startDesktopUi,
 } from '../src/desktop-ui-component.js';
 import { openLocalUi } from '../src/ui-launcher.js';
-import { startAtlasUiServer, startTaskReviewServer } from '../src/ui-server.js';
+import { startAtlasUiServer } from '../src/ui-server.js';
 import {
   ATLAS_VERSION,
   CAPABILITIES,
@@ -92,6 +78,28 @@ function isUnboundInstalledRuntime() {
   }
 }
 
+function isInstalledProductRuntime() {
+  return path.resolve(installationRoot) !== projectRoot;
+}
+
+function exposedCapabilities() {
+  if (!isInstalledProductRuntime()) return CAPABILITIES;
+  const exposed = structuredClone(CAPABILITIES);
+  delete exposed.workflows.guarded;
+  delete exposed.workflows.derived;
+  delete exposed.workflows.intake;
+  exposed.product_entrypoints.internal_foundation.commands = [
+    'bootstrap', 'tracked_direct', 'evolution',
+  ];
+  delete exposed.guarded_operations;
+  delete exposed.guarded_review;
+  delete exposed.derived_operations;
+  delete exposed.derived_relation_types;
+  delete exposed.intake_origins;
+  delete exposed.intake_placement_modes;
+  return exposed;
+}
+
 function emit(command, data, printHuman) {
   activeCommand = command;
   if (outputJson) console.log(JSON.stringify(successEnvelope(command, data), null, 2));
@@ -115,21 +123,18 @@ function parseCallerFlag(result, args, index) {
   return index + 1;
 }
 
-function usage() {
+function foundationUsage() {
   return `Atlas ${ATLAS_VERSION} — local-first file governance foundation
 
 Usage:
   atlas version [--json]
   atlas capabilities [--json]
-  atlas doctor [analytics] [--json]
+  Current product: atlas ui; atlas save prepare/show/execute/undo/redo
+  Other commands are supporting foundation or diagnostics.
+  atlas doctor [ui] [--json]
   atlas inspect --root <path> [--max-depth <1..8>]
   atlas ledger backups
   atlas ledger restore --backup <filename> --expect-current-hash <sha256>
-  atlas analytics export [--name <export_name>]
-  atlas analytics install [--python <python_path>]
-  atlas analytics evaluate --export <export_name> [--name <evaluation_id>]
-  atlas analytics show <evaluation_id>
-  atlas analytics remove
   atlas begin --root <path> --allow <path> [--allow <path> ...] [--intent <text>]
               [--operation <type>] [--importance <level>] [--link-impact <count>] [--confidence <0..1>] [--rules]
   atlas close [run_id]
@@ -149,6 +154,7 @@ Usage:
                         [--compact]
                         [--actor <actor>] [--agent <name>] [--model <name>]
                         [--tool <name>] [--client-run-id <id>]
+  atlas resource relationships submit --request-file <json> --tool <name> --client-run-id <id>
   atlas content prepare-data --file <csv|tsv|xlsx> [--sheet <xlsx_sheet_name>]
   atlas content prepare-context --file <csv|tsv|xlsx> [--sheet <name>] --purpose <text> --include-column <exact_name> [...]
   atlas content compare --left <path> --right <path>
@@ -159,6 +165,9 @@ Usage:
                                       --tool <name> --client-run-id <id>
   atlas work stage --file <path> --kind <candidate|proposal|intermediate> [--ttl-hours <number>]
   atlas work status [work_id] | release <work_id> [--reason <text>]
+  atlas save prepare --root <path> --candidate-file <path> --project <project_id> [--target <new_relative_path>]
+                     --channel <host|import|work> --request-key <key> --tool <tool> --client-run-id <id>
+  atlas save show <save_id> | execute <save_id> --reason <text> | undo <save_id> | redo <save_id>
   atlas bootstrap profiles
   atlas bootstrap scan --root <path> [--ignore <relative_directory> ...]
                        [--scan-mode <structure|metadata>] [--new]
@@ -183,21 +192,9 @@ Usage:
   atlas root relocate <root_id> --path <new_path> --reason <text>
   atlas root release <root_id> --reason <text>
   atlas project resolve --path <current_directory>
-  atlas agent start --path <current_directory> --request-file <task_json> [agent options]
-  atlas agent status --path <current_directory>
-  atlas agent context --path <current_directory> --request-file <json>
-  atlas agent prepare <task_id> --candidate-file <path> [--reason <text>]
-  atlas agent approve <task_id> --reason <user_approval>
-  atlas agent fulfill <task_id> --approval-token <token>
-  atlas agent resume <task_id>
-  atlas agent rollback <task_id>
-  atlas ui [--path <current_directory>] [--task <task_id>] [--port <port>] [--no-open|--browser] [--refresh-sources]
+  atlas ui [--path <current_directory>] [--port <port>] [--no-open|--browser]
   atlas ui install --python <python-3.11-or-newer>
   atlas ui doctor | remove
-  atlas ui context --path <current_directory>
-  atlas ui operation --task <task_id> [--refresh-sources]
-  atlas ui serve --task <task_id> [--port <port>] [--refresh-sources]
-  atlas ui action --task <task_id> --action <approve|reject|execute|rollback> --snapshot <operation_json> [--reason <text>] [--approval-token <token>]
   atlas catalog update --project <project_id> [agent options]
   atlas catalog search --project <project_id> [--term <text> ...]
                        [--extension <.ext> ...] [--max-candidates <1..50>]
@@ -205,32 +202,11 @@ Usage:
                        [--kind <kind>] [--filename <name>] [--project <project_id>]
                        [--target <new_path>] [--input <related_path> ...] [--intent <text>]
   atlas intake show <run_id>
-  atlas intake execute <run_id> --reason <task_authorization>
-  atlas intake rollback <run_id>
   atlas intake correct --root <path> --scope <artifact|project|global> --origin <origin>
                        --kind <kind> --role <role> --target-subdirectory <path> --reason <text>
                        [--candidate-file <path>] [--project <project_id>]
   atlas intake batch-plan --root <path> --request-file <json>
-  atlas intake batch-execute --root <path> --request-file <json> --reason <task_authorization>
   atlas intake corrections --root <path>
-  atlas task prepare --root <path> --request-file <json> [agent options]
-  atlas task discover --root <path> --project <project_id> [--role <role> ...]
-                      [--extension <.ext> ...] [--modified-after <iso>] [--max-candidates <1..50>]
-  atlas task discover-context --project <project_id> --purpose <identifier>
-                              [--term <text> ...] [--compact] [agent options]
-  atlas task prepare-context --candidate-set <candidate_set_id>
-                             --select <catalog_entry_id> [--select <catalog_entry_id> ...]
-                             --request-file <json> [--compact] [agent options]
-  atlas task context-candidates <candidate_set_id> [--compact|--entry <catalog_entry_id>]
-  atlas task source-set <source_set_id>
-  atlas task source-status <task_id> [caller metadata]
-  atlas task show <task_id> [--compact]
-  atlas task fulfill <task_id> --candidate-file <path> [--reason <task_authorization>]
-  atlas task archive-plan <task_id>
-  atlas task complete <task_id> --run <derived_or_guarded_run_id>
-  atlas task review-rule <task_id> --rule-id <rule_id>
-                         --decision <accepted|corrected> --reason <text>
-  atlas task rollback <task_id>
   atlas evolve prepare --root <path> [--target-root <path>] --operation <create_directory|move_file|migrate_project|migrate_directory|migrate_cross_root|remove_empty_directory>
                        [--source <path>] --target <path> [--project <project_id>] [--intent <text>]
   atlas evolve preview <run_id>
@@ -278,6 +254,39 @@ Agent options for run-producing commands:
   --actor <type> --agent <name> --model <name> --tool <name> --client-run-id <id>
 
 Pass --json to any command for the stable ${CAPABILITIES.protocol_version} envelope.
+`;
+}
+
+function usage() {
+  return `Atlas ${ATLAS_VERSION} — local Workspace and verified result saving
+
+Current product:
+  atlas ui [--path <current_directory>] [--port <port>] [--no-open|--browser]
+  atlas ui install --python <python-3.11-or-newer>
+  atlas ui doctor | remove
+  atlas save prepare --root <path> --candidate-file <path> --project <project_id> [--target <new_relative_path>]
+                     [--input <related_path> ...] --channel <host|import|work>
+                     --request-key <key> --tool <tool> --client-run-id <id>
+  atlas save show <save_id>
+  atlas save execute <save_id> --reason <text>
+  atlas save undo <save_id>
+  atlas save redo <save_id>
+
+Current lookup and inspection:
+  atlas project list | show <project_id> | resolve --path <current_directory>
+  atlas content inspect --file <path> [--purpose <structure|content|data|visual>]
+  atlas content compare --left <path> --right <path>
+  atlas resource relationships submit --request-file <json> --tool <name> --client-run-id <id>
+
+Health and protocol:
+  atlas version [--json]
+  atlas capabilities [--json]
+  atlas doctor [ui] [--json]
+
+Internal foundations are not fallback product workflows. Source developers may use:
+  atlas help foundation
+
+Pass --json for the stable ${CAPABILITIES.protocol_version} envelope.
 `;
 }
 
@@ -1005,152 +1014,6 @@ function handleProject(registry, args) {
   throw new Error(`Unknown project action: ${action ?? '(missing)'}`);
 }
 
-function handleAgent(registry, rules, lifecycle, args) {
-  const [action, ...rest] = args;
-  if (action === 'start') {
-    let currentPath = null;
-    let requestFile = null;
-    const callerOptions = {};
-    for (let index = 0; index < rest.length; index += 1) {
-      if (rest[index] === '--path') currentPath = rest[++index];
-      else if (rest[index] === '--request-file') requestFile = rest[++index];
-      else {
-        const parsed = parseCallerFlag(callerOptions, rest, index);
-        if (parsed != null) index = parsed;
-        else throw new Error(`Unknown agent start argument: ${rest[index]}`);
-      }
-    }
-    if (!currentPath || !requestFile) throw new Error('agent start requires --path and --request-file');
-    emit('agent.start', lifecycle.start(currentPath, {
-      request: readJsonFile(requestFile, 'Agent Task request'),
-      caller: callerFromOptions(callerOptions),
-    }), (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  if (action === 'status') {
-    let currentPath = null;
-    for (let index = 0; index < rest.length; index += 1) {
-      if (rest[index] === '--path') currentPath = rest[++index];
-      else throw new Error(`Unknown agent status argument: ${rest[index]}`);
-    }
-    if (!currentPath) throw new Error('agent status requires --path');
-    emit('agent.status', lifecycle.status(currentPath), (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  if (action === 'context') {
-    let currentPath = null;
-    let requestFile = null;
-    for (let index = 0; index < rest.length; index += 1) {
-      if (rest[index] === '--path') currentPath = rest[++index];
-      else if (rest[index] === '--request-file') requestFile = rest[++index];
-      else throw new Error(`Unknown agent context argument: ${rest[index]}`);
-    }
-    if (!currentPath || !requestFile) {
-      throw new Error('agent context requires --path and --request-file');
-    }
-    const resolution = registry.resolvePath(currentPath);
-    if (resolution.status !== 'resolved') {
-      emit('agent.context', {
-        schema: 'atlas-agent-context.v1',
-        status: 'setup_required',
-        resolution,
-        attention: null,
-        source_changes: [],
-      }, (data) => console.log(JSON.stringify(data, null, 2)));
-      return;
-    }
-    const request = readJsonFile(requestFile, 'Agent context request');
-    if (request.project_id && request.project_id !== resolution.project.id) {
-      throw new Error('Agent context request project_id does not match the resolved current Project.');
-    }
-    const effectiveRequest = { ...request, project_id: resolution.project.id };
-    const attention = rules.context({
-      root: resolution.root.current_path,
-      request: effectiveRequest,
-    });
-    const compactRule = (rule) => ({
-      kind: rule.kind,
-      value: rule.value,
-      summary: rule.summary ?? null,
-    });
-    const compactLinks = resolution.context_links.map((link) => ({
-      purpose: link.purpose,
-      source_project_id: link.source_project_id,
-      filters: link.filters,
-    }));
-    emit('agent.context', {
-      schema: 'atlas-agent-context.v1',
-      status: attention.status === 'conflict' ? 'conflict' : 'ready',
-      project: { id: resolution.project.id, name: resolution.project.name },
-      root: { id: resolution.root.id, path: resolution.root.current_path },
-      location: { path: resolution.location.relative_path },
-      context_links: compactLinks,
-      attention: {
-        status: attention.status,
-        applied_rules: attention.applied_rules.map(compactRule),
-        gaps: attention.gaps,
-        default_advice: attention.default_advice,
-        conflicts: attention.conflicts.map((conflict) => ({
-          kind: conflict.kind,
-          reason: conflict.reason,
-        })),
-        estimated_tokens: attention.attention_budget.estimated_tokens,
-      },
-      counts: {
-        eligible_rules: attention.eligible_rules.length,
-        applied_rules: attention.applied_rules.length,
-      },
-      source_changes: [],
-    }, (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  const taskId = rest[0];
-  if (!taskId || taskId.startsWith('--')) throw new Error(`agent ${action ?? '(missing)'} requires a task_id`);
-  if (action === 'prepare') {
-    let candidateFile = null;
-    let reason = null;
-    for (let index = 1; index < rest.length; index += 1) {
-      if (rest[index] === '--candidate-file') candidateFile = rest[++index];
-      else if (rest[index] === '--reason') reason = rest[++index];
-      else throw new Error(`Unknown agent prepare argument: ${rest[index]}`);
-    }
-    if (!candidateFile) throw new Error('agent prepare requires --candidate-file');
-    emit('agent.prepare', lifecycle.prepare(taskId, { candidateFile, reason }), (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  if (action === 'approve') {
-    let reason = null;
-    for (let index = 1; index < rest.length; index += 1) {
-      if (rest[index] === '--reason') reason = rest[++index];
-      else throw new Error(`Unknown agent approve argument: ${rest[index]}`);
-    }
-    if (!reason?.trim()) throw new Error('agent approve requires --reason');
-    emit('agent.approve', lifecycle.approve(taskId, { reason }), (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  if (action === 'fulfill') {
-    let token = null;
-    for (let index = 1; index < rest.length; index += 1) {
-      if (rest[index] === '--approval-token') token = rest[++index];
-      else throw new Error(`Unknown agent fulfill argument: ${rest[index]}`);
-    }
-    if (!token) throw new Error('agent fulfill requires --approval-token');
-    emit('agent.fulfill', lifecycle.fulfill(taskId, { token }), (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  if (action === 'rollback') {
-    if (rest.length !== 1) throw new Error('agent rollback accepts one task_id');
-    emit('agent.rollback', lifecycle.rollback(taskId), (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  if (action === 'resume') {
-    if (rest.length !== 1) throw new Error('agent resume accepts one task_id');
-    emit('agent.resume', lifecycle.resume(taskId), (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  throw new Error(`Unknown agent action: ${action ?? '(missing)'}`);
-}
-
 function handleRule(rules, ledger, args) {
   const [action, ...rest] = args;
   if (action === 'list') {
@@ -1490,17 +1353,10 @@ function handleIntake(intake, args) {
     return;
   }
   if (action === 'execute') {
-    const runId = rest[0];
-    if (!runId || runId.startsWith('--')) throw new Error('intake execute requires a run_id');
-    const receipt = intake.execute(runId, { reason: parseReason(rest) });
-    emit('intake.execute', receipt, (data) => console.log(`Intake created and verified ${data.target}.`));
-    return;
+    throw new Error('atlas intake execute is unsupported for user-facing saves. Use atlas save execute.');
   }
   if (action === 'rollback') {
-    if (rest.length !== 1) throw new Error('intake rollback requires one run_id');
-    const receipt = intake.rollback(rest[0]);
-    emit('intake.rollback', receipt, (data) => console.log(`Rolled back Intake ${data.run_id}.`));
-    return;
+    throw new Error('atlas intake rollback is unsupported for user-facing saves. Use atlas save undo.');
   }
   if (action === 'correct') {
     const options = {};
@@ -1543,34 +1399,7 @@ function handleIntake(intake, args) {
     return;
   }
   if (action === 'batch-execute') {
-    const options = {};
-    for (let index = 0; index < rest.length; index += 1) {
-      if (rest[index] === '--root') options.root = rest[++index];
-      else if (rest[index] === '--request-file') options.requestFile = rest[++index];
-      else if (rest[index] === '--reason') options.reason = rest[++index];
-      else {
-        const consumed = parseCallerFlag(options, rest, index);
-        if (consumed == null) throw new Error(`Unknown intake batch-execute argument: ${rest[index]}`);
-        index = consumed;
-      }
-    }
-    if (!options.root || !options.requestFile || !options.reason) {
-      throw new Error('intake batch-execute requires --root, --request-file, and --reason');
-    }
-    const request = readJsonFile(options.requestFile, 'Intake batch execution request');
-    const started = process.hrtime.bigint();
-    const result = intake.batchExecute({
-      root: options.root,
-      items: request.items,
-      reason: options.reason,
-      caller: callerFromOptions(options),
-    });
-    const elapsedMs = Number(process.hrtime.bigint() - started) / 1_000_000;
-    emit('intake.batch-execute', {
-      ...result,
-      elapsed_ms: Number(elapsedMs.toFixed(3)),
-    }, (data) => console.log(`Intake batch ${data.status}: ${data.summary.executed ?? 0}/${data.summary.total}.`));
-    return;
+    throw new Error('atlas intake batch-execute is unsupported for user-facing saves. Use atlas save prepare and execute per item.');
   }
   if (action === 'corrections') {
     if (rest.length !== 2 || rest[0] !== '--root') throw new Error('intake corrections requires --root');
@@ -1579,6 +1408,57 @@ function handleIntake(intake, args) {
     return;
   }
   throw new Error(`Unknown intake action: ${action ?? '(missing)'}`);
+}
+
+function handleSave(save, args) {
+  const [action, ...rest] = args;
+  if (action === 'prepare') {
+    const options = { inputs: [] };
+    for (let index = 0; index < rest.length; index += 1) {
+      const token = rest[index];
+      if (token === '--root') options.root = rest[++index];
+      else if (token === '--candidate-file') options.candidateFile = rest[++index];
+      else if (token === '--origin') options.origin = rest[++index];
+      else if (token === '--kind') options.kind = rest[++index];
+      else if (token === '--project') options.projectId = rest[++index];
+      else if (token === '--target') options.target = rest[++index];
+      else if (token === '--input') options.inputs.push(rest[++index]);
+      else if (token === '--relation') options.relationType = rest[++index];
+      else if (token === '--intent') options.intent = rest[++index];
+      else if (token === '--channel') options.channel = rest[++index];
+      else if (token === '--request-key') options.requestKey = rest[++index];
+      else {
+        const consumed = parseCallerFlag(options, rest, index);
+        if (consumed == null) throw new Error(`Unknown save prepare argument: ${token}`);
+        index = consumed;
+      }
+    }
+    options.caller = callerFromOptions(options);
+    emit('save.prepare', save.prepare(options), (data) => console.log(`Prepared ${data.save_id}.`));
+    return;
+  }
+  if (action === 'show') {
+    if (rest.length !== 1) throw new Error('save show requires one save_id');
+    emit('save.show', save.show(rest[0]), (data) => console.log(`${data.save_id}: ${data.status}.`));
+    return;
+  }
+  if (action === 'execute') {
+    const saveId = rest[0];
+    if (!saveId || saveId.startsWith('--')) throw new Error('save execute requires one save_id');
+    emit('save.execute', save.execute(saveId, { reason: parseReason(rest) }), (data) => console.log(`Saved ${data.save_id}.`));
+    return;
+  }
+  if (action === 'undo') {
+    if (rest.length !== 1) throw new Error('save undo requires one save_id');
+    emit('save.undo', save.undo(rest[0]), (data) => console.log(`Undid ${data.save_id}.`));
+    return;
+  }
+  if (action === 'redo') {
+    if (rest.length !== 1) throw new Error('save redo requires one save_id');
+    emit('save.redo', save.redo(rest[0]), (data) => console.log(`Redid ${data.save_id}.`));
+    return;
+  }
+  throw new Error(`Unknown save action: ${action ?? '(missing)'}`);
 }
 
 function handleEvolution(evolution, args) {
@@ -1776,112 +1656,6 @@ function handleStorage(storage, args) {
   throw new Error(`Unknown storage action: ${action ?? '(missing)'}`);
 }
 
-function compactContextCandidateSet(candidateSet) {
-  return {
-    ...candidateSet,
-    compact: true,
-    candidates: candidateSet.candidates.map((candidate) => ({
-      entry_id: candidate.entry_id,
-      relative_path: candidate.relative_path,
-      byte_size: candidate.byte_size,
-      modified_at: candidate.modified_at,
-      title: candidate.title,
-      score: candidate.score,
-    })),
-  };
-}
-
-function compactAttention(attention) {
-  if (!attention) return null;
-  return {
-    status: attention.status,
-    context_hash: attention.context_hash,
-    eligible_rules: attention.eligible_rules,
-    applied_rules: attention.applied_rules,
-    gaps: attention.gaps,
-    default_advice: attention.default_advice,
-    conflicts: attention.conflicts,
-    attention_budget: attention.attention_budget,
-  };
-}
-
-function compactPreparedTask(receipt) {
-  return {
-    compact: true,
-    task_id: receipt.task_id,
-    schema: receipt.schema,
-    status: receipt.status,
-    candidate_set_id: receipt.candidate_set_id,
-    source_set_id: receipt.source_set_id,
-    read: {
-      scope: receipt.read.scope,
-      selected: receipt.read.selected.map((item) => ({
-        path: item.path,
-        content_hash: item.content_hash,
-        byte_size: item.byte_size,
-        source_root_id: item.source_root_id,
-        source_project_id: item.source_project_id,
-        source_root_path: item.source_root_path,
-        source_relative_path: item.source_relative_path,
-        catalog_entry_id: item.catalog_entry_id,
-      })),
-      excluded: receipt.read.excluded,
-      selected_bytes: receipt.read.selected_bytes,
-      selected_text_bytes: receipt.read.selected_text_bytes,
-      selected_binary_bytes: receipt.read.selected_binary_bytes,
-      estimated_tokens: receipt.read.estimated_tokens,
-      requires_local_extraction: receipt.read.requires_local_extraction,
-    },
-    attention: compactAttention(receipt.attention),
-    write: receipt.write,
-    boundaries: {
-      root: receipt.boundaries.root,
-      write_root_id: receipt.boundaries.write_root_id,
-      read_root_ids: receipt.boundaries.read_root_ids,
-      allowed_read_paths: receipt.boundaries.allowed_read_paths,
-      candidate_area: receipt.boundaries.candidate_area,
-      formal_target: receipt.boundaries.formal_target,
-      allowed_write_paths: receipt.boundaries.allowed_write_paths,
-    },
-    questions: receipt.questions,
-  };
-}
-
-function compactTaskDetail(detail) {
-  return {
-    compact: true,
-    task_id: detail.run.id,
-    run: {
-      id: detail.run.id,
-      mode: detail.run.mode,
-      status: detail.run.status,
-      root_path: detail.run.root_path,
-      intent: detail.run.intent,
-      started_at: detail.run.started_at,
-      closed_at: detail.run.closed_at,
-      rolled_back_at: detail.run.rolled_back_at,
-    },
-    contract_id: detail.contract_id,
-    project_id: detail.project_id,
-    candidate_set_id: detail.candidate_set_id,
-    source_set_id: detail.source_set_id,
-    inputs: detail.inputs.map((item) => ({
-      path: item.path,
-      content_hash: item.content_hash,
-      byte_size: item.byte_size,
-      selected: item.selected,
-      source_root_id: item.source_root_id,
-      source_project_id: item.source_project_id,
-      catalog_entry_id: item.catalog_entry_id,
-    })),
-    write: detail.contract?.write ?? null,
-    completion_receipt: detail.completion_receipt,
-    rollback_receipt: detail.rollback_receipt,
-    output: detail.output,
-    latest_policy_decision: detail.policy_decisions.at(-1) ?? null,
-  };
-}
-
 function compactRunDetail(detail) {
   return {
     compact: true,
@@ -1910,244 +1684,6 @@ function compactRunDetail(detail) {
       closed_at: detail.change_set.closed_at,
     } : null,
   };
-}
-
-function selectContextCandidate(candidateSet, entryId) {
-  const candidate = candidateSet.candidates.find((item) => item.entry_id === entryId);
-  if (!candidate) {
-    throw new Error(`Candidate Set does not contain entry: ${entryId}`);
-  }
-  return {
-    ...candidateSet,
-    candidates: [candidate],
-  };
-}
-
-function handleTask(task, args) {
-  const [action, ...rest] = args;
-  if (action === 'discover-context') {
-    const options = { terms: [], compact: false };
-    for (let index = 0; index < rest.length; index += 1) {
-      const token = rest[index];
-      if (token === '--project') options.projectId = rest[++index];
-      else if (token === '--purpose') options.purpose = rest[++index];
-      else if (token === '--term') options.terms.push(rest[++index]);
-      else if (token === '--compact') options.compact = true;
-      else {
-        const consumed = parseCallerFlag(options, rest, index);
-        if (consumed == null) throw new Error(`Unknown task discover-context argument: ${token}`);
-        index = consumed;
-      }
-    }
-    if (!options.projectId || !options.purpose) {
-      throw new Error('task discover-context requires --project and --purpose');
-    }
-    const result = task.discoverContext({
-      projectId: options.projectId,
-      purpose: options.purpose,
-      terms: options.terms,
-      caller: callerFromOptions(options),
-    });
-    emit(
-      'task.discover-context',
-      options.compact ? compactContextCandidateSet(result) : result,
-      (data) => console.log(JSON.stringify(data, null, 2)),
-    );
-    return;
-  }
-  if (action === 'prepare-context') {
-    const options = { selectedEntryIds: [], compact: false };
-    for (let index = 0; index < rest.length; index += 1) {
-      const token = rest[index];
-      if (token === '--candidate-set') options.candidateSetId = rest[++index];
-      else if (token === '--select') options.selectedEntryIds.push(rest[++index]);
-      else if (token === '--request-file') options.requestFile = rest[++index];
-      else if (token === '--compact') options.compact = true;
-      else {
-        const consumed = parseCallerFlag(options, rest, index);
-        if (consumed == null) throw new Error(`Unknown task prepare-context argument: ${token}`);
-        index = consumed;
-      }
-    }
-    if (!options.candidateSetId || !options.selectedEntryIds.length || !options.requestFile) {
-      throw new Error('task prepare-context requires --candidate-set, --select, and --request-file');
-    }
-    const receipt = task.prepareContext({
-      candidateSetId: options.candidateSetId,
-      selectedEntryIds: options.selectedEntryIds,
-      request: readJsonFile(options.requestFile, 'cross-Project task request'),
-      caller: callerFromOptions(options),
-    });
-    emit(
-      'task.prepare-context',
-      options.compact ? compactPreparedTask(receipt) : receipt,
-      (data) => console.log(JSON.stringify(data, null, 2)),
-    );
-    return;
-  }
-  if (action === 'context-candidates') {
-    const candidateSetId = rest[0];
-    if (!candidateSetId || candidateSetId.startsWith('--')) {
-      throw new Error('task context-candidates requires one candidate_set_id');
-    }
-    let compact = false;
-    let entryId = null;
-    for (let index = 1; index < rest.length; index += 1) {
-      if (rest[index] === '--compact') compact = true;
-      else if (rest[index] === '--entry') entryId = rest[++index];
-      else throw new Error(`Unknown task context-candidates argument: ${rest[index]}`);
-    }
-    if (compact && entryId) {
-      throw new Error('task context-candidates accepts either --compact or --entry, not both');
-    }
-    const candidateSet = task.showContextCandidates(candidateSetId);
-    const result = entryId
-      ? selectContextCandidate(candidateSet, entryId)
-      : compact
-        ? compactContextCandidateSet(candidateSet)
-        : candidateSet;
-    emit(
-      'task.context-candidates',
-      result,
-      (data) => console.log(JSON.stringify(data, null, 2)),
-    );
-    return;
-  }
-  if (action === 'source-set') {
-    if (rest.length !== 1) throw new Error('task source-set requires one source_set_id');
-    emit(
-      'task.source-set',
-      task.showSourceSet(rest[0]),
-      (data) => console.log(JSON.stringify(data, null, 2)),
-    );
-    return;
-  }
-  if (action === 'source-status') {
-    const taskId = rest[0];
-    if (!taskId || taskId.startsWith('--')) throw new Error('task source-status requires one task_id');
-    const options = {};
-    for (let index = 1; index < rest.length; index += 1) {
-      const consumed = parseCallerFlag(options, rest, index);
-      if (consumed == null) throw new Error(`Unknown task source-status argument: ${rest[index]}`);
-      index = consumed;
-    }
-    emit(
-      'task.source-status',
-      task.sourceStatus(taskId, { caller: callerFromOptions(options) }),
-      (data) => console.log(`${data.status}: ${data.attention}`),
-    );
-    return;
-  }
-  if (action === 'discover') {
-    const options = { roles: [], extensions: [] };
-    for (let index = 0; index < rest.length; index += 1) {
-      const token = rest[index];
-      if (token === '--root') options.root = rest[++index];
-      else if (token === '--project') options.projectId = rest[++index];
-      else if (token === '--role') options.roles.push(rest[++index]);
-      else if (token === '--extension') options.extensions.push(rest[++index]);
-      else if (token === '--modified-after') options.modifiedAfter = rest[++index];
-      else if (token === '--max-candidates') options.maxCandidates = Number(rest[++index]);
-      else throw new Error(`Unknown task discover argument: ${token}`);
-    }
-    if (!options.root || !options.projectId) throw new Error('task discover requires --root and --project');
-    const result = task.discover(options);
-    emit('task.discover', result, (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  if (action === 'prepare') {
-    const options = {};
-    for (let index = 0; index < rest.length; index += 1) {
-      const token = rest[index];
-      if (token === '--root') options.root = rest[++index];
-      else if (token === '--request-file') options.requestFile = rest[++index];
-      else {
-        const consumed = parseCallerFlag(options, rest, index);
-        if (consumed == null) throw new Error(`Unknown task prepare argument: ${token}`);
-        index = consumed;
-      }
-    }
-    if (!options.root || !options.requestFile) throw new Error('task prepare requires --root and --request-file');
-    const request = readJsonFile(options.requestFile, 'task request');
-    const receipt = task.prepare({ root: options.root, request, caller: callerFromOptions(options) });
-    emit('task.prepare', receipt, (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  if (action === 'show') {
-    const taskId = rest[0];
-    if (!taskId || taskId.startsWith('--')) throw new Error('task show requires one task_id');
-    const compact = rest.slice(1).includes('--compact');
-    if (rest.slice(1).some((item) => item !== '--compact')) {
-      throw new Error('task show accepts only --compact after task_id');
-    }
-    const detail = task.show(taskId);
-    emit(
-      'task.show',
-      compact ? compactTaskDetail(detail) : detail,
-      (data) => console.log(JSON.stringify(data, null, 2)),
-    );
-    return;
-  }
-  if (action === 'fulfill') {
-    const taskId = rest[0];
-    if (!taskId || taskId.startsWith('--')) throw new Error('task fulfill requires a task_id');
-    let candidateFile = null;
-    let reason = null;
-    for (let index = 1; index < rest.length; index += 1) {
-      if (rest[index] === '--candidate-file') candidateFile = rest[++index];
-      else if (rest[index] === '--reason') reason = rest[++index];
-      else throw new Error(`Unknown task fulfill argument: ${rest[index]}`);
-    }
-    if (!candidateFile) throw new Error('task fulfill requires --candidate-file');
-    const receipt = task.fulfill(taskId, { candidateFile, reason });
-    emit('task.fulfill', receipt, (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  if (action === 'complete') {
-    const taskId = rest[0];
-    if (!taskId || taskId.startsWith('--')) throw new Error('task complete requires a task_id');
-    let runId = null;
-    for (let index = 1; index < rest.length; index += 1) {
-      if (rest[index] === '--run') runId = rest[++index];
-      else throw new Error(`Unknown task complete argument: ${rest[index]}`);
-    }
-    if (!runId) throw new Error('task complete requires --run');
-    emit('task.complete', task.complete(taskId, { runId }), (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  if (action === 'archive-plan') {
-    if (rest.length !== 1) throw new Error('task archive-plan requires one task_id');
-    emit('task.archive-plan', task.archivePlan(rest[0]), (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  if (action === 'review-rule') {
-    const taskId = rest[0];
-    if (!taskId || taskId.startsWith('--')) throw new Error('task review-rule requires a task_id');
-    let ruleId = null;
-    let decision = null;
-    let reason = null;
-    for (let index = 1; index < rest.length; index += 1) {
-      if (rest[index] === '--rule-id') ruleId = rest[++index];
-      else if (rest[index] === '--decision') decision = rest[++index];
-      else if (rest[index] === '--reason') reason = rest[++index];
-      else throw new Error(`Unknown task review-rule argument: ${rest[index]}`);
-    }
-    if (!ruleId || !decision || !reason) {
-      throw new Error('task review-rule requires --rule-id, --decision, and --reason');
-    }
-    emit(
-      'task.review-rule',
-      task.reviewRule(taskId, { ruleId, decision, reason }),
-      (data) => console.log(JSON.stringify(data, null, 2)),
-    );
-    return;
-  }
-  if (action === 'rollback') {
-    if (rest.length !== 1) throw new Error('task rollback requires one task_id');
-    emit('task.rollback', task.rollback(rest[0]), (data) => console.log(JSON.stringify(data, null, 2)));
-    return;
-  }
-  throw new Error(`Unknown task action: ${action ?? '(missing)'}`);
 }
 
 function handleLedgerMaintenance(args) {
@@ -2180,57 +1716,6 @@ function handleLedgerMaintenance(args) {
     return;
   }
   throw new Error(`Unknown ledger action: ${action ?? '(missing)'}`);
-}
-
-function parseAnalytics(args) {
-  const [action, ...rest] = args;
-  if (action === 'export') {
-    let exportName = null;
-    for (let index = 0; index < rest.length; index += 1) {
-      if (rest[index] === '--name') exportName = rest[++index];
-      else throw new Error(`Unknown analytics export argument: ${rest[index]}`);
-    }
-    if (rest.includes('--name') && !exportName) {
-      throw new Error('analytics export --name requires a value');
-    }
-    return { action, exportName };
-  }
-  if (action === 'evaluate') {
-    let exportName = null;
-    let evaluationName = null;
-    for (let index = 0; index < rest.length; index += 1) {
-      if (rest[index] === '--export') exportName = rest[++index];
-      else if (rest[index] === '--name') evaluationName = rest[++index];
-      else throw new Error(`Unknown analytics evaluate argument: ${rest[index]}`);
-    }
-    if (!exportName) throw new Error('analytics evaluate requires --export <export_name>');
-    if (rest.includes('--name') && !evaluationName) {
-      throw new Error('analytics evaluate --name requires a value');
-    }
-    return { action, exportName, evaluationName };
-  }
-  if (action === 'install') {
-    let sourcePython = null;
-    for (let index = 0; index < rest.length; index += 1) {
-      if (rest[index] === '--python') sourcePython = rest[++index];
-      else throw new Error(`Unknown analytics install argument: ${rest[index]}`);
-    }
-    if (rest.includes('--python') && !sourcePython) {
-      throw new Error('analytics install --python requires a value');
-    }
-    return { action, sourcePython };
-  }
-  if (action === 'show') {
-    if (rest.length !== 1 || rest[0].startsWith('--')) {
-      throw new Error('analytics show requires one evaluation_id');
-    }
-    return { action, evaluationId: rest[0] };
-  }
-  if (action === 'remove') {
-    if (rest.length) throw new Error('analytics remove does not accept arguments');
-    return { action };
-  }
-  throw new Error(`Unknown analytics action: ${action ?? '(missing)'}`);
 }
 
 function parseContent(args) {
@@ -2415,16 +1900,13 @@ function compactContentInspection(result) {
 }
 
 function optionalPythonCapability() {
-  const detail = doctorAnalyticsComponent({
-    installationRoot,
-    runtimeRoot: projectRoot,
-  });
+  const detail = doctorDesktopUiComponent({ installationRoot, runtimeRoot: projectRoot });
   return {
     available: detail.status === 'ready',
     ...detail,
     configured_path: detail.python_path ?? null,
     required_for_file_governance: false,
-    input: 'versioned_export_or_one_exact_authorized_file',
+    input: 'one_exact_authorized_file',
   };
 }
 
@@ -2442,6 +1924,15 @@ async function main() {
     emit('help', { usage: usage() }, ({ usage: helpText }) => console.log(helpText));
     return;
   }
+  if (command === 'help' && args.length === 1 && args[0] === 'foundation') {
+    if (isInstalledProductRuntime()) {
+      const error = new Error('Foundation command help is available only from the Atlas source workspace.');
+      error.code = 'ATLAS_INVALID_ARGUMENT';
+      throw error;
+    }
+    emit('help.foundation', { usage: foundationUsage() }, ({ usage: helpText }) => console.log(helpText));
+    return;
+  }
   if (command === 'version') {
     if (args.length) throw new Error('version does not accept arguments');
     emit('version', { version: ATLAS_VERSION }, ({ version }) => console.log(`Atlas ${version}`));
@@ -2449,8 +1940,13 @@ async function main() {
   }
   if (command === 'capabilities') {
     if (args.length) throw new Error('capabilities does not accept arguments');
-    emit('capabilities', CAPABILITIES, (data) => console.log(JSON.stringify(data, null, 2)));
+    emit('capabilities', exposedCapabilities(), (data) => console.log(JSON.stringify(data, null, 2)));
     return;
+  }
+  if (isInstalledProductRuntime() && new Set(['guarded', 'derive', 'intake']).has(command)) {
+    const error = new Error(`The installed Atlas product does not expose ${command}. Use the current Save workflow.`);
+    error.code = 'ATLAS_INVALID_ARGUMENT';
+    throw error;
   }
   if (command === 'inspect') {
     const detail = new WorkspaceInspector().inspect(parseInspect(args));
@@ -2462,12 +1958,31 @@ async function main() {
   }
   stateDir = normalizeStateDir(projectRoot, stateDirInput, installationRoot);
 
+  if (command === 'resource') {
+    const [area, action, ...rest] = args;
+    if (area !== 'relationships' || action !== 'submit') throw new Error('Use atlas resource relationships submit.');
+    let requestFile = null; let tool = null; let clientRunId = null;
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--request-file') requestFile = rest[++index];
+      else if (rest[index] === '--tool') tool = rest[++index];
+      else if (rest[index] === '--client-run-id') clientRunId = rest[++index];
+      else throw new Error(`Unknown resource relationships argument: ${rest[index]}`);
+    }
+    if (!requestFile) throw new Error('resource relationships submit requires --request-file <json>.');
+    const request = JSON.parse(fs.readFileSync(requestFile, 'utf8'));
+    const control = createResourceControl({ stateDir });
+    try { emit('resource.relationships.submit', { relationships: control.submitRelationships({ candidates: request.candidates, caller: { tool, client_run_id: clientRunId } }) }, (data) => console.log(JSON.stringify(data, null, 2))); }
+    finally { control.dispose(); }
+    return;
+  }
+
   if (command === 'content') {
     const options = parseContent(args);
     if (options.action === 'inspect') {
       const project = options.callerProvided
         ? projectForHostInspection(options.projectId, options.filePath)
         : null;
+      const resourceControl = options.callerProvided ? createResourceControl({ stateDir }) : null;
       const activity = options.callerProvided
         ? beginCurrentActivity({
           stateDir,
@@ -2475,6 +1990,7 @@ async function main() {
           purpose: options.purpose,
           caller: options.caller,
           project,
+          resourceId: resourceControl?.identify({ filePath: options.filePath, project })?.resource_id ?? null,
         })
         : null;
       try {
@@ -2499,10 +2015,12 @@ async function main() {
             project,
             caller: options.caller,
             channel: 'host',
+            resourceControl,
           });
           coordination = {
             saving_point_recorded: true,
             work_id: work.work_id,
+            resource_id: work.resource_id,
             initiated_by: work.initiated_by,
             project: work.project,
             activity_visible_in_desktop: true,
@@ -2510,6 +2028,7 @@ async function main() {
           };
         }
         if (activity) finishCurrentActivity(stateDir, activity.activity_id);
+        resourceControl?.dispose();
         const fullResult = { ...inspection, coordination };
         const result = options.compact ? compactContentInspection(fullResult) : fullResult;
         emit('content.inspect', result, (detail) => {
@@ -2530,6 +2049,7 @@ async function main() {
             // Preserve the actual inspection error when activity state also cannot be updated.
           }
         }
+        resourceControl?.dispose();
         throw error;
       }
     } else if (options.action === 'prepare-data') {
@@ -2591,23 +2111,15 @@ async function main() {
   const derived = new Derived({ stateDir });
   const evolution = new Evolution({ stateDir });
   const intake = new Intake({ stateDir });
+  const save = new SaveService({ stateDir, intake });
   const portfolio = new Portfolio({ stateDir });
   const registry = new Registry({ stateDir });
   const catalog = new Catalog({ stateDir, registry });
   const storage = new RuntimeStorage({ stateDir, ledger: tracker.ledger });
   const capture = new BrowserCapture({ stateDir, storage });
-  const task = new TaskContract({ stateDir });
   const rules = new PreferenceRules({ stateDir, ledger: tracker.ledger });
-  const agentLifecycle = new AgentLifecycle({ task, guarded, registry });
   try {
     if (command === 'doctor') {
-      if (args.length === 1 && args[0] === 'analytics') {
-        const data = optionalPythonCapability();
-        emit('doctor.analytics', data, (detail) => {
-          console.log(`Atlas analytics doctor: ${detail.status}; ${detail.mode}.`);
-        });
-        return;
-      }
       if (args.length === 1 && args[0] === 'ui') {
         const data = doctorDesktopUiComponent({ installationRoot, runtimeRoot: projectRoot });
         emit('doctor.ui', data, (detail) => {
@@ -2615,7 +2127,7 @@ async function main() {
         });
         return;
       }
-      if (args.length) throw new Error('doctor accepts only the optional analytics or ui target');
+      if (args.length) throw new Error('doctor accepts only the optional ui target');
       const ledger = tracker.ledger.diagnostics();
       const data = {
         status: ledger.integrity === 'ok' && ledger.schema_version === ledger.supported_schema_version
@@ -2630,8 +2142,7 @@ async function main() {
         ledger,
         capabilities: {
           file_governance: true,
-          analytics_export: true,
-          analytics_python: optionalPythonCapability(),
+          content_python: optionalPythonCapability(),
           desktop_ui: doctorDesktopUiComponent({ installationRoot, runtimeRoot: projectRoot }),
         },
       };
@@ -2642,48 +2153,6 @@ async function main() {
         console.log(`State: ${detail.state_dir}`);
       });
       if (data.status !== 'ok' || !data.node.supported) process.exitCode = 1;
-    } else if (command === 'analytics') {
-      const options = parseAnalytics(args);
-      if (options.action === 'export') {
-        const result = withStateLock(stateDir, () => exportAnalytics({
-          ledger: tracker.ledger,
-          stateDir,
-          exportName: options.exportName,
-        }));
-        emit('analytics.export', result, (detail) => {
-          console.log(`Exported ${detail.record_count} analytics record(s) to ${detail.output_dir}.`);
-        });
-      } else if (options.action === 'install') {
-        const result = withStateLock(stateDir, () => installAnalyticsComponent({
-          installationRoot,
-          runtimeRoot: projectRoot,
-          sourcePython: options.sourcePython ?? process.env.ATLAS_PYTHON,
-        }));
-        emit('analytics.install', result, (detail) => {
-          console.log(`Atlas analytics component: ${detail.status}; Python ${detail.python_version}.`);
-        });
-      } else if (options.action === 'evaluate') {
-        const result = withStateLock(stateDir, () => evaluateAnalytics({
-          stateDir,
-          projectRoot,
-          installationRoot,
-          exportName: options.exportName,
-          evaluationName: options.evaluationName,
-        }));
-        emit('analytics.evaluate', result, (detail) => {
-          console.log(`Evaluated ${detail.source_export}: ${detail.status}; ${detail.evaluation_id}.`);
-        });
-      } else if (options.action === 'show') {
-        const result = showAnalyticsEvaluation({ stateDir, evaluationId: options.evaluationId });
-        emit('analytics.show', result, (detail) => {
-          console.log(JSON.stringify(detail, null, 2));
-        });
-      } else if (options.action === 'remove') {
-        const result = withStateLock(stateDir, () => removeAnalyticsComponent({ installationRoot }));
-        emit('analytics.remove', result, (detail) => {
-          console.log(`Atlas analytics component: ${detail.status}; state preserved.`);
-        });
-      }
     } else if (command === 'bootstrap') {
       handleBootstrap(bootstrap, storage, args);
     } else if (command === 'portfolio') {
@@ -2694,10 +2163,10 @@ async function main() {
       handleDerived(derived, args);
     } else if (command === 'intake') {
       handleIntake(intake, args);
+    } else if (command === 'save') {
+      handleSave(save, args);
     } else if (command === 'evolve') {
       handleEvolution(evolution, args);
-    } else if (command === 'task') {
-      handleTask(task, args);
     } else if (command === 'work') {
       handleWork(storage, args);
     } else if (command === 'capture') {
@@ -2710,32 +2179,25 @@ async function main() {
       handleCatalog(catalog, args);
     } else if (command === 'project') {
       handleProject(registry, args);
-    } else if (command === 'agent') {
-      handleAgent(registry, rules, agentLifecycle, args);
     } else if (command === 'ui') {
       if (!args[0] || args[0].startsWith('--')) {
         const options = {
-          currentPath: null, taskId: null, contextPackId: null, port: 0, mode: 'desktop', refreshSources: false,
+          currentPath: null, port: 0, mode: 'desktop',
         };
         for (let index = 0; index < args.length; index += 1) {
           if (args[index] === '--path') options.currentPath = args[++index];
-          else if (args[index] === '--task') options.taskId = args[++index];
-          else if (args[index] === '--context') options.contextPackId = args[++index];
           else if (args[index] === '--port') options.port = Number(args[++index]);
           else if (args[index] === '--no-open') options.mode = 'host_only';
           else if (args[index] === '--browser') options.mode = 'browser_debug';
-          else if (args[index] === '--refresh-sources') options.refreshSources = true;
           else throw new Error(`Unknown ui argument: ${args[index]}`);
         }
         if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535) {
-          throw new Error('ui accepts an optional --path, --task, --context, --port, --no-open, --browser, and --refresh-sources.');
+          throw new Error('ui accepts an optional --path, --port, --no-open, or --browser.');
         }
         const diagnostics = tracker.ledger.diagnostics();
         const session = await startAtlasUiServer({
           stateDir,
           currentPath: options.currentPath,
-          initialTaskId: options.taskId,
-          initialContextPackId: options.contextPackId,
           registry,
           rules,
           runtime: {
@@ -2751,15 +2213,10 @@ async function main() {
             },
             python: optionalPythonCapability(),
           },
-          task,
-          guarded,
-          derived,
           intake,
-          lifecycle: agentLifecycle,
           projectRoot,
           installationRoot,
           port: options.port,
-          refreshSources: options.refreshSources,
           desktopPickerEnabled: options.mode === 'desktop',
         });
         let surface = { status: 'not_requested', mode: options.mode };
@@ -2839,99 +2296,8 @@ async function main() {
         emit('ui.remove', result, (detail) => {
           console.log(`Atlas Desktop UI: ${detail.status}; Node governance preserved.`);
         });
-      } else if (args[0] === 'context') {
-        if (args[1] !== '--path' || !args[2] || args.length !== 3) {
-          throw new Error('ui context requires --path <current_directory>');
-        }
-        const result = createContextView({
-          stateDir,
-          currentPath: args[2],
-          registry,
-          rules,
-          runtime: (() => {
-            const diagnostics = tracker.ledger.diagnostics();
-            return {
-              atlas_version: ATLAS_VERSION,
-              node_version: process.versions.node,
-              ledger: {
-                integrity: diagnostics.integrity,
-                schema_version: diagnostics.schema_version,
-                supported_schema_version: diagnostics.supported_schema_version,
-              },
-              python: optionalPythonCapability(),
-            };
-          })(),
-        });
-        emit('ui.context', result, (detail) => console.log(`Atlas Workspace snapshot: ${detail.view_path}`));
-      } else if (args[0] === 'operation') {
-        let taskId = null;
-        let refreshSources = false;
-        for (let index = 1; index < args.length; index += 1) {
-          if (args[index] === '--task') taskId = args[++index];
-          else if (args[index] === '--refresh-sources') refreshSources = true;
-          else throw new Error(`Unknown ui operation argument: ${args[index]}`);
-        }
-        if (!taskId) {
-          throw new Error('ui operation requires --task <task_id>');
-        }
-        const result = createOperationSnapshot({
-          stateDir, taskId, task, guarded, derived, refreshSources,
-        });
-        emit('ui.operation', result, (detail) => console.log(`Atlas Task snapshot: ${detail.operation_path}`));
-      } else if (args[0] === 'action') {
-        const options = { taskId: null, action: null, snapshotPath: null, reason: null, approvalToken: null };
-        for (let index = 1; index < args.length; index += 1) {
-          if (args[index] === '--task') options.taskId = args[++index];
-          else if (args[index] === '--action') options.action = args[++index];
-          else if (args[index] === '--snapshot') options.snapshotPath = args[++index];
-          else if (args[index] === '--reason') options.reason = args[++index];
-          else if (args[index] === '--approval-token') options.approvalToken = args[++index];
-          else throw new Error(`Unknown ui action argument: ${args[index]}`);
-        }
-        if (!options.taskId || !options.action || !options.snapshotPath) {
-          throw new Error('ui action requires --task, --action, and --snapshot');
-        }
-        const result = applyUiAction({
-          stateDir,
-          ...options,
-          task,
-          guarded,
-          derived,
-          lifecycle: agentLifecycle,
-        });
-        emit('ui.action', result, (detail) => console.log(`Atlas UI action ${detail.action}: ${detail.status}.`));
-      } else if (args[0] === 'serve') {
-        let taskId = null;
-        let port = 0;
-        let refreshSources = false;
-        for (let index = 1; index < args.length; index += 1) {
-          if (args[index] === '--task') taskId = args[++index];
-          else if (args[index] === '--port') port = Number(args[++index]);
-          else if (args[index] === '--refresh-sources') refreshSources = true;
-          else throw new Error(`Unknown ui serve argument: ${args[index]}`);
-        }
-        if (!taskId || !Number.isInteger(port) || port < 0 || port > 65535) {
-          throw new Error('ui serve requires --task <task_id> and an optional valid --port <port>.');
-        }
-        const session = await startTaskReviewServer({
-          stateDir, taskId, task, guarded, derived, lifecycle: agentLifecycle, port,
-          refreshSources,
-        });
-        emit('ui.serve', {
-          schema: session.schema,
-          task_id: session.task_id,
-          url: session.url,
-          network_scope: session.network_scope,
-          source_freshness: session.source_freshness,
-          source_changes: [],
-        }, (detail) => console.log(`Atlas Task Review: ${detail.url}\nPress Ctrl+C to stop.`));
-        await new Promise((resolve, reject) => {
-          const stop = () => session.close().then(resolve, reject);
-          process.once('SIGINT', stop);
-          process.once('SIGTERM', stop);
-        });
       } else {
-        throw new Error('ui requires install, doctor, remove, context, operation, serve, or action');
+        throw new Error('ui requires install, doctor, or remove');
       }
     } else if (command === 'rule') {
       handleRule(rules, tracker.ledger, args);
@@ -2970,7 +2336,9 @@ async function main() {
       const result = tracker.gc(parseGc(args));
       emit('gc', result, () => console.log(`GC: deleted ${result.deleted_blobs} blob(s), ${result.deleted_bytes} byte(s); kept ${result.skipped_referenced} referenced and ${result.skipped_recent} recent.`));
     } else {
-      throw new Error(`Unknown command: ${command}\n\n${usage()}`);
+      const error = new Error(`Unknown command: ${command}\n\n${usage()}`);
+      error.code = 'ATLAS_INVALID_ARGUMENT';
+      throw error;
     }
   } finally {
     tracker.dispose();
@@ -2982,7 +2350,6 @@ async function main() {
     portfolio.dispose();
     registry.dispose();
     catalog.dispose();
-    task.dispose();
     rules.dispose();
     capture.dispose();
   }

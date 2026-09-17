@@ -28,6 +28,7 @@ function validRecord(value) {
   const stale = value.status === 'running' && Date.now() - Date.parse(started) > 30 * 60 * 1000;
   return {
     activity_id: value.activity_id,
+    resource_id: typeof value.resource_id === 'string' ? value.resource_id : null,
     file_path: path.resolve(value.file_path),
     purpose: typeof value.purpose === 'string' ? value.purpose : 'content',
     status: stale ? 'interrupted' : value.status,
@@ -72,11 +73,12 @@ function writeItems(stateDir, items) {
   }
 }
 
-export function beginCurrentActivity({ stateDir, filePath, purpose = 'content', caller = {}, project = null, channel = 'host' }) {
+export function beginCurrentActivity({ stateDir, filePath, purpose = 'content', caller = {}, project = null, channel = 'host', resourceId = null }) {
   const now = new Date().toISOString();
   const items = writableItems(stateDir);
   const record = {
     activity_id: `ACT-${crypto.randomUUID()}`,
+    resource_id: typeof resourceId === 'string' ? resourceId : null,
     file_path: path.resolve(filePath),
     purpose,
     status: 'running',

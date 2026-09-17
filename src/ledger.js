@@ -12,12 +12,15 @@ import { PolicyRepository } from './storage/repositories/policy-repository.js';
 import { DerivedRepository } from './storage/repositories/derived-repository.js';
 import { GuardedRepository } from './storage/repositories/guarded-repository.js';
 import { EvolutionRepository } from './storage/repositories/evolution-repository.js';
+import { ResourceRepository } from './storage/repositories/resource-repository.js';
 import {
-  TaskRepository,
-  TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID,
-} from './storage/repositories/task-repository.js';
-
-export { TASK_SCOPED_ENVIRONMENT_RULE_VERSION_ID } from './storage/repositories/task-repository.js';
+  LEGACY_TASK_REMOVAL_SCHEMA_VERSION,
+  removeLegacyTaskStorage,
+} from './storage/migrations/v22-remove-legacy-task-storage.js';
+import {
+  LEGACY_CONTEXT_SELECTION_REMOVAL_SCHEMA_VERSION,
+  removeLegacyContextSelectionStorage,
+} from './storage/migrations/v23-retire-legacy-context-selection.js';
 
 const RULE_VERSION_ID = 'RULE-TRACKED-DIRECT-1';
 const BOOTSTRAP_RULE_VERSION_ID = 'RULE-BOOTSTRAP-2';
@@ -76,9 +79,20 @@ export class Ledger {
       if (currentVersion > 0 && currentVersion < LATEST_SCHEMA_VERSION) {
         this.#backupBeforeMigration(currentVersion);
       }
+      if (currentVersion > 0 && currentVersion < LEGACY_TASK_REMOVAL_SCHEMA_VERSION) {
+        this.#removeLegacyTaskStorageFromBackups();
+      }
+      if (currentVersion > 0 && currentVersion < LEGACY_CONTEXT_SELECTION_REMOVAL_SCHEMA_VERSION) {
+        this.#removeLegacyContextSelectionStorageFromBackups();
+      }
       this.db.exec('PRAGMA foreign_keys = ON;');
       this.db.exec('PRAGMA journal_mode = WAL;');
       this.#initializeSchema();
+      if (currentVersion > 0 && currentVersion < LEGACY_TASK_REMOVAL_SCHEMA_VERSION) {
+        this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+        this.db.exec('VACUUM;');
+        this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+      }
       this.projects = new ProjectRepository({
         db: this.db,
         transaction: (callback) => this.transaction(callback),
@@ -90,15 +104,6 @@ export class Ledger {
         insertEvent: (runId, eventType, payload, occurredAt) => (
           this.#insertEvent(runId, eventType, payload, occurredAt)
         ),
-      });
-      this.tasks = new TaskRepository({
-        db: this.db,
-        transaction: (callback) => this.transaction(callback),
-        getRun: (runId) => this.getRun(runId),
-        insertEvent: (runId, eventType, payload, occurredAt) => (
-          this.#insertEvent(runId, eventType, payload, occurredAt)
-        ),
-        storeBlobPath: (blobPath) => this.#storeBlobPath(blobPath),
       });
       this.derived = new DerivedRepository({
         db: this.db,
@@ -139,6 +144,7 @@ export class Ledger {
           this.#insertRollbackOutcome(runId, outcome, occurredAt)
         ),
       });
+      this.resources = new ResourceRepository({ db: this.db, transaction: (callback) => this.transaction(callback) });
     } catch (error) {
       this.db.close();
       throw error;
@@ -165,6 +171,77 @@ export class Ledger {
       fs.rmSync(tempPath, { force: true });
     }
     return backupPath;
+  }
+
+  #removeLegacyTaskStorageFromBackups() {
+    const backupDir = path.join(this.stateDir, 'backups');
+    if (!fs.existsSync(backupDir)) return;
+    const resolvedStateDir = fs.realpathSync(this.stateDir);
+    const entries = fs.readdirSync(backupDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || entry.isSymbolicLink() || !entry.name.endsWith('.sqlite')) continue;
+      const backupPath = path.join(backupDir, entry.name);
+      const resolvedBackup = fs.realpathSync(backupPath);
+      const relative = path.relative(resolvedStateDir, resolvedBackup);
+      if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        throw new Error(`Atlas refused to clean a Ledger backup outside state: ${backupPath}`);
+      }
+      const backup = new DatabaseSync(resolvedBackup);
+      try {
+        backup.exec('PRAGMA busy_timeout = 5000;');
+        backup.exec('PRAGMA foreign_keys = ON;');
+        backup.exec('BEGIN IMMEDIATE;');
+        try {
+          removeLegacyTaskStorage(backup);
+          backup.exec('COMMIT;');
+        } catch (error) {
+          backup.exec('ROLLBACK;');
+          throw error;
+        }
+        backup.exec('VACUUM;');
+        const integrity = backup.prepare('PRAGMA integrity_check').get().integrity_check;
+        if (integrity !== 'ok') {
+          throw new Error(`Ledger backup failed integrity check after Task removal: ${entry.name}`);
+        }
+      } finally {
+        backup.close();
+      }
+    }
+  }
+
+  #removeLegacyContextSelectionStorageFromBackups() {
+    const backupDir = path.join(this.stateDir, 'backups');
+    if (!fs.existsSync(backupDir)) return;
+    const resolvedStateDir = fs.realpathSync(this.stateDir);
+    const entries = fs.readdirSync(backupDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || entry.isSymbolicLink() || !entry.name.endsWith('.sqlite')) continue;
+      const backupPath = path.join(backupDir, entry.name);
+      const resolvedBackup = fs.realpathSync(backupPath);
+      const relative = path.relative(resolvedStateDir, resolvedBackup);
+      if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        throw new Error(`Atlas refused to clean a Ledger backup outside state: ${backupPath}`);
+      }
+      const backup = new DatabaseSync(resolvedBackup);
+      try {
+        backup.exec('PRAGMA busy_timeout = 5000;');
+        backup.exec('PRAGMA foreign_keys = ON;');
+        backup.exec('BEGIN IMMEDIATE;');
+        try {
+          removeLegacyContextSelectionStorage(backup);
+          backup.exec('COMMIT;');
+        } catch (error) {
+          backup.exec('ROLLBACK;');
+          throw error;
+        }
+        const integrity = backup.prepare('PRAGMA integrity_check').get().integrity_check;
+        if (integrity !== 'ok') {
+          throw new Error(`Ledger backup failed integrity check after Task Context selection removal: ${entry.name}`);
+        }
+      } finally {
+        backup.close();
+      }
+    }
   }
 
   #storeBlobPath(blobPath) {
@@ -592,66 +669,6 @@ export class Ledger {
     });
   }
 
-  findTaskContract(contractId) {
-    return this.tasks.findByContractId(contractId);
-  }
-
-  createTaskContract({
-    runId,
-    contractId,
-    root,
-    request,
-    contract,
-    contractHash,
-    project,
-    environmentRuleVersionId,
-    inputs,
-    caller = {},
-    candidateSetId = null,
-    sourceSetId = null,
-    writeRootId = null,
-    startedAt,
-  }) {
-    return this.tasks.create({
-      runId,
-      contractId,
-      root,
-      request,
-      contract,
-      contractHash,
-      project,
-      environmentRuleVersionId,
-      inputs,
-      caller,
-      candidateSetId,
-      sourceSetId,
-      writeRootId,
-      startedAt,
-    });
-  }
-
-  getTaskDetail(runId) {
-    return this.tasks.getDetail(runId);
-  }
-
-  reviewTaskRuleApplication(runId, { ruleId, decision, reason }) {
-    return this.tasks.reviewRuleApplication(runId, { ruleId, decision, reason });
-  }
-
-  claimTaskFulfillment(runId, claimToken, processId, occurredAt, plannedWriteRunId = null) {
-    return this.tasks.claimFulfillment(
-      runId, claimToken, processId, occurredAt, plannedWriteRunId,
-    );
-  }
-
-  releaseTaskFulfillmentClaim(runId, claimToken, occurredAt) {
-    return this.tasks.releaseFulfillmentClaim(runId, claimToken, occurredAt);
-  }
-
-  recordTaskUnderlyingRun(runId, writeRunId, occurredAt, claimToken = null) {
-    return this.tasks.recordUnderlyingRun(runId, writeRunId, occurredAt, claimToken);
-  }
-
   getActiveArtifactContext(rootPath, currentPath) {
     const artifact = this.db.prepare(`
       SELECT id, project_id, role, status, created_at, updated_at
@@ -685,34 +702,6 @@ export class Ledger {
     };
   }
 
-  markTaskStale(runId, payload, occurredAt) {
-    return this.tasks.markStale(runId, payload, occurredAt);
-  }
-
-  completeTaskContract(runId, {
-    writeRunId,
-    outputArtifactId,
-    outputMaterialId,
-    targetPath,
-    relationType,
-    writeMode,
-    completedAt,
-  }) {
-    return this.tasks.complete(runId, {
-      writeRunId,
-      outputArtifactId,
-      outputMaterialId,
-      targetPath,
-      relationType,
-      writeMode,
-      completedAt,
-    });
-  }
-
-  finishTaskRollback(runId, receipt, rolledBackAt) {
-    return this.tasks.finishRollback(runId, receipt, rolledBackAt);
-  }
-
   createDerivedRun(options) {
     return this.derived.createDerivedRun(options);
   }
@@ -741,8 +730,8 @@ export class Ledger {
     return this.derived.markDerivedStale(runId, payload, occurredAt);
   }
 
-  startDerivedExecution(runId, occurredAt) {
-    return this.derived.startDerivedExecution(runId, occurredAt);
+  startDerivedExecution(runId, occurredAt, ownership = null) {
+    return this.derived.startDerivedExecution(runId, occurredAt, ownership);
   }
 
   finishDerivedExecution(runId, execution) {
@@ -1914,79 +1903,6 @@ export class Ledger {
     return this.db.prepare(`
       SELECT DISTINCT blob_path, content_hash FROM materials WHERE blob_path IS NOT NULL
     `).all().map((row) => this.#resolveBlobPath(row.blob_path, row.content_hash));
-  }
-
-  readAnalyticsSource() {
-    this.db.exec('BEGIN;');
-    try {
-      const source = {
-        ledgerSchema: this.db.prepare('PRAGMA user_version').get().user_version,
-        runs: this.db.prepare(`
-          SELECT id, mode, status, root_path, intent, actor, agent, model, tool, client_run_id,
-                 rule_version_id, started_at, closed_at, aborted_at, rolled_back_at,
-                 receipt_json, abort_receipt_json, rollback_receipt_json
-          FROM runs ORDER BY started_at, id
-        `).all(),
-        predictions: this.db.prepare(`
-          SELECT id, run_id, kind, payload_json, created_at
-          FROM predictions ORDER BY created_at, id
-        `).all(),
-        labels: this.db.prepare(`
-          SELECT id, run_id, subject_prediction_id, name, value, source, details_json, created_at
-          FROM labels ORDER BY created_at, id
-        `).all(),
-        policyDecisions: this.db.prepare(`
-          SELECT id, run_id, rule_version_id, decision, reason, details_json, created_at
-          FROM policy_decisions ORDER BY created_at, id
-        `).all(),
-        operationEvents: this.db.prepare(`
-          SELECT id, run_id, event_type, payload_json, occurred_at
-          FROM operation_events ORDER BY occurred_at, id
-        `).all(),
-        ruleVersions: this.db.prepare(`
-          SELECT id, name, version, definition_json, created_at
-          FROM rule_versions ORDER BY created_at, id
-        `).all(),
-        preferenceRules: this.db.prepare(`
-          SELECT id, run_id, scope_type, scope_key, kind, condition_hash, condition_json,
-                 value_json, priority, rule_version_id, status, summary, basis,
-                 evidence_json, created_at, superseded_at
-          FROM preference_rules ORDER BY created_at, id
-        `).all(),
-        taskContracts: this.db.prepare(`
-          SELECT tc.run_id, r.started_at, tc.contract_id, tc.project_id, tc.environment_rule_version_id,
-                 tc.contract_hash, tc.request_json, tc.contract_json, tc.underlying_run_id,
-                 tc.completion_receipt_json, tc.completed_at,
-                 COUNT(ti.ordinal) AS input_count,
-                 COALESCE(SUM(CASE WHEN ti.selected = 1 THEN 1 ELSE 0 END), 0) AS selected_count,
-                 COALESCE(SUM(CASE WHEN ti.selected = 0 THEN 1 ELSE 0 END), 0) AS excluded_count,
-                 COALESCE(SUM(ti.byte_size), 0) AS input_bytes,
-                 COALESCE(SUM(CASE WHEN ti.selected = 1 THEN ti.byte_size ELSE 0 END), 0) AS selected_bytes
-          FROM task_contracts tc
-          JOIN runs r ON r.id = tc.run_id
-          LEFT JOIN task_inputs ti ON ti.run_id = tc.run_id
-          GROUP BY tc.run_id
-          ORDER BY tc.run_id
-        `).all(),
-        changes: this.db.prepare(`
-          SELECT c.id, cs.run_id, r.started_at, c.path, c.change_type, c.allowed,
-                 c.before_kind, c.before_hash, c.after_kind, c.after_hash
-          FROM changes c
-          JOIN change_sets cs ON cs.id = c.change_set_id
-          JOIN runs r ON r.id = cs.run_id
-          ORDER BY cs.run_id, c.path
-        `).all(),
-        materialDerivations: this.db.prepare(`
-          SELECT output_material_id, input_material_id, run_id, relation_type, ordinal, created_at
-          FROM material_derivations ORDER BY created_at, run_id, ordinal
-        `).all(),
-      };
-      this.db.exec('COMMIT;');
-      return source;
-    } catch (error) {
-      this.db.exec('ROLLBACK;');
-      throw error;
-    }
   }
 
   diagnostics() {

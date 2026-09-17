@@ -151,6 +151,233 @@ test('Ledger exposes a current schema version and migration history', () => {
   }
 });
 
+test('a fresh Ledger does not create removed Task or Task Context selection storage', () => {
+  const { stateDir } = setup('schema-without-task-contract');
+  const tracker = new Tracker({ stateDir });
+  tracker.status();
+  tracker.dispose();
+
+  const db = new DatabaseSync(path.join(stateDir, 'ledger.sqlite'), { readOnly: true });
+  try {
+    const names = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
+    assert.equal(names.has('task_contracts'), false);
+    assert.equal(names.has('task_inputs'), false);
+    assert.equal(names.has('task_fulfillment_claims'), false);
+    assert.equal(names.has('context_candidate_sets'), false);
+    assert.equal(names.has('context_candidate_items'), false);
+    assert.equal(names.has('source_sets'), false);
+    assert.equal(names.has('source_set_items'), false);
+  } finally {
+    db.close();
+  }
+});
+
+test('an upgrade removes historical Task Context selection storage from the Ledger and migration backups', () => {
+  const { stateDir } = setup('schema-removes-historical-task-context-selection');
+  const initialized = new Tracker({ stateDir });
+  initialized.status();
+  initialized.dispose();
+
+  const databasePath = path.join(stateDir, 'ledger.sqlite');
+  const legacy = new DatabaseSync(databasePath);
+  try {
+    legacy.exec(`
+      INSERT OR IGNORE INTO projects(
+        id, name, current_path, status, parent_project_id, lineage_json, created_at, updated_at
+      ) VALUES (
+        'PRJ-LEGACY', 'Legacy Context Project', NULL, 'active', NULL, '{}',
+        '2026-09-16T00:00:00.000Z', '2026-09-16T00:00:00.000Z'
+      );
+      CREATE TABLE IF NOT EXISTS context_candidate_sets (
+        id TEXT PRIMARY KEY,
+        target_project_id TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        terms_json TEXT NOT NULL,
+        context_link_ids_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS context_candidate_items (
+        candidate_set_id TEXT NOT NULL REFERENCES context_candidate_sets(id),
+        ordinal INTEGER NOT NULL,
+        catalog_entry_id TEXT NOT NULL,
+        context_link_id TEXT NOT NULL,
+        source_project_id TEXT NOT NULL,
+        source_root_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        score REAL,
+        snippet TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        PRIMARY KEY(candidate_set_id, catalog_entry_id)
+      );
+      CREATE TABLE IF NOT EXISTS source_sets (
+        id TEXT PRIMARY KEY,
+        candidate_set_id TEXT NOT NULL REFERENCES context_candidate_sets(id),
+        target_project_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS source_set_items (
+        source_set_id TEXT NOT NULL REFERENCES source_sets(id),
+        ordinal INTEGER NOT NULL,
+        catalog_entry_id TEXT NOT NULL,
+        source_project_id TEXT NOT NULL,
+        source_root_id TEXT NOT NULL,
+        source_root_path TEXT NOT NULL,
+        source_relative_path TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        byte_size INTEGER NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        PRIMARY KEY(source_set_id, catalog_entry_id)
+      );
+      INSERT INTO context_candidate_sets(
+        id, target_project_id, purpose, terms_json, context_link_ids_json,
+        status, created_at, expires_at
+      ) VALUES (
+        'CCS-LEGACY', 'PRJ-LEGACY', 'task_context', '[]', '[]',
+        'prepared', '2026-09-16T00:00:00.000Z', NULL
+      );
+      INSERT INTO source_sets(id, candidate_set_id, target_project_id, status, created_at)
+      VALUES (
+        'SRCSET-LEGACY', 'CCS-LEGACY', 'PRJ-LEGACY', 'accepted',
+        '2026-09-16T00:00:00.000Z'
+      );
+      CREATE TABLE legacy_context_keep (
+        id INTEGER PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      INSERT INTO legacy_context_keep(id, value)
+      VALUES (1, 'retain current Project and Catalog foundations');
+      PRAGMA user_version = 22;
+    `);
+  } finally {
+    legacy.close();
+  }
+  const backupDir = path.join(stateDir, 'backups');
+  fs.mkdirSync(backupDir, { recursive: true });
+  fs.copyFileSync(databasePath, path.join(backupDir, 'ledger-pre-migration-v21-to-v22.sqlite'));
+
+  const upgraded = new Tracker({ stateDir });
+  upgraded.status();
+  upgraded.dispose();
+
+  const retiredTables = [
+    'context_candidate_sets', 'context_candidate_items', 'source_sets', 'source_set_items',
+  ];
+  const verify = (database, name) => {
+    const tables = new Set(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
+    for (const table of retiredTables) assert.equal(tables.has(table), false, `${name}: ${table}`);
+    assert.equal(tables.has('project_context_links'), true, `${name}: project_context_links`);
+    assert.equal(tables.has('catalog_entries'), true, `${name}: catalog_entries`);
+    assert.equal(tables.has('resources'), true, `${name}: resources`);
+    assert.equal(
+      database.prepare('SELECT value FROM legacy_context_keep WHERE id = 1').get().value,
+      'retain current Project and Catalog foundations',
+      name,
+    );
+    assert.equal(database.prepare('PRAGMA integrity_check').get().integrity_check, 'ok', name);
+  };
+
+  const verified = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    assert.equal(verified.prepare('PRAGMA user_version').get().user_version, LATEST_SCHEMA_VERSION);
+    verify(verified, 'main');
+  } finally {
+    verified.close();
+  }
+
+  const backups = fs.readdirSync(backupDir).filter((name) => name.endsWith('.sqlite'));
+  assert.ok(backups.length >= 2);
+  for (const name of backups) {
+    const backup = new DatabaseSync(path.join(backupDir, name), { readOnly: true });
+    try {
+      verify(backup, name);
+    } finally {
+      backup.close();
+    }
+  }
+});
+
+test('an upgrade removes historical Task storage from the Ledger and migration backups', () => {
+  const { stateDir } = setup('schema-removes-historical-task-storage');
+  const initialized = new Tracker({ stateDir });
+  initialized.status();
+  initialized.dispose();
+
+  const databasePath = path.join(stateDir, 'ledger.sqlite');
+  const legacy = new DatabaseSync(databasePath);
+  try {
+    legacy.exec(`
+      CREATE TABLE task_contracts (
+        run_id TEXT PRIMARY KEY,
+        contract_id TEXT NOT NULL,
+        underlying_run_id TEXT
+      );
+      CREATE TABLE task_inputs (
+        run_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        PRIMARY KEY(run_id, ordinal)
+      );
+      CREATE TABLE task_fulfillment_claims (
+        task_run_id TEXT PRIMARY KEY,
+        claim_token TEXT NOT NULL
+      );
+      CREATE TABLE legacy_keep (
+        id INTEGER PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      INSERT INTO task_contracts(run_id, contract_id, underlying_run_id)
+      VALUES ('RUN-HISTORICAL-TASK', 'TSK-HISTORICAL', NULL);
+      INSERT INTO task_inputs(run_id, ordinal, path)
+      VALUES ('RUN-HISTORICAL-TASK', 0, 'Source/input.csv');
+      INSERT INTO task_fulfillment_claims(task_run_id, claim_token)
+      VALUES ('RUN-HISTORICAL-TASK', 'CLAIM-HISTORICAL');
+      INSERT INTO legacy_keep(id, value)
+      VALUES (1, 'retain unrelated data');
+      PRAGMA user_version = 21;
+    `);
+  } finally {
+    legacy.close();
+  }
+  const backupDir = path.join(stateDir, 'backups');
+  fs.mkdirSync(backupDir, { recursive: true });
+  fs.copyFileSync(databasePath, path.join(backupDir, 'ledger-pre-migration-v20-to-v21.sqlite'));
+
+  const upgraded = new Tracker({ stateDir });
+  upgraded.status();
+  upgraded.dispose();
+
+  const verified = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const tables = new Set(verified.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
+    assert.equal(tables.has('task_contracts'), false);
+    assert.equal(tables.has('task_inputs'), false);
+    assert.equal(tables.has('task_fulfillment_claims'), false);
+    assert.equal(verified.prepare('SELECT value FROM legacy_keep WHERE id = 1').get().value, 'retain unrelated data');
+    assert.equal(verified.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
+  } finally {
+    verified.close();
+  }
+
+  const backups = fs.readdirSync(backupDir).filter((name) => name.endsWith('.sqlite'));
+  assert.ok(backups.length >= 2);
+  for (const name of backups) {
+    const backup = new DatabaseSync(path.join(backupDir, name), { readOnly: true });
+    try {
+      const tables = new Set(backup.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
+      assert.equal(tables.has('task_contracts'), false, name);
+      assert.equal(tables.has('task_inputs'), false, name);
+      assert.equal(tables.has('task_fulfillment_claims'), false, name);
+      assert.equal(backup.prepare('SELECT value FROM legacy_keep WHERE id = 1').get().value, 'retain unrelated data');
+      assert.equal(backup.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
+    } finally {
+      backup.close();
+    }
+  }
+});
+
 test('historical runs expose the immutable RuleVersion definition they used', (t) => {
   const { vault, stateDir } = setup('rule-version-detail');
   const tracker = openTracker(t, stateDir);
@@ -241,8 +468,6 @@ test('a version 1 Ledger is migrated in place without losing its existing run', 
     const runColumns = new Set(migrated.prepare('PRAGMA table_info(runs)').all().map((row) => row.name));
     const labelColumns = new Set(migrated.prepare('PRAGMA table_info(labels)').all().map((row) => row.name));
     const artifactColumns = new Set(migrated.prepare('PRAGMA table_info(artifacts)').all().map((row) => row.name));
-    const taskContractColumns = new Set(migrated.prepare('PRAGMA table_info(task_contracts)').all().map((row) => row.name));
-    const taskInputColumns = new Set(migrated.prepare('PRAGMA table_info(task_inputs)').all().map((row) => row.name));
     assert.ok(runColumns.has('aborted_at'));
     assert.ok(runColumns.has('abort_receipt_json'));
     assert.ok(runColumns.has('actor'));
@@ -251,10 +476,10 @@ test('a version 1 Ledger is migrated in place without losing its existing run', 
     assert.ok(runColumns.has('tool'));
     assert.ok(runColumns.has('client_run_id'));
     assert.ok(labelColumns.has('subject_prediction_id'));
-    assert.ok(taskContractColumns.has('contract_hash'));
-    assert.ok(taskContractColumns.has('environment_rule_version_id'));
-    assert.ok(taskInputColumns.has('prepared_hash'));
-    assert.ok(taskInputColumns.has('selection_reason'));
+    const migratedTables = new Set(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
+    assert.equal(migratedTables.has('task_contracts'), false);
+    assert.equal(migratedTables.has('task_inputs'), false);
+    assert.equal(migratedTables.has('task_fulfillment_claims'), false);
     assert.ok(labelColumns.has('details_json'));
     assert.ok(artifactColumns.has('root_path'));
     assert.ok(artifactColumns.has('role'));

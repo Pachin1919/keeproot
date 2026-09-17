@@ -32,6 +32,7 @@ export function createDataWorkService({
     return value;
   };
   const cleanup = (id) => { const value = sessions.get(id); if (value?.staged_path) fs.rmSync(value.staged_path, { force: true }); if (value?.request_path) fs.rmSync(value.request_path, { force: true }); sessions.delete(id); };
+  const invalidateStage = (value) => { if (value.staged_path) fs.rmSync(value.staged_path, { force: true }); value.staged_path = null; value.staged = null; };
   const expire = () => { for (const [id, value] of sessions) if (now() - (value.last_active_at ?? value.created_at) > SESSION_AGE_MS) cleanup(id); };
   const invoke = async (value, action, { page = 0, exportStage = false } = {}) => {
     const requestPath = path.join(path.resolve(stateDir), 'tmp', 'data-work', `${value.session_id}.json`);
@@ -59,7 +60,7 @@ export function createDataWorkService({
     if (path.extname(resolved).toLowerCase() === '.csv') { await invoke(value, 'preview'); } else if (!value.sheets?.length) { value.sheets = (await runDataWorkFn({ projectRoot, installationRoot, filePath: resolved, expectedSha256: value.source_fingerprint.sha256, action: 'describe' })).sheets; }
     sessions.set(value.session_id, value); return value;
   };
-  const selectSheet = async (id, sheet) => { const value = session(id); if (!value) throw new Error('This Data Work session is no longer available.'); if (!value.sheets?.some((item) => item.name === sheet)) throw new Error('Choose one workbook sheet.'); value.sheet = sheet; await invoke(value, 'preview'); return value; };
+  const selectSheet = async (id, sheet) => { const value = session(id); if (!value) throw new Error('This Data Work session is no longer available.'); if (!value.sheets?.some((item) => item.name === sheet)) throw new Error('Choose one workbook sheet.'); value.sheet = sheet; await invoke(value, 'preview'); invalidateStage(value); return value; };
   const change = async (id, action, input = {}) => {
     const value = session(id); if (!value) throw new Error('This Data Work session is no longer available.'); if (!value.preview) throw new Error('Choose a sheet first.');
     const columns = value.available_columns ?? value.preview.columns;
@@ -78,6 +79,7 @@ export function createDataWorkService({
       }
       if (action === 'clean') { value.operations.remove_empty_rows = input.remove_empty_rows === true; value.operations.remove_duplicates = input.remove_duplicates === true; }
       if (value.operations.columns?.length !== 0) await invoke(value, 'preview');
+      invalidateStage(value);
       return value;
     } catch (error) {
       value.operations = previousOperations;
@@ -87,8 +89,8 @@ export function createDataWorkService({
     }
   };
   const page = async (id, value) => { const item = session(id); if (!item) throw new Error('This Data Work session is no longer available.'); await invoke(item, 'preview', { page: Number(value) || 0 }); return item; };
-  const stage = async (id) => { const value = session(id); if (!value) throw new Error('This Data Work session is no longer available.'); return invoke(value, 'export', { exportStage: true }); };
-  const clearStage = (id) => { const value = session(id); if (!value) return; if (value.staged_path) fs.rmSync(value.staged_path, { force: true }); value.staged_path = null; value.staged = null; };
+  const stage = async (id) => { const value = session(id); if (!value) throw new Error('This Data Work session is no longer available.'); if (value.staged_path && value.staged && fs.existsSync(value.staged_path)) return value.preview; return invoke(value, 'export', { exportStage: true }); };
+  const clearStage = (id) => { const value = session(id); if (!value) return; invalidateStage(value); };
   const attachProject = (id, project) => { const value = session(id); if (!value) return null; value.project = project; return value; };
   return { begin, session, selectSheet, change, page, stage, clearStage, attachProject, cleanup, expire };
 }

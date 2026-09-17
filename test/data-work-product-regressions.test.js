@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { once } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
-import test from 'node:test';
+import test, { after } from 'node:test';
 import { Worker } from 'node:worker_threads';
 import {
   CONTENT_INSPECTION_SCHEMA, CONTENT_PROCESSOR_VERSION, contentFileFingerprint,
@@ -22,6 +22,8 @@ import {
 import { createSavedWorkService, readSavedWorkState } from '../src/ui/services/saved-work-service.js';
 import { createDataWorkService } from '../src/ui/services/data-work-service.js';
 import { createProjectImportService, saveProjectImport } from '../src/ui/services/project-import-service.js';
+import { createSaveService } from '../src/save-service.js';
+import { createResourceControl } from '../src/resource-control.js';
 import { createProjectOnboardingService } from '../src/ui/services/project-onboarding-service.js';
 import { createDesktopSelectionService } from '../src/ui/services/desktop-selection-service.js';
 import { runUiContentOperation } from '../src/ui/content-worker-client.js';
@@ -30,18 +32,27 @@ import { renderFileWorkView } from '../src/ui/views/file-work-view.js';
 import { renderActivityView } from '../src/ui/views/activity-view.js';
 import { renderBatchWorkView } from '../src/ui/views/batch-work-view.js';
 import { renderDataWorkView } from '../src/ui/views/data-work-view.js';
-import { renderProjectResourcesView } from '../src/ui/views/project-resources-view.js';
+import { renderProjectResourceFolderGroup, renderProjectResourcesView } from '../src/ui/views/project-resources-view.js';
 import { renderProjectsHomeView } from '../src/ui/views/projects-home-view.js';
 import { renderSettingsView } from '../src/ui/views/settings-view.js';
 import { normalizeUiPreferences, preferenceHtmlAttributes, UI_PREFERENCE_DEFAULTS } from '../src/ui/preferences.js';
 import { describeFileReadFailure } from '../src/ui/file-read-failure.js';
 
 const testRoot = path.resolve('test', '.tmp');
+const temporaryRoots = new Set();
+
+after(() => {
+  for (const directory of temporaryRoots) {
+    const relative = path.relative(testRoot, directory);
+    assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+  }
+});
 
 function temporaryDirectory(t) {
   fs.mkdirSync(testRoot, { recursive: true });
   const directory = fs.mkdtempSync(path.join(testRoot, 'data-work-regression-'));
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  temporaryRoots.add(directory);
   return directory;
 }
 
@@ -49,6 +60,14 @@ function write(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, value, 'utf8');
   return filePath;
+}
+
+function assertProjectResourceHref(actual, { projectId, relativePath, resourceId }) {
+  const parsed = new URL(actual, 'http://atlas.local');
+  assert.equal(parsed.pathname, `/projects/${projectId}/resources`);
+  assert.equal(parsed.searchParams.get('path'), relativePath);
+  assert.equal(parsed.searchParams.get('resource_id'), resourceId);
+  assert.deepEqual([...parsed.searchParams.keys()].sort(), ['path', 'resource_id']);
 }
 
 function saveInput(root) {
@@ -126,7 +145,7 @@ test('Project import keeps its source path when a conflict is resolved with a ne
       show: () => ({ location: { root_path: projectRoot, relative_path: '' } }),
       resolvePath: () => ({ project: null }),
     },
-    intake: { prepare: (value) => { prepared = value; return { status: 'prepared', run_id: 'run-1' }; } },
+    intake: { prepare: (value) => { prepared = value; return { status: 'prepared', run_id: value.runId, save_id: value.runId, project: { id: 'project-1', name: 'Project One', path: 'Data' }, target: value.target }; } },
   });
   const result = service.prepare({
     work: { work_id: 'work-1', file_path: sourcePath, project: null },
@@ -150,11 +169,11 @@ test('Import conflict waits for a new name, resumes the same activity, and clear
   const project = { id: 'project-1', name: 'Project One', status: 'active' };
   const prepared = new Map();
   const intake = {
-    prepare: (value) => { prepared.set('run-1', value); return { status: 'prepared', run_id: 'run-1' }; },
+    prepare: (value) => { prepared.set(value.runId, value); return { status: 'prepared', run_id: value.runId, project: { id: 'project-1', name: 'Project One', path: 'Data' }, target: value.target }; },
     execute: (runId) => {
       const value = prepared.get(runId);
       fs.copyFileSync(value.candidateFile, path.join(value.root, value.target));
-      return { verified: true, rollback_ready: false };
+      return { verified: true, rollback_ready: true };
     },
     rollback: () => ({ status: 'rolled_back' }),
   };
@@ -323,31 +342,71 @@ test('Add to Project renders an existing-folder picker instead of a destination 
   assert.match(html, /<button class="action-button" type="submit" disabled>Review destination<\/button>/u);
 });
 
-test('Saved Work removes a newly created result when metadata cannot be written', (t) => {
+test('Data Work binds existing destination folders to the selected Project', () => {
+  const html = renderDataWorkView({
+    mode: 'save', csrf: 'token', session: { session_id: 'DW-1', file_path: 'C:\\incoming\\source.csv' },
+    projects: [
+      { id: 'project-a', name: 'Project A', folders: [{ relative_path: 'Data' }] },
+      { id: 'project-b', name: 'Project B', folders: [{ relative_path: 'Reports' }] },
+    ],
+  }, {});
+  assert.match(html, /data-project-folder-form/u);
+  assert.match(html, /data-project-id="project-a"/u);
+  assert.match(html, /data-project-id="project-b"/u);
+  assert.match(html, /value="Data"/u);
+  assert.match(html, /value="Reports"/u);
+  assert.doesNotMatch(html, /value=""[^>]*data-folder-path/u);
+  assert.match(html, /Cancel/u);
+});
+
+test('Saved Work requires the canonical Save Service for current saves', (t) => {
   const root = temporaryDirectory(t);
   const input = saveInput(root);
-  const service = createSavedWorkService({ stateDir: path.join(root, 'state'), writeStateFn: () => { throw new Error('metadata unavailable'); } });
-  assert.throws(() => service.save(input), /metadata unavailable/u);
+  const service = createSavedWorkService({ stateDir: path.join(root, 'state') });
+  assert.throws(() => service.save(input), /Save Service is unavailable/u);
   assert.equal(fs.existsSync(path.join(input.projectRoot, 'result.csv')), false);
 });
 
-test('Saved Work restores the result when Undo metadata cannot be written', (t) => {
+test('Saved Work Undo delegates to the canonical Save Service', (t) => {
   const root = temporaryDirectory(t);
-  const input = saveInput(root);
-  const stateDir = path.join(root, 'state');
-  const record = createSavedWorkService({ stateDir }).save(input);
-  const service = createSavedWorkService({ stateDir, writeStateFn: () => { throw new Error('metadata unavailable'); } });
-  assert.throws(() => service.undo(record.work_id), /result file was restored/u);
-  assert.equal(fs.readFileSync(record.result_path, 'utf8'), 'name\nresult\n');
-  assert.equal(readSavedWorkState(stateDir).items[0].status, 'active');
+  const calls = [];
+  const service = createSavedWorkService({ stateDir: path.join(root, 'state'), saveService: { undo(saveId) { calls.push(saveId); return { save_id: saveId, status: 'undone' }; } } });
+  assert.deepEqual(service.undo('SAV-one'), { save_id: 'SAV-one', status: 'undone' });
+  assert.deepEqual(calls, ['SAV-one']);
+});
+
+test('canonical saved Work activity uses the same Save result identity and Resource link', (t) => {
+  const root = temporaryDirectory(t); const stateDir = path.join(root, 'state');
+  const candidate = write(path.join(root, 'candidate.csv'), 'name\nresult\n');
+  const save = createSaveService({ stateDir, intake: {
+    prepare: (options) => ({ status: 'prepared', run_id: options.runId, target: 'Project A/Data/result.csv', project: { id: 'project-a', name: 'Project A', path: 'Project A' } }),
+    execute: (runId) => ({ run_id: runId, verified: true, rollback_ready: true, after_sha256: 'f'.repeat(64), executed_at: '2026-09-14T00:00:00.000Z' }), rollback: () => ({}), dispose() {},
+  } });
+  const prepared = save.prepare({ root, candidateFile: candidate, projectId: 'project-a', target: 'Project A/Data/result.csv', channel: 'work', caller: { actor: 'user', tool: 'atlas-ui', client_run_id: 'DW-1' }, requestKey: 'DW-1' });
+  const shown = save.execute(prepared.save_id);
+  const activity = createSavedWorkService({ stateDir, saveService: save }).activityItems()[0];
+  assert.equal(activity.save_id, shown.save_id);
+  assert.equal(activity.file_path, shown.target.path);
+  assert.equal(activity.project.id, shown.project.id);
+  assert.equal(activity.verification.sha256, shown.verification.sha256);
+  assert.equal(activity.resource_href, shown.resources_href);
 });
 
 test('Data Work result names keep the source format', (t) => {
   const root = temporaryDirectory(t);
   const input = saveInput(root);
+  fs.mkdirSync(path.join(input.projectRoot, 'Data'));
   const service = createSavedWorkService({ stateDir: path.join(root, 'state') });
-  assert.equal(path.basename(service.prepareDestination({ projectRoot: input.projectRoot, folder: '', fileName: 'result', sourcePath: input.sourcePath })), 'result.csv');
-  assert.throws(() => service.prepareDestination({ projectRoot: input.projectRoot, folder: '', fileName: 'result.xlsx', sourcePath: input.sourcePath }), /produces a CSV result\. Use a file name ending in \.csv/u);
+  assert.equal(path.basename(service.prepareDestination({ projectRoot: input.projectRoot, folder: 'Data', fileName: 'result', sourcePath: input.sourcePath })), 'result.csv');
+  assert.throws(() => service.prepareDestination({ projectRoot: input.projectRoot, folder: 'Data', fileName: 'result.xlsx', sourcePath: input.sourcePath }), /produces a CSV result\. Use a file name ending in \.csv/u);
+});
+
+test('Data Work destinations require an existing non-root Project folder', (t) => {
+  const root = temporaryDirectory(t); const input = saveInput(root); const service = createSavedWorkService({ stateDir: path.join(root, 'state') });
+  fs.mkdirSync(path.join(input.projectRoot, 'Data'));
+  assert.throws(() => service.prepareDestination({ projectRoot: input.projectRoot, folder: '', fileName: 'result.csv', sourcePath: input.sourcePath }), /Choose an existing destination folder/u);
+  assert.throws(() => service.prepareDestination({ projectRoot: input.projectRoot, folder: '.', fileName: 'result.csv', sourcePath: input.sourcePath }), /Choose an existing destination folder/u);
+  assert.equal(service.prepareDestination({ projectRoot: input.projectRoot, folder: 'Data', fileName: 'result.csv', sourcePath: input.sourcePath }), path.join(input.projectRoot, 'Data', 'result.csv'));
 });
 
 test('Data Work keeps the last valid state after a bad filter and expires by inactivity', async (t) => {
@@ -378,21 +437,31 @@ test('Data Work keeps the last valid state after a bad filter and expires by ina
 });
 
 test('Data Work save uses refreshable GET pages after review and confirmation', async (t) => {
-  const root = temporaryDirectory(t);
-  const projectRoot = path.join(root, 'project');
+  fs.mkdirSync(testRoot, { recursive: true });
+  const root = fs.mkdtempSync(path.join(testRoot, 'data-work-save-canonical-'));
+  const stateDir = path.join(root, 'state');
+  const workspaceRoot = path.join(root, 'workspace');
+  const projectRoot = path.join(workspaceRoot, 'Project One');
   const sourcePath = write(path.join(projectRoot, 'Data', 'source.csv'), 'name,amount\nOne,1\n');
-  const registry = {
-    list: () => [{ id: 'project-1', name: 'Project One', status: 'active' }],
-    show: () => ({ location: { root_path: projectRoot, relative_path: '' } }),
-  };
+  const registry = new Registry({ stateDir });
+  const adopted = registry.adoptRoot({ rootPath: workspaceRoot, rootType: 'project_workspace', contentPolicy: 'bounded_content' });
+  const created = registry.create({ name: 'Project One', currentPath: 'Project One' });
+  registry.attachRoot(created.project_id, { rootId: adopted.root_id, relativePath: 'Project One', reason: 'Bind Data Work regression Project.' });
+  const targetProjectRoot = path.join(workspaceRoot, 'Project Two');
+  fs.mkdirSync(path.join(targetProjectRoot, 'Data'), { recursive: true });
+  const targetProject = registry.create({ name: 'Project Two', currentPath: 'Project Two' });
+  registry.attachRoot(targetProject.project_id, { rootId: adopted.root_id, relativePath: 'Project Two', reason: 'Bind Data Work target Project.' });
+  const intake = new Intake({ stateDir });
   const preview = {
     columns: ['name', 'amount'], column_types: { name: 'text', amount: 'number' }, rows: [['One', 1]],
     source_summary: { rows: 1, columns: 2 }, result_summary: { rows: 1, columns: 2 },
   };
+  let exportCount = 0;
   const runContentOperation = async (operation, args) => {
     if (operation === 'fingerprint') return contentFileFingerprint(args.filePath);
     if (operation !== 'data-work') throw new Error(`Unexpected content operation: ${operation}`);
     if (args.action === 'export') {
+      exportCount += 1;
       fs.copyFileSync(args.filePath, args.outputPath);
       const staged = contentFileFingerprint(args.outputPath);
       return { ...structuredClone(preview), staged: { path: staged.file_path, sha256: staged.sha256, bytes: staged.bytes } };
@@ -400,12 +469,11 @@ test('Data Work save uses refreshable GET pages after review and confirmation', 
     return structuredClone(preview);
   };
   const server = await startAtlasUiServer({
-    stateDir: path.join(root, 'state'), runContentOperation,
-    ...serverServices(registry), projectRoot, installationRoot: projectRoot,
+    stateDir, runContentOperation, ...serverServices(registry), resourceControl: null, intake, projectRoot, installationRoot: projectRoot,
   });
-  t.after(() => server.close());
+  t.after(async () => { await server.close(); intake.dispose(); registry.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); });
 
-  const start = await fetch(`${server.workspace_url}projects/project-1/data-work?path=Data/source.csv`, { redirect: 'manual' });
+  const start = await fetch(`${server.workspace_url}projects/${created.project_id}/data-work?path=Data/source.csv`, { redirect: 'manual' });
   assert.equal(start.status, 303);
   const workUrl = new URL(start.headers.get('location'), server.workspace_url).toString();
   const savePage = await fetch(`${workUrl}/save`);
@@ -414,24 +482,127 @@ test('Data Work save uses refreshable GET pages after review and confirmation', 
 
   const review = await fetch(`${workUrl}/save/review`, {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ csrf, project_id: 'project-1', folder: 'Data', file_name: 'cleaned.csv' }), redirect: 'manual',
+    body: new URLSearchParams({ csrf, project_id: targetProject.project_id, folder: 'Data', file_name: 'cleaned.csv' }), redirect: 'manual',
   });
   assert.equal(review.status, 303);
-  assert.match(review.headers.get('location'), /\/save\/review\?/u);
+  if (!/\/save\/review\?/u.test(review.headers.get('location'))) {
+    const failure = await (await fetch(new URL(review.headers.get('location'), server.workspace_url))).text();
+    assert.fail(failure.match(/<section class="surface"><p class="callout warn">([^<]+)/u)?.[1] ?? review.headers.get('location'));
+  }
   const reviewUrl = new URL(review.headers.get('location'), server.workspace_url).toString();
   const reviewPage = await fetch(reviewUrl);
   assert.equal(reviewPage.status, 200);
   assert.match(await reviewPage.text(), /Review save/u);
 
+  const existingTarget = path.join(targetProjectRoot, 'Data', 'cleaned.csv');
+  fs.writeFileSync(existingTarget, 'external result\n');
+  const conflicted = await fetch(`${workUrl}/save/confirm`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ csrf, project_id: targetProject.project_id, folder: 'Data', file_name: 'cleaned.csv' }), redirect: 'manual',
+  });
+  assert.equal(conflicted.status, 303);
+  assert.match(conflicted.headers.get('location'), /\/save$/u);
+  assert.equal(fs.readFileSync(existingTarget, 'utf8'), 'external result\n');
+  const conflictHtml = await (await fetch(new URL(conflicted.headers.get('location'), server.workspace_url))).text();
+  assert.match(conflictHtml, /Rename file/u);
+  assert.match(conflictHtml, /Choose another folder/u);
+  assert.match(conflictHtml, /Cancel/u);
+  assert.equal(readSavedWorkState(stateDir).items.some((item) => item.status === 'executed'), false);
+  const renamedReview = await fetch(`${workUrl}/save/review`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ csrf, project_id: targetProject.project_id, folder: 'Data', file_name: 'renamed.csv' }), redirect: 'manual',
+  });
+  assert.equal(renamedReview.status, 303);
+
   const confirmed = await fetch(`${workUrl}/save/confirm`, {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ csrf, project_id: 'project-1', folder: 'Data', file_name: 'cleaned.csv' }), redirect: 'manual',
+    body: new URLSearchParams({ csrf, project_id: targetProject.project_id, folder: 'Data', file_name: 'renamed.csv' }), redirect: 'manual',
   });
   assert.equal(confirmed.status, 303);
-  assert.match(confirmed.headers.get('location'), /\/saved\?work_id=SWR-/u);
-  const savedPage = await fetch(new URL(confirmed.headers.get('location'), server.workspace_url));
-  assert.equal(savedPage.status, 200);
-  assert.match(await savedPage.text(), /Atlas saved the new result/u);
+  assert.match(confirmed.headers.get('location'), /\/saved\?work_id=SAV-/u);
+  const savedStates = readSavedWorkState(stateDir).items.filter((item) => item.save_id);
+  assert.equal(savedStates.filter((item) => item.status === 'executed').length, 1, JSON.stringify(savedStates.map((item) => ({ status: item.status, save_id: item.save_id, request_key: item.request_key, target: item.target }))));
+  const savedPage = await fetch(new URL(confirmed.headers.get('location'), server.workspace_url), { redirect: 'manual' });
+  assert.equal(savedPage.status, 200, `saved redirect: ${savedPage.headers.get('location')}`);
+  assert.match((await savedPage.text()).slice(-3000), /Atlas saved the new result/u);
+  assert.equal(fs.readFileSync(existingTarget, 'utf8'), 'external result\n');
+  const saves = readSavedWorkState(stateDir).items.filter((item) => item.save_id);
+  assert.equal(saves.filter((item) => item.status === 'failed').length, 1);
+  assert.equal(saves.filter((item) => item.status === 'executed').length, 1);
+  assert.match(saves.find((item) => item.status === 'executed').resources_href, /path=Data%2Frenamed\.csv/u);
+  const executed = saves.find((item) => item.status === 'executed');
+  const sourceResource = registry.ledger.resources.byPath(sourcePath);
+  assert.match(executed.resource_id, /^RES-/u);
+  assert.match(sourceResource.id, /^RES-/u);
+  assert.notEqual(executed.resource_id, sourceResource.id);
+  assert.deepEqual(executed.inputs, [{ relative_path: 'Project One/Data/source.csv', sha256: contentFileFingerprint(sourcePath).sha256 }]);
+  const derivedSave = intake.show(executed.save_id);
+  assert.equal(derivedSave.inputs.length, 1);
+  assert.equal(derivedSave.inputs[0].path, 'Project One/Data/source.csv');
+  assert.equal(derivedSave.lineage.length, 1);
+  assert.equal(derivedSave.lineage[0].input_material_id, derivedSave.inputs[0].material_id);
+  assert.equal(createSavedWorkService({ stateDir }).activityItems().find((item) => item.save_id === executed.save_id).resource_id, executed.resource_id);
+  assert.ok(registry.ledger.resources.listRelationships(sourceResource.id).some((entry) => entry.type === 'used_by' && entry.target_kind === 'project' && entry.target_id === targetProject.project_id));
+  assert.equal(exportCount, 1);
+  const savedTarget = path.join(targetProjectRoot, 'Data', 'renamed.csv');
+  assert.equal(executed.target.path, savedTarget);
+  const activeResourcePage = await fetch(new URL(executed.resources_href, server.workspace_url));
+  const activeResourceHtml = await activeResourcePage.text();
+  assert.match(activeResourceHtml, /renamed\.csv/u);
+  assert.match(activeResourceHtml, /Open in default app/u);
+
+  const stateBeforeRejectedUndo = readSavedWorkState(stateDir).items.find((item) => item.save_id === executed.save_id);
+  const resourceBeforeRejectedUndo = registry.ledger.resources.describe(executed.resource_id);
+  const rejectedUndo = await fetch(`${server.workspace_url}data-work/undo`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ csrf, work_id: executed.save_id, project_id: created.project_id }), redirect: 'manual',
+  });
+  assert.equal(rejectedUndo.status, 400, await rejectedUndo.text());
+  assert.equal(fs.existsSync(savedTarget), true);
+  assert.deepEqual(readSavedWorkState(stateDir).items.find((item) => item.save_id === executed.save_id), stateBeforeRejectedUndo);
+  assert.deepEqual(registry.ledger.resources.describe(executed.resource_id), resourceBeforeRejectedUndo);
+
+  const undone = await fetch(`${server.workspace_url}data-work/undo`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ csrf, work_id: executed.save_id, project_id: targetProject.project_id }), redirect: 'manual',
+  });
+  assert.equal(undone.status, 303, await undone.text());
+  assert.equal(fs.existsSync(savedTarget), false);
+  assert.match(undone.headers.get('location'), new RegExp(`resource_id=${executed.resource_id}`, 'u'));
+  const missingResourcePage = await fetch(new URL(executed.resources_href, server.workspace_url));
+  const missingResourceHtml = await missingResourcePage.text();
+  assert.match(missingResourceHtml, /Missing|Recorded file is missing/u);
+  assert.match(missingResourceHtml, /Redo/u);
+  fs.mkdirSync(path.join(workspaceRoot, 'Project Three'), { recursive: true });
+  const foreign = registry.create({ name: 'Project Three', currentPath: 'Project Three' });
+  registry.attachRoot(foreign.project_id, { rootId: adopted.root_id, relativePath: 'Project Three', reason: 'Cross-Project redo regression.' });
+  const foreignRedo = await fetch(`${server.workspace_url}projects/${foreign.project_id}/resources/actions/redo-save`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ csrf, resource_id: executed.resource_id, work_id: executed.save_id }), redirect: 'manual',
+  });
+  assert.equal(foreignRedo.status, 400);
+  assert.equal(fs.existsSync(savedTarget), false);
+  assert.equal(createSavedWorkService({ stateDir }).find(executed.save_id).write.redo_available, true);
+  const redoPage = await fetch(new URL(confirmed.headers.get('location'), server.workspace_url));
+  assert.match(await redoPage.text(), /Redo/u);
+  const rejectedRedo = await fetch(`${server.workspace_url}data-work/redo`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ csrf, work_id: executed.save_id, project_id: created.project_id }), redirect: 'manual',
+  });
+  assert.equal(rejectedRedo.status, 400, await rejectedRedo.text());
+  assert.equal(fs.existsSync(savedTarget), false);
+  assert.equal(createSavedWorkService({ stateDir }).find(executed.save_id).write.redo_available, true);
+
+  const redone = await fetch(`${server.workspace_url}data-work/redo`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ csrf, work_id: executed.save_id, project_id: targetProject.project_id }), redirect: 'manual',
+  });
+  assert.equal(redone.status, 303);
+  assert.equal(fs.readFileSync(savedTarget, 'utf8'), 'name,amount\nOne,1\n');
+  const redoneRecord = createSavedWorkService({ stateDir }).find(executed.save_id);
+  assert.equal(redoneRecord.resource_id, executed.resource_id);
+  assert.equal(redoneRecord.write.undo_available, true);
+  assert.equal(redoneRecord.write.redo_available, false);
 });
 
 test('expired Data Work stays inside the Data Work surface', async (t) => {
@@ -624,8 +795,10 @@ test('Project Resources renders a local Project tree instead of category cards',
   assert.match(html, /aria-current="page"><a href="\/projects\/project-1\/resources" title="Resources"/u);
   assert.doesNotMatch(html, />Files<\/span>/u);
   assert.match(html, /Not yet worked in Atlas/u);
-  assert.match(html, /<details data-project-folder data-folder-path="Data" open><summary class="workspace-tree-folder-row"/u);
-  assert.match(html, /<details data-project-folder data-folder-path="Data\/Facebook"/u);
+  assert.match(html, /data-project-folder data-folder-path="Data" data-folder-open="true"/u);
+  assert.match(html, /data-folder-toggle aria-expanded="true"[^>]*aria-label="Collapse Data"/u);
+  assert.match(html, /href="\/projects\/project-1\/resources\?folder=Data"[^>]*data-folder-select/u);
+  assert.match(html, /data-project-folder data-folder-path="Data\/Facebook" data-folder-open="true"/u);
   assert.match(html, /data-resource-tree data-project-id="project-1"/u);
   assert.match(html, /href="\/projects\/project-1\/resources\?path=/u);
   assert.match(html, /Open in default app/u);
@@ -643,16 +816,79 @@ test('Resource tree client supports folder and file keyboard equivalents without
   const client = fs.readFileSync(path.resolve('src', 'ui', 'client.js'), 'utf8');
   const css = fs.readFileSync(path.resolve('src', 'ui', 'styles', 'components.css'), 'utf8');
   assert.match(client, /const visibleControls = \(\) => controls\.filter/u);
-  assert.match(client, /event\.key === 'ArrowRight'[\s\S]*?folder\.open/u);
+  assert.match(client, /event\.key === 'ArrowRight'[\s\S]*?setFolderOpen\(folder, true\)/u);
   assert.match(client, /visible\[visible\.indexOf\(control\) \+ 1\]\?\.focus\(\)/u);
   assert.match(client, /event\.key === 'ArrowLeft'[\s\S]*?parentFolderControl\(control\)\?\.focus\(\)/u);
-  assert.match(client, /control\.tagName !== 'SUMMARY'[\s\S]*?:scope > summary/u);
+  assert.match(client, /const controls = folderControls/u);
+  assert.match(client, /const node = control\.closest\('\.workspace-tree-folder'\)[\s\S]*?:scope > \[data-folder-select\]/u);
   assert.match(client, /if \(event\.key === 'Enter'\)[\s\S]*?openResource\(row\)/u);
   assert.match(client, /fileList\.querySelectorAll\('\[data-open-resource\]'\)/u);
   assert.doesNotMatch(client, /document\.addEventListener\('keydown', \(event\) => \{[\s\S]{0,240}ArrowDown/u);
   assert.match(css, /\.workspace-tree-folder-row:hover\s*\{[^}]*background:/u);
   assert.match(css, /\.workspace-tree-folder-row:focus-visible\s*\{[^}]*outline:/u);
   assert.match(css, /\.workspace-resource-file:focus-visible\s*\{[^}]*outline:/u);
+});
+
+test('Project Resources keeps bounded temp folders discoverable after the global file result limit and sorts names both ways', (t) => {
+  const root = temporaryDirectory(t);
+  for (let index = 0; index < 170; index += 1) write(path.join(root, 'bulk', `file-${String(index).padStart(3, '0')}.md`), 'fixture');
+  write(path.join(root, 'test', '.tmp', 'v17-data-source.csv'), 'name,value\nAtlas,1\n');
+  write(path.join(root, 'test', '.tmp', 'alpha.csv'), 'name,value\nAlpha,2\n');
+  write(path.join(root, 'test', '.tmp', 'generated-case', 'internal.txt'), 'temporary');
+  const initialModel = buildProjectResourcesModel({
+    project: { id: 'project-1', name: 'Project One' }, root, base: '/projects/project-1', recentWork: [],
+  });
+  const initialHtml = renderProjectResourcesView(initialModel, { csrfToken: 'token' });
+  assert.match(initialHtml, /data-folder-files="test\/\.tmp" data-folder-loaded="false"[^>]*hidden/u);
+  assert.match(initialHtml, /Select this folder to load its files\./u);
+  const focusedModel = buildProjectResourcesModel({
+    project: { id: 'project-1', name: 'Project One' }, root, base: '/projects/project-1', recentWork: [],
+    focusedPath: 'test/.tmp/v17-data-source.csv',
+  });
+  assert.equal(focusedModel.truncated, true);
+  assert.equal(focusedModel.selected_folder_path, 'test/.tmp');
+  assert.equal(focusedModel.selected_folder_loaded, false);
+  const focusedHtml = renderProjectResourcesView(focusedModel, { csrfToken: 'token' });
+  assert.match(focusedHtml, /data-folder-files="test\/\.tmp" data-folder-loaded="false"/u);
+  const model = buildProjectResourcesModel({
+    project: { id: 'project-1', name: 'Project One' }, root, base: '/projects/project-1', recentWork: [],
+    selectedFolderPath: 'test/.tmp',
+  });
+  const testFolder = model.tree.folders.find((folder) => folder.relative_path === 'test');
+  const tempFolder = testFolder.folders.find((folder) => folder.relative_path === 'test/.tmp');
+  assert.ok(tempFolder);
+  assert.deepEqual(tempFolder.folders, []);
+  assert.deepEqual(tempFolder.files.map((file) => file.name), ['alpha.csv', 'v17-data-source.csv']);
+  assert.equal(model.selected_folder_loaded, true);
+  const html = renderProjectResourcesView(model, { csrfToken: 'token' });
+  const fragment = renderProjectResourceFolderGroup(model);
+  const client = fs.readFileSync(path.resolve('src', 'ui', 'client.js'), 'utf8');
+  assert.match(html, /data-resource-name-sort data-sort-direction="asc"/u);
+  assert.match(html, /data-resource-name="v17-data-source\.csv"/u);
+  assert.match(fragment, /data-folder-files="test\/\.tmp" data-folder-loaded="true"/u);
+  assert.match(fragment, /data-resource-name="alpha\.csv"/u);
+  assert.match(client, /data-resource-name-sort[\s\S]*?button\.dataset\.sortDirection === 'asc' \? 'desc' : 'asc'/u);
+  assert.match(client, /fragment: 'folder-files'/u);
+  assert.match(client, /folderLoadRequests\.has\(folderPath\)/u);
+  assert.doesNotMatch(client, /event\.detail > 1|folderClickTimers/u);
+  assert.match(html, /Files in <strong data-selected-folder-label>Project One \/ test \/ \.tmp<\/strong>/u);
+  assert.match(html, /The initial file list is bounded\. Select a folder to load its direct files\./u);
+});
+
+test('Project Resource selection puts viewing facts before technical identity', (t) => {
+  const root = temporaryDirectory(t);
+  const source = write(path.join(root, 'Data', 'source.csv'), 'name,value\nAtlas,1\n');
+  const result = write(path.join(root, 'Data', 'result.csv'), 'name,value\nAtlas,1\n');
+  const project = { id: 'project-1', name: 'Project One' };
+  const model = buildProjectResourcesModel({
+    project, root, base: '/projects/project-1', recentWork: [], focusedPath: 'Data/source.csv',
+    savedWork: [{ work_id: 'saved-1', project, result_path: result, source_path: source, status: 'active', created_at: '2026-09-15T00:00:00.000Z', write: { undo_available: true } }],
+  });
+  const html = renderProjectResourcesView(model, { csrfToken: 'token' });
+  assert.match(html, /<dt>Type<\/dt>[\s\S]*?<dt>Project<\/dt>[\s\S]*?<dt>Stored in<\/dt>[\s\S]*?<dt>Current state<\/dt>[\s\S]*?<dt>Last used<\/dt>/u);
+  assert.match(html, /<dt>Used by<\/dt><dd>result\.csv<\/dd>/u);
+  assert.match(html, /<details class="workspace-technical-details"><summary>Technical details<\/summary>[\s\S]*?<dt>Resource ID<\/dt>/u);
+  assert.doesNotMatch(html, /<dt>Representation<\/dt><dd>No local representation has been prepared\.<\/dd>/u);
 });
 
 test('Project Resource detail distinguishes recorded work from a disk modification and labels downstream results as Used by', (t) => {
@@ -782,7 +1018,7 @@ test('Resource Context shows only known Project, state, activity, and representa
   assert.match(html, /Project<\/dt><dd>Project One<\/dd>/u);
   assert.match(html, /Current state<\/dt><dd>The local parser stopped\.<\/dd>/u);
   assert.match(html, /Recent activity<\/dt>/u);
-  assert.match(html, /No local representation has been prepared\./u);
+  assert.doesNotMatch(html, /No local representation has been prepared\./u);
   assert.match(html, /href="\/activity\?selected=ACT-1">Back to Activity/u);
   assert.doesNotMatch(html, /Structured details available/u);
 });
@@ -796,7 +1032,7 @@ test('Resource Representation does not claim structure from a file extension wit
   });
   assert.equal(model.focused_resource.representation, null);
   const html = renderProjectResourcesView(model, { csrfToken: 'token' });
-  assert.match(html, /No local representation has been prepared\./u);
+  assert.doesNotMatch(html, /No local representation has been prepared\./u);
   assert.doesNotMatch(html, /Structured details available/u);
 });
 
@@ -1018,7 +1254,7 @@ test('Resources layout collapses before the tested narrow desktop width', () => 
   }, { csrfToken: 'token' });
   const styles = fs.readFileSync(path.resolve('src', 'ui', 'styles', 'components.css'), 'utf8');
   const client = fs.readFileSync(path.resolve('src', 'ui', 'client.js'), 'utf8');
-  assert.match(styles, /@media \(max-width: 1180px\) \{[\s\S]*?\.workspace-resource-grid \{ grid-template-columns:/u);
+  assert.match(styles, /@container \(max-width: 900px\) \{[\s\S]*?\.workspace-resource-grid[^\{]*\{ grid-template-columns:/u);
   assert.match(styles, /\.workspace-folder-scroll, \.workspace-resource-list-scroll, \.workspace-focus \{[^}]*overflow:\s*auto/u);
   assert.match(html, /data-resource-list-toggle[^>]*aria-controls="project-resource-file-list"[^>]*aria-expanded="true"/u);
   assert.match(html, /id="project-resource-file-list"[^>]*data-resource-file-list/u);
@@ -1040,7 +1276,128 @@ test('Resources starts with folders closed and remembers disclosure by Project',
   assert.match(client, /atlas-ui-open-folders:\$\{projectId\}/u);
   assert.match(client, /atlas-ui-selected-folder:\$\{projectId\}/u);
   assert.match(client, /atlas-ui-resource-list:\$\{projectId\}/u);
-  assert.match(client, /focusedPath[\s\S]*?setFileListExpanded\(Boolean\(focusedPath\)/u);
+  assert.match(client, /const initialListExpanded = focusedPath[\s\S]*?!compactResourceWorkspace\(\)/u);
+});
+
+test('Resources joins explicit Resource IDs before legacy path facts', (t) => {
+  const root = temporaryDirectory(t); write(path.join(root, 'Data', 'report.csv'), 'name\nvalue\n');
+  const base = { project: { id: 'project-1', name: 'Project One' }, root, base: '/projects/project-1', recentWork: [], resourceFacts: [{ resource_id: 'RES-current', path: path.join(root, 'Data', 'report.csv') }] };
+  const conflictingSaved = [{ resource_id: 'RES-other', result_path: path.join(root, 'Data', 'report.csv'), source_path: path.join(root, 'source.csv'), status: 'executed' }];
+  const conflictingActivity = [{ resource_id: 'RES-other', project: base.project, file_path: path.join(root, 'Data', 'report.csv'), status: 'running', updated_at: new Date().toISOString() }];
+  const explicit = buildProjectResourcesModel({ ...base, savedWork: conflictingSaved, currentActivity: conflictingActivity }).tree.folders[0].files[0];
+  assert.equal(explicit.resource_id, 'RES-current'); assert.equal(explicit.saved_work, null); assert.equal(explicit.activity, null);
+  const legacy = buildProjectResourcesModel({ ...base, savedWork: [{ ...conflictingSaved[0], resource_id: null }], currentActivity: [{ ...conflictingActivity[0], resource_id: null }] }).tree.folders[0].files[0];
+  assert.ok(legacy.saved_work); assert.ok(legacy.activity);
+});
+
+test('Resource ID focus preserves the local file type, Project-relative location, and primary data action', (t) => {
+  const root = temporaryDirectory(t);
+  const target = write(path.join(root, 'test', '.tmp', 'v17-data-source.csv'), 'name,value\nalpha,1\n');
+  const project = { id: 'project-1', name: 'Project One' };
+  const resourceId = 'RES-data-source';
+  const model = buildProjectResourcesModel({
+    project,
+    root,
+    base: '/projects/project-1',
+    recentWork: [],
+    focusedResourceId: resourceId,
+    resourceFacts: [{
+      resource_id: resourceId,
+      resource: { id: resourceId, display_name: 'v17-data-source.csv', kind: 'file', status: 'active' },
+      path: target,
+      relationship_label: 'Stored in',
+      locations: [{ project_id: project.id, path: target, status: 'active' }],
+      relationships: [{ id: 'RREL-stored', type: 'stored_in', target_kind: 'project', target_id: project.id, target_name: project.name, status: 'active' }],
+    }],
+  });
+  const html = renderProjectResourcesView(model, { csrfToken: 'token' });
+
+  assert.equal(model.focused_resource.type, 'CSV');
+  assert.equal(model.focused_resource.relative_path, 'test/.tmp/v17-data-source.csv');
+  assert.match(html, /<dt>Stored in<\/dt><dd>test\/.tmp<\/dd>/u);
+  assert.match(html, /Work with data/u);
+  assert.match(html, /href="\/projects\/project-1\/resources\?path=test%2F\.tmp%2Fv17-data-source\.csv&amp;resource_id=RES-data-source"/u);
+  assert.ok(html.indexOf('Work with data') < html.indexOf('<dl>'));
+});
+
+test('Resources keeps imported Resource identity and Project relationships beyond the visible file limit', (t) => {
+  const root = temporaryDirectory(t);
+  for (let index = 0; index < 150; index += 1) write(path.join(root, `${String(index).padStart(3, '0')}.md`), `file ${index}\n`);
+  const source = write(path.join(root, '..', `${path.basename(root)}-outside`, 'source.csv'), 'name\nsource\n');
+  const target = write(path.join(root, 'zzz', 'imported.csv'), 'name\nsource\n');
+  const project = { id: 'project-1', name: 'Project One' };
+  const resourceId = 'RES-imported';
+  const listed = searchProjectFiles(root, '');
+  assert.equal(listed.truncated, true);
+  assert.equal(listed.items.some((item) => item.relative_path === 'zzz/imported.csv'), false);
+  const model = buildProjectResourcesModel({
+    project, root, base: '/projects/project-1', focusedPath: 'zzz/imported.csv', focusedResourceId: resourceId,
+    recentWork: [{
+      work_id: 'RWK-imported', resource_id: resourceId, file_path: target, project,
+      inspected_at: '2026-09-15T08:00:00.000Z', last_continued_at: null,
+      inspect: { purpose: 'data', sheet: null, max_characters: 4000 },
+      source_fingerprint: contentFileFingerprint(target), cache_reference: 'content/imported.json',
+      project_transfer: {
+        saved_at: '2026-09-15T08:01:00.000Z', undo_available: true,
+        origin: { file_path: source },
+      },
+    }],
+    resourceFacts: [{
+      resource_id: resourceId,
+      resource: { id: resourceId, display_name: 'imported.csv', status: 'active' },
+      path: target,
+      relationship_label: 'Stored in',
+      locations: [{ project_id: project.id, path: target, status: 'active' }],
+      relationships: [
+        { id: 'RREL-stored', type: 'stored_in', target_kind: 'project', target_id: project.id, target_name: project.name, status: 'active' },
+        { id: 'RREL-used', type: 'used_by', target_kind: 'project', target_id: 'project-2', target_name: 'Project Two', status: 'active' },
+      ],
+    }],
+  });
+  const html = renderProjectResourcesView(model, { csrfToken: 'token' });
+  assert.equal(model.focused_resource.resource_id, resourceId);
+  assert.equal(model.focused_resource.relative_path, 'zzz/imported.csv');
+  assert.equal(model.focused_resource.open_available, true);
+  assert.equal(model.focused_resource.added_from.origin_file, source);
+  assert.match(html, /RES-imported/u);
+  assert.match(html, /Stored in[\s\S]*Project One/u);
+  assert.match(html, /Used by[\s\S]*Project Two/u);
+  assert.match(html, /Work with data/u);
+  assert.match(html, /data-work\?path=zzz%2Fimported\.csv/u);
+});
+
+test('Resources only offers Data Work for a focused supported Project data file', (t) => {
+  const root = temporaryDirectory(t);
+  write(path.join(root, 'Data', 'report.csv'), 'name\nvalue\n');
+  write(path.join(root, 'Notes', 'brief.md'), '# Brief\n');
+  const base = { project: { id: 'project-1', name: 'Project One' }, root, base: '/projects/project-1', recentWork: [] };
+  const csvHtml = renderProjectResourcesView(buildProjectResourcesModel({ ...base, focusedPath: 'Data/report.csv' }), { csrfToken: 'token' });
+  const markdownHtml = renderProjectResourcesView(buildProjectResourcesModel({ ...base, focusedPath: 'Notes/brief.md' }), { csrfToken: 'token' });
+  assert.match(csvHtml, /Work with data/u);
+  assert.match(csvHtml, /data-work\?path=Data%2Freport\.csv/u);
+  assert.doesNotMatch(markdownHtml, /Work with data/u);
+  assert.doesNotMatch(markdownHtml, /data-work\?path=/u);
+});
+
+test('Resource visibility keeps external and missing ledger facts outside the disk tree', (t) => {
+  const root = temporaryDirectory(t); write(path.join(root, 'Data', 'disk.csv'), 'x\n'); const project = { id: 'project-1', name: 'Project One' };
+  const external = { resource_id: 'RES-external', resource: { display_name: 'external.md', status: 'active' }, locations: [], relationships: [], relationship_to_project: 'used_by', relationship_label: 'Used by', path: 'C:/outside/external.md' };
+  const missing = { resource_id: 'RES-missing', resource: { display_name: 'missing.md', status: 'missing' }, locations: [], relationships: [], relationship_to_project: 'stored_in', relationship_label: 'Stored in', path: 'Data/missing.md', content_hash: 'a'.repeat(64), status: 'missing' };
+  const model = buildProjectResourcesModel({ project, root, base: '/projects/project-1', recentWork: [], resourceFacts: [external, missing], focusedResourceId: 'RES-missing' }); const html = renderProjectResourcesView(model, { csrfToken: 'token' });
+  assert.equal(model.tree.folders[0].files.length, 1); assert.equal(model.external_references.length, 1); assert.equal(model.missing_resources.length, 1); assert.equal(model.focused_resource.resource_id, 'RES-missing'); assert.match(html, /External references/u); assert.match(html, /Missing resources/u); assert.match(html, /Resource ID/u); assert.doesNotMatch(html, /Delete file/u); assert.doesNotMatch(html, /Open in default app/u);
+  assert.equal(buildProjectResourcesModel({ project, root, base: '/projects/project-1', recentWork: [], resourceFacts: [external], focusedResourceId: 'RES-other' }).focused_resource, null);
+});
+
+test('Resource recovery action contract is Project-scoped and renders distinct non-delete controls', (t) => {
+  const root = temporaryDirectory(t); write(path.join(root, 'Data', 'disk.csv'), 'x\n'); const project = { id: 'project-a', name: 'Project A' };
+  const missing = { resource_id: 'RES-missing', resource: { display_name: 'missing.md', status: 'missing' }, locations: [{ id: 'RLOC-old', project_id: project.id, path: 'Data/missing.md', status: 'missing' }], relationships: [{ id: 'RREL-a-used', target_kind: 'project', target_id: project.id, type: 'used_by', status: 'active' }, { id: 'RREL-b-used', target_kind: 'project', target_id: 'project-b', type: 'used_by', status: 'active' }], relationship_to_project: 'stored_in', relationship_label: 'Stored in', path: 'Data/missing.md', content_hash: 'a'.repeat(64), status: 'missing' };
+  const external = { resource_id: 'RES-external', resource: { display_name: 'external.md', status: 'active' }, locations: [], relationships: [{ id: 'RREL-a-external', target_kind: 'project', target_id: project.id, type: 'used_by', status: 'active' }], relationship_to_project: 'used_by', relationship_label: 'Used by', path: 'C:/outside/external.md' };
+  const model = buildProjectResourcesModel({ project, root, base: '/projects/project-a', recentWork: [], resourceFacts: [missing, external], focusedResourceId: 'RES-missing' }); const html = renderProjectResourcesView(model, { csrfToken: 'token' }); const client = fs.readFileSync(path.resolve('src', 'ui', 'client.js'), 'utf8');
+  assert.equal(model.focused_resource.actions.keep_record, true); assert.equal(model.focused_resource.actions.relink, true); assert.deepEqual(model.focused_resource.actions.relationships.map((item) => item.id), ['RREL-a-used']); assert.equal(model.focused_resource.actions.relationships[0].can_remove_reference, true);
+  assert.match(html, /resources\/actions\/keep/u); assert.match(html, /resources\/actions\/relink/u); assert.match(html, /resources\/actions\/forget/u); assert.match(html, /resources\/actions\/remove-reference/u); assert.match(html, /Choose file to relink/u); assert.match(html, /data-resource-relink-picker/u); assert.match(html, /These actions do not delete files/u); assert.doesNotMatch(html, /Delete file/u);
+  const externalModel = buildProjectResourcesModel({ project, root, base: '/projects/project-a', recentWork: [], resourceFacts: [external], focusedResourceId: 'RES-external' }); const externalHtml = renderProjectResourcesView(externalModel, { csrfToken: 'token' }); assert.equal(externalModel.focused_resource.actions.keep_record, false); assert.equal(externalModel.focused_resource.actions.relink, false); assert.match(externalHtml, /Remove reference/u); assert.doesNotMatch(externalHtml, /Choose file to relink/u);
+  const disk = buildProjectResourcesModel({ project, root, base: '/projects/project-a', recentWork: [], focusedPath: 'Data/disk.csv' }); assert.equal(disk.focused_resource.actions, null);
+  assert.match(client, /\[data-resource-relink-picker\]/u); assert.match(client, /chooseDesktopFile\(button, 'pick_file'\)/u); assert.match(client, /selection\?\.selection_id/u); assert.match(client, /data-resource-relink-confirm/u);
 });
 
 test('Resources renders the approved three-pane workspace and remembers the collapsible file list', (t) => {
@@ -1064,7 +1421,7 @@ test('Resources renders the approved three-pane workspace and remembers the coll
   assert.match(html, /data-resource-workspace[^>]*data-project-id="project-1"/u);
   assert.match(html, /data-folder-navigator/u);
   assert.match(html, /data-resource-file-list/u);
-  assert.match(html, /Files in <strong[^>]*>src\/ui\/views/u);
+  assert.match(html, /Files in <strong[^>]*>Project One \/ src \/ ui \/ views/u);
   assert.match(html, /data-resource-inspector/u);
   assert.match(html, /data-resource-list-toggle[^>]*aria-controls="project-resource-file-list"/u);
   assert.match(html, /data-folder-select[^>]*data-folder-path="src\/ui\/views"/u);
@@ -1073,6 +1430,9 @@ test('Resources renders the approved three-pane workspace and remembers the coll
   assert.match(client, /atlas-ui-selected-folder:\$\{projectId\}/u);
   assert.match(client, /atlas-ui-resource-list:\$\{projectId\}/u);
   assert.match(client, /is-file-list-collapsed/u);
+  assert.match(client, /Show resource details/u);
+  assert.match(client, /Back to file list/u);
+  assert.match(client, /compact !== resourceWorkspaceWasCompact && focusedPath/u);
   assert.match(client, /if \(selectedFolder && \(focusedPath \|\| workspace\.dataset\.selectedFolderExplicit === 'true'\)\)/u);
   assert.match(client, /if \(clearResource\)[\s\S]*?classList\.remove\('is-focused'\)[\s\S]*?history\.replaceState/u);
   assert.match(client, /event\.key === 'ArrowLeft'[\s\S]*?folders\.filter[\s\S]*?saveFolders\(\)[\s\S]*?target\.focus\(\)/u);
@@ -1080,6 +1440,39 @@ test('Resources renders the approved three-pane workspace and remembers the coll
   assert.match(styles, /grid-template-columns:\s*minmax\([^;]+\)\s+minmax\([^;]+\)/u);
   assert.match(styles, /\.workspace-resource-list\[hidden\], \.workspace-folder-files\[hidden\] \{ display: none !important; \}/u);
   assert.match(styles, /@container \(max-width: 900px\)[\s\S]*?\.workspace-resource-grid:not\(\.is-file-list-collapsed\) \.workspace-focus \{ display: none; \}/u);
+});
+
+test('Resources exposes direct folder disclosure, adjustable panes, and native zoom reflow', () => {
+  const html = renderProjectResourcesView({
+    mode: 'explorer', project: { id: 'project-1', name: 'Project One' }, base: '/projects/project-1',
+    tree: { folders: [
+      { name: 'src', relative_path: 'src', folders: [{ name: 'ui', relative_path: 'src/ui', folders: [], files: [] }], files: [] },
+      { name: 'test', relative_path: 'test', folders: [], files: [] },
+    ], files: [] },
+    focused_resource: null, missing_sources: [], selected_folder_path: '',
+  }, { csrfToken: 'token' });
+  const client = fs.readFileSync(path.resolve('src', 'ui', 'client.js'), 'utf8');
+  const styles = fs.readFileSync(path.resolve('src', 'ui', 'styles', 'components.css'), 'utf8');
+
+  assert.match(html, /data-resource-pane-resizer="folder"/u);
+  assert.match(html, /data-resource-pane-resizer="list"/u);
+  assert.match(client, /data-resource-pane-resizer/u);
+  assert.match(client, /atlas-ui-resource-pane-widths:\$\{projectId\}/u);
+  assert.doesNotMatch(client, /folderClickTimers|window\.location\.assign\(control\.dataset\.folderHref\)/u);
+  assert.match(client, /const ownExpandableFolder = \(control\) => \{[\s\S]*?closest\('\.workspace-tree-folder'\)[\s\S]*?matches\('\[data-project-folder\]'\)/u);
+  assert.match(client, /controls\.forEach[\s\S]*?const folder = ownExpandableFolder\(control\)/u);
+  assert.match(client, /folderControls\.forEach[\s\S]*?const folder = ownExpandableFolder\(control\)[\s\S]*?addEventListener\('dblclick'/u);
+  assert.match(client, /folderToggles\.forEach[\s\S]*?setFolderOpen\(folder, !folderOpen\(folder\)\)/u);
+  assert.doesNotMatch(client, /event\.detail > 1/u);
+  assert.match(html, /data-project-folder data-folder-path="src"[^>]*>[\s\S]*?data-folder-toggle[\s\S]*?href="\/projects\/project-1\/resources\?folder=src"[^>]*data-folder-select/u);
+  assert.match(html, /<a[^>]*workspace-tree-folder-leaf[^>]*data-folder-path="src\/ui"/u);
+  assert.match(html, /<a[^>]*workspace-tree-folder-leaf[^>]*data-folder-path="test"/u);
+  assert.doesNotMatch(html, /data-folder-toggle[^>]*aria-label="(?:Expand|Collapse) (?:ui|test)"/u);
+  assert.match(styles, /\.workspace-tree-folder-toggle::before[^}]*content:\s*"›"/u);
+  assert.match(styles, /\.workspace-tree-folder-toggle\[aria-expanded="true"\]::before[^}]*rotate\(90deg\)/u);
+  assert.match(styles, /\.workspace-pane-resizer \{[^}]*cursor:\s*col-resize/u);
+  assert.doesNotMatch(client, /body\.style\.zoom|data-page-zoom/u);
+  assert.doesNotMatch(client, /document\.addEventListener\('wheel'/u);
 });
 
 test('Settings overlay keeps its dedicated width and reflows choices before 800 pixels', () => {
@@ -1104,12 +1497,12 @@ test('Import Selection Set saves through Intake and opens the exact Resource', a
   const prepared = new Map();
   let executionError = null;
   const intake = {
-    prepare: (value) => { prepared.set('run-1', value); return { status: 'prepared', run_id: 'run-1' }; },
+    prepare: (value) => { prepared.set(value.runId, value); return { status: 'prepared', run_id: value.runId, project: { id: project.id, name: project.name, path: 'Data' }, target: value.target }; },
     execute: (runId) => {
       if (executionError) throw executionError;
       const value = prepared.get(runId);
       fs.copyFileSync(value.candidateFile, path.join(value.root, value.target));
-      return { verified: true, rollback_ready: false };
+      return { verified: true, rollback_ready: true };
     },
     rollback: () => ({ status: 'rolled_back' }),
   };
@@ -1146,7 +1539,7 @@ test('Import Selection Set saves through Intake and opens the exact Resource', a
       markSaveStarted();
       await saveGate;
     }
-    const result = saveProjectImport({ stateDir, intake, imported });
+    const result = saveProjectImport({ stateDir, saveService: createSaveService({ stateDir, intake }), imported });
     if (corruptActivityAfterSave) write(path.join(stateDir, 'ui', 'current-activity.json'), '{invalid');
     return result;
   };
@@ -1205,11 +1598,18 @@ test('Import Selection Set saves through Intake and opens the exact Resource', a
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal(importStatus.status, 'completed');
-  assert.equal(importStatus.href, '/projects/project-1/resources?path=Data%2Freport.txt');
+  assertProjectResourceHref(importStatus.href, {
+    projectId: 'project-1', relativePath: 'Data/report.txt', resourceId: 'RES-test-1',
+  });
   const terminalQueuePage = await fetch(new URL(importHref, server.workspace_url));
   assert.equal(terminalQueuePage.status, 200);
   assert.match(await terminalQueuePage.text(), /report\.txt/u);
   assert.equal(fs.readFileSync(path.join(projectRoot, 'Data', 'report.txt'), 'utf8'), 'local report');
+  const importedWork = readRecentWorkState(stateDir).items.find((item) => item.file_path === path.join(projectRoot, 'Data', 'report.txt'));
+  assert.match(importedWork.project_transfer.run_id, /^SAV-/u);
+  assert.equal(importedWork.project_transfer.undo_available, true);
+  const activityHtml = await (await fetch(`${server.workspace_url}activity`)).text();
+  assert.match(activityHtml, /report\.txt/u);
   await new Promise((resolve) => setTimeout(resolve, 45));
   const expiredStatus = await fetch(`${server.workspace_url}activity/import-status?import_id=${importId}`);
   assert.equal(expiredStatus.status, 410);
@@ -1312,7 +1712,9 @@ test('Import Selection Set saves through Intake and opens the exact Resource', a
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal(activityFailureStatus.status, 'completed');
-  assert.equal(activityFailureStatus.href, '/projects/project-1/resources?path=Data%2Factivity-failure.txt');
+  assertProjectResourceHref(activityFailureStatus.href, {
+    projectId: 'project-1', relativePath: 'Data/activity-failure.txt', resourceId: 'RES-test-4',
+  });
   assert.equal(fs.readFileSync(path.join(projectRoot, 'Data', 'activity-failure.txt'), 'utf8'), 'activity failure isolation');
 });
 
@@ -1333,9 +1735,13 @@ test('Import save worker executes real Intake state and compensates a failed Rec
     rootId: adopted.root_id, relativePath: 'Project One', reason: 'Bind the worker regression Project.',
   });
   const intake = new Intake({ stateDir });
-  t.after(() => intake.dispose());
-  t.after(() => registry.dispose());
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const resourceControl = createResourceControl({ stateDir, ledger: registry.ledger });
+  t.after(() => {
+    resourceControl.dispose();
+    intake.dispose();
+    registry.dispose();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+  });
   const service = createProjectImportService({ stateDir, registry, intake });
 
   const inspectForRecentWork = (sourcePath) => {
@@ -1369,6 +1775,7 @@ test('Import save worker executes real Intake state and compensates a failed Rec
       sourceFingerprint: fingerprint,
       inspectionId: inspection.inspection_id,
       cacheReference: path.relative(stateDir, inspection.cache_path),
+      resourceId: resourceControl.identify({ filePath: sourcePath }).resource_id,
     });
   };
 
@@ -1381,22 +1788,66 @@ test('Import save worker executes real Intake state and compensates a failed Rec
   assert.equal(saved.project.id, created.project_id);
   assert.equal(fs.readFileSync(savedPath, 'utf8'), 'worker success');
   assert.equal(intake.show(prepared.run_id).run.status, 'executed');
+  const journal = JSON.parse(fs.readFileSync(path.join(stateDir, 'ui', 'saved-work.json'), 'utf8')).items.find((item) => item.save_id === prepared.save_id);
+  const transferred = readRecentWorkState(stateDir).items.find((item) => item.work_id === work.work_id);
+  assert.equal(journal.resource_id, work.resource_id);
+  assert.equal(transferred.resource_id, work.resource_id);
+  assert.equal(transferred.project_transfer.origin.resource_id, work.resource_id);
+  assert.equal(transferred.project_transfer.origin.file_path, sourcePath);
+  assert.equal(transferred.project_transfer.origin.source_fingerprint.sha256, work.source_fingerprint.sha256);
+  assert.equal(transferred.project_transfer.origin.source_fingerprint.bytes, work.source_fingerprint.bytes);
+  const relationships = resourceControl.ledger.resources.listRelationships(work.resource_id);
+  assert.ok(relationships.some((entry) => entry.type === 'stored_in' && entry.target_kind === 'project' && entry.target_id === created.project_id));
+  assert.ok(relationships.some((entry) => entry.type === 'used_by' && entry.target_kind === 'project' && entry.target_id === created.project_id));
+  assert.equal(relationships.some((entry) => entry.target_kind === 'resource' && entry.target_id === entry.source_resource_id), false);
 
   const failingSource = write(path.join(root, 'incoming', 'worker-rollback.txt'), 'worker rollback');
   const failingWork = inspectForRecentWork(failingSource);
   const failingPrepared = service.prepare({
     work: failingWork, projectId: created.project_id, folder: 'Data',
   });
-  fs.rmSync(path.resolve(stateDir, failingWork.cache_reference));
+  const failingCache = path.resolve(stateDir, failingWork.cache_reference);
+  const cachedInspection = fs.readFileSync(failingCache, 'utf8');
+  fs.rmSync(failingCache);
   await assert.rejects(
     runUiContentOperation('project-import-save', { stateDir, imported: failingPrepared }),
-    (error) => error.code === 'ATLAS_CONTENT_CACHE_UNAVAILABLE',
+    (error) => error.code === 'ATLAS_PROJECTION_PENDING',
   );
-  assert.equal(fs.existsSync(path.join(projectRoot, 'Data', 'worker-rollback.txt')), false);
-  assert.equal(intake.show(failingPrepared.run_id).run.status, 'rolled_back');
+  assert.equal(fs.existsSync(path.join(projectRoot, 'Data', 'worker-rollback.txt')), true);
+  assert.equal(intake.show(failingPrepared.run_id).run.status, 'executed');
   const retained = readRecentWorkState(stateDir).items.find((item) => item.work_id === failingWork.work_id);
   assert.equal(retained.file_path, failingSource);
   assert.equal(retained.project, null);
+  const savedPathBeforeRetry = path.join(projectRoot, 'Data', 'worker-rollback.txt');
+  const savedStatBeforeRetry = fs.statSync(savedPathBeforeRetry);
+  const saveBeforeRetry = JSON.parse(fs.readFileSync(path.join(stateDir, 'ui', 'saved-work.json'), 'utf8')).items.find((item) => item.save_id === failingPrepared.save_id);
+  const executionBeforeRetry = intake.show(failingPrepared.run_id).execution_receipt;
+  fs.writeFileSync(failingCache, cachedInspection, 'utf8');
+  const reopenedIntake = new Intake({ stateDir });
+  const reopenedImport = createProjectImportService({ stateDir, registry, intake: reopenedIntake });
+  const resumedPrepared = reopenedImport.prepare({ work: retained, projectId: created.project_id, folder: 'Data' });
+  assert.equal(resumedPrepared.save_id, failingPrepared.save_id);
+  assert.equal(resumedPrepared.run_id, failingPrepared.run_id);
+  reopenedIntake.dispose();
+  const retried = await runUiContentOperation('project-import-save', { stateDir, imported: resumedPrepared });
+  const saveAfterRetry = JSON.parse(fs.readFileSync(path.join(stateDir, 'ui', 'saved-work.json'), 'utf8')).items.find((item) => item.save_id === failingPrepared.save_id);
+  assert.equal(retried.file_path, savedPathBeforeRetry);
+  assert.equal(retried.project_transfer.run_id, failingPrepared.run_id);
+  assert.equal(retried.resource_id, saveBeforeRetry.resource_id);
+  assert.equal(saveAfterRetry.save_id, saveBeforeRetry.save_id);
+  assert.equal(saveAfterRetry.run_id, saveBeforeRetry.run_id);
+  assert.equal(saveAfterRetry.resource_id, saveBeforeRetry.resource_id);
+  assert.equal(fs.statSync(savedPathBeforeRetry).mtimeMs, savedStatBeforeRetry.mtimeMs);
+  assert.deepEqual(intake.show(failingPrepared.run_id).execution_receipt, executionBeforeRetry);
+});
+
+test('Import save survives server restart for Undo and Redo', async (t) => {
+  fs.mkdirSync(testRoot,{recursive:true});const root=fs.mkdtempSync(path.join(testRoot,'import-restart-'));const stateDir=path.join(root,'state');const workspace=path.join(root,'workspace');const projectRoot=path.join(workspace,'Project');fs.mkdirSync(path.join(projectRoot,'Data'),{recursive:true});const source=write(path.join(root,'incoming','source.txt'),'restart source');const sourceHash=contentFileFingerprint(source).sha256;const registry=new Registry({stateDir});const adopted=registry.adoptRoot({rootPath:workspace,rootType:'project_workspace',contentPolicy:'bounded_content'});const project=registry.create({name:'Project',currentPath:'Project'});registry.attachRoot(project.project_id,{rootId:adopted.root_id,relativePath:'Project',reason:'restart'});const control=createResourceControl({stateDir,ledger:registry.ledger});
+  const fingerprint=contentFileFingerprint(source);const inspection=inspectContent({stateDir,projectRoot:path.resolve('.'),installationRoot:path.resolve('.'),filePath:source,purpose:'content',maxCharacters:4000,pythonPath:'test',runProcess:()=>({status:0,stdout:JSON.stringify({schema:CONTENT_INSPECTION_SCHEMA,purpose:'content',source:fingerprint,selection:{sheet:null},extraction:{status:'success',type:'text',characters:fingerprint.bytes},attention:{maximum_characters:4000,truncated:false},processor:{version:CONTENT_PROCESSOR_VERSION}}),stderr:''})});const work=upsertRecentWork({stateDir,filePath:source,inspect:{purpose:'content',sheet:null,maxCharacters:4000},sourceFingerprint:fingerprint,inspectionId:inspection.inspection_id,cacheReference:path.relative(stateDir,inspection.cache_path),resourceId:control.identify({filePath:source}).resource_id});const intake=new Intake({stateDir});const importer=createProjectImportService({stateDir,registry,intake});const prepared=importer.prepare({work,projectId:project.project_id,folder:'Data'});const saved=await runUiContentOperation('project-import-save',{stateDir,imported:prepared});const target=saved.file_path;const targetHash=contentFileFingerprint(target).sha256;intake.dispose();control.dispose();
+  const open=()=>{const freshIntake=new Intake({stateDir});const freshControl=createResourceControl({stateDir});return {freshIntake,freshControl,server:startAtlasUiServer({stateDir,...serverServices(registry),intake:freshIntake,resourceControl:freshControl})};};let first=open();const server1=await first.server;try{const html=await (await fetch(`${server1.workspace_url}files/result/${work.work_id}`)).text();const csrf=html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1];const response=await fetch(`${server1.workspace_url}files/add-to-project/undo`,{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({csrf,work_id:work.work_id}),redirect:'manual'});const body=await response.text();assert.equal(response.status,303,body.match(/<p>([^<]+)/u)?.[1]??body.slice(-500));}finally{await server1.close();first.freshControl.dispose();first.freshIntake.dispose();}
+  let undone=readRecentWorkState(stateDir).items.find(x=>x.work_id===work.work_id);assert.equal(fs.existsSync(target),false);assert.equal(contentFileFingerprint(source).sha256,sourceHash);assert.equal(undone.file_path,source);assert.equal(undone.project_transfer.status,'undone');assert.equal(undone.project_transfer.redo_available,true);
+  const second=open();const server2=await second.server;try{const html=await (await fetch(`${server2.workspace_url}files/result/${work.work_id}`)).text();assert.match(html,/Redo Add to Project/u);const csrf=html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1];const response=await fetch(`${server2.workspace_url}files/add-to-project/redo`,{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({csrf,work_id:work.work_id}),redirect:'manual'});assert.equal(response.status,303);}finally{await server2.close();second.freshControl.dispose();second.freshIntake.dispose();}
+  assert.equal(contentFileFingerprint(source).sha256,sourceHash);assert.equal(contentFileFingerprint(target).sha256,targetHash);registry.dispose();fs.rmSync(root,{recursive:true,force:true,maxRetries:5,retryDelay:20});
 });
 
 test('Recent Work serializes a worker update with a concurrent UI removal', async (t) => {
@@ -1970,12 +2421,46 @@ test('Unsupported files do not consume Project Compare result slots', (t) => {
 });
 
 test('Projects Home keeps an unavailable registered Project visible without an Open action', () => {
-  const html = renderProjectsHomeView({ projects: [{ id: 'p1', name: 'Unavailable Project', folder: 'F:\\missing', folder_display: 'missing', folder_available: false, folder_issue: 'This Project folder is no longer at its recorded location.', relink_href: '/projects/p1/relink' }] });
+  const html = renderProjectsHomeView({ projects: [{ id: 'p1', name: 'Unavailable Project', folder: 'F:\\missing', folder_display: 'missing', folder_available: false, folder_issue: 'This Project folder is no longer at its recorded location.', relink_href: '/projects/p1/relink', remove_href: '/projects/p1/remove' }] });
   assert.match(html, /Folder unavailable/u);
   assert.match(html, /This Project folder is no longer at its recorded location\./u);
   assert.match(html, /href="\/projects\/p1\/relink">Relink/u);
+  assert.match(html, /href="\/projects\/p1\/remove">Remove from Atlas/u);
   assert.doesNotMatch(html, /F:\\missing/u);
   assert.doesNotMatch(html, />Open</u);
+});
+
+test('Unavailable Project removal archives only the Atlas record after one confirmation', async (t) => {
+  const root = temporaryDirectory(t);
+  let projectStatus = 'active';
+  const project = { id: 'missing-project', name: 'Missing Project', status: projectStatus };
+  const registry = {
+    list: () => [{ ...project, status: projectStatus }],
+    show: () => ({ ...project, status: projectStatus, location: null }),
+    evolve: (projectId, options) => {
+      assert.equal(projectId, project.id);
+      assert.equal(options.status, 'archived');
+      projectStatus = 'archived';
+      return { project_id: projectId, status: projectStatus, semantic_only: true, source_changes: [] };
+    },
+  };
+  const server = await startAtlasUiServer({ stateDir: path.join(root, 'state'), ...serverServices(registry) });
+  t.after(() => server.close());
+  const home = await (await fetch(`${server.workspace_url}projects`)).text();
+  assert.match(home, /href="\/projects\/missing-project\/remove">Remove from Atlas/u);
+  const review = await (await fetch(`${server.workspace_url}projects/missing-project/remove`)).text();
+  assert.match(review, /Remove Missing Project from Atlas/u);
+  assert.match(review, /does not delete any local files/u);
+  const csrf = review.match(/name="csrf" value="([^"]+)"/u)?.[1];
+  assert.ok(csrf);
+  const response = await fetch(`${server.workspace_url}projects/missing-project/remove/confirm`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ csrf }), redirect: 'manual',
+  });
+  assert.equal(response.status, 303);
+  assert.equal(projectStatus, 'archived');
+  const after = await (await fetch(`${server.workspace_url}projects`)).text();
+  assert.doesNotMatch(after, /Missing Project/u);
 });
 
 test('Projects Home uses whole-row links and real recent resources instead of dashboard counts', () => {
@@ -2019,11 +2504,33 @@ test('Project Relink verifies a moved folder through the existing Registry recov
 });
 
 function serverServices(registry) {
+  const ids = new Map();
+  const resourceControl = {
+    ledger: { db: { prepare: () => ({ get: () => ({ id: 'test-project' }) }) } },
+    identify({ filePath }) { const key = path.resolve(filePath); if (!ids.has(key)) ids.set(key, `RES-test-${ids.size + 1}`); return { resource_id: ids.get(key), locations: [], relationships: [] }; },
+    recordSave({ saveId, target }) { const identified = this.identify({ filePath: target.path }); return { resource_id: identified.resource_id, relationships: [] }; },
+    projectResources: () => [],
+    dispose() {},
+  };
   return {
-    registry, rules: {}, runtime: {}, task: {}, guarded: {}, derived: {}, intake: {}, lifecycle: {},
+    registry, rules: {}, runtime: {}, intake: {},
     projectRoot: path.resolve('.'), installationRoot: path.resolve('.'),
+    resourceControl,
   };
 }
+
+test('removed Task and Context pages stay unavailable in the current Desktop server', async (t) => {
+  const root = temporaryDirectory(t);
+  const registry = { list: () => [], show: () => null };
+  const server = await startAtlasUiServer({ stateDir: path.join(root, 'state'), ...serverServices(registry) });
+  t.after(() => server.close());
+
+  for (const route of ['tasks', 'tasks/TSK-old', 'contexts/CTX-0123456789abcdef01234567']) {
+    const response = await fetch(`${server.workspace_url}${route}`);
+    assert.equal(response.status, 404);
+    assert.match(await response.text(), /does not exist/u);
+  }
+});
 
 test('Projects route remains available when one registered folder is missing', async (t) => {
   const root = temporaryDirectory(t);
@@ -2040,6 +2547,29 @@ test('Projects route remains available when one registered folder is missing', a
   assert.doesNotMatch(response.headers.get('content-security-policy'), /unsafe-eval/u);
   assert.match(html, /Missing Project/u);
   assert.match(html, /Folder unavailable/u);
+});
+
+test('Resource visibility route refreshes only scoped facts for resource_id focus', async (t) => {
+  const root = temporaryDirectory(t); const stateDir = path.join(root, 'state'); const projectRoot = path.join(root, 'project'); write(path.join(projectRoot, 'Data', 'disk.md'), 'disk');
+  const project = { id: 'project-a', name: 'Project A', status: 'active' }; const calls = [];
+  const resourceControl = { ledger: { db: { prepare: () => ({ get: () => ({ id: 'project-a' }) }) } }, identify: () => ({ resource_id: 'RES-test' }), recordSave: () => ({ resource_id: 'RES-test', relationships: [] }), dispose() {}, projectResources(projectId, options) { calls.push({ projectId, options }); return [{ resource_id: 'RES-a', resource: { display_name: 'A reference', status: 'active' }, locations: [], relationships: [], relationship_to_project: 'used_by', relationship_label: 'Used by', path: 'C:/external/a.md' }]; } };
+  const registry = { list: () => [project], show: () => ({ ...project, location: { root_path: projectRoot, relative_path: '' } }), resolvePath: () => ({ project: null }) };
+  const server = await startAtlasUiServer({ stateDir, ...serverServices(registry), resourceControl }); t.after(async () => { await server.close(); });
+  const focused = await (await fetch(`${server.workspace_url}projects/project-a/resources?resource_id=RES-a`)).text(); assert.match(focused, /RES-a/u); assert.deepEqual(calls[0], { projectId: 'project-a', options: { refresh: true } });
+  const denied = await (await fetch(`${server.workspace_url}projects/project-a/resources?resource_id=RES-b`)).text(); assert.match(denied, /unavailable/u); assert.doesNotMatch(denied, /Project B|b\.md/u);
+});
+
+test('Resource recovery actions route executes only scoped, CSRF-verified core actions', async (t) => {
+  const root = temporaryDirectory(t); const stateDir = path.join(root, 'state'); const workspace = path.join(root, 'workspace'); const aRoot = path.join(workspace, 'Project A'); const bRoot = path.join(workspace, 'Project B'); const missingPath = write(path.join(aRoot, 'Data', 'missing.md'), 'old'); fs.mkdirSync(bRoot, { recursive: true }); const storedPath = write(path.join(aRoot, 'Data', 'stored.md'), 'stored'); const replacement = write(path.join(root, 'outside', 'replacement.md'), 'replacement'); const reference = write(path.join(root, 'outside', 'reference.md'), 'reference'); const removedReference = write(path.join(root, 'outside', 'removed.md'), 'removed'); const bReference = write(path.join(root, 'outside', 'b.md'), 'b');
+  const registry = new Registry({ stateDir }); const adopted = registry.adoptRoot({ rootPath: workspace, rootType: 'project_workspace', contentPolicy: 'bounded_content' }); const a = registry.create({ name: 'Project A', currentPath: 'Project A' }); const b = registry.create({ name: 'Project B', currentPath: 'Project B' }); registry.attachRoot(a.project_id, { rootId: adopted.root_id, relativePath: 'Project A', reason: 'Resource action route A.' }); registry.attachRoot(b.project_id, { rootId: adopted.root_id, relativePath: 'Project B', reason: 'Resource action route B.' }); const resourceControl = createResourceControl({ stateDir, ledger: registry.ledger }); const missing = resourceControl.identify({ filePath: missingPath, project: { id: a.project_id } }); fs.rmSync(missingPath); resourceControl.projectResources(a.project_id, { refresh: true }); const stored = resourceControl.identify({ filePath: storedPath, project: { id: a.project_id } }); const first = resourceControl.identify({ filePath: reference }); const second = resourceControl.identify({ filePath: removedReference }); const foreign = resourceControl.identify({ filePath: bReference }); const caller = { tool: 'test', client_run_id: 'route-setup' };
+  const [storedRelation] = resourceControl.submitRelationships({ caller, candidates: [{ source_resource_id: stored.resource_id, target: { kind: 'project', id: a.project_id }, type: 'stored_in', evidence: { location: 'known' } }] }); const [forgotten] = resourceControl.submitRelationships({ caller, candidates: [{ source_resource_id: first.resource_id, target: { kind: 'project', id: a.project_id }, type: 'used_by', evidence: { reason: 'explicit' } }] }); const [removed] = resourceControl.submitRelationships({ caller, candidates: [{ source_resource_id: second.resource_id, target: { kind: 'project', id: a.project_id }, type: 'used_by', evidence: { reason: 'explicit' } }] }); const [foreignRelation] = resourceControl.submitRelationships({ caller, candidates: [{ source_resource_id: foreign.resource_id, target: { kind: 'project', id: b.project_id }, type: 'used_by', evidence: { reason: 'explicit' } }] });
+  const server = await startAtlasUiServer({ stateDir, desktopPickerEnabled: true, ...serverServices(registry), resourceControl }); t.after(async () => { await server.close(); resourceControl.dispose(); registry.dispose(); });
+  const page = await (await fetch(`${server.workspace_url}projects/${a.project_id}/resources?resource_id=${missing.resource_id}`)).text(); const csrf = page.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1]; assert.ok(csrf);
+  const post = (action, values, csrfValue = csrf) => fetch(`${server.workspace_url}projects/${a.project_id}/resources/actions/${action}`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf: csrfValue, ...values }), redirect: 'manual' });
+  const kept = await post('keep', { resource_id: missing.resource_id }); assert.equal(kept.status, 303, await kept.text()); assert.match(kept.headers.get('location') ?? '', new RegExp(`resource_id=${missing.resource_id}`, 'u')); assert.equal(resourceControl.describe(missing.resource_id).resource.status, 'missing'); assert.equal(resourceControl.describe(missing.resource_id).actions.at(-1).action_type, 'keep_record');
+  const registered = await fetch(server.desktop_picker.registration_url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-atlas-desktop-token': server.desktop_picker.token }, body: new URLSearchParams({ file_path: replacement, kind: 'file', mode: 'single' }) }); const selection = await registered.json(); const relinked = await post('relink', { resource_id: missing.resource_id, selection_id: selection.selection_id }); assert.equal(relinked.status, 303, await relinked.text()); assert.equal(resourceControl.describe(missing.resource_id).locations.find((item) => item.status === 'active').path, path.resolve(replacement)); assert.equal(fs.readFileSync(replacement, 'utf8'), 'replacement');
+  const forgot = await post('forget', { resource_id: first.resource_id, relationship_id: forgotten.id }); assert.equal(forgot.status, 303); const removedResponse = await post('remove-reference', { resource_id: second.resource_id, relationship_id: removed.id }); assert.equal(removedResponse.status, 303); assert.equal(resourceControl.ledger.resources.relationshipById(forgotten.id).status, 'forgotten'); assert.equal(resourceControl.ledger.resources.relationshipById(removed.id).status, 'removed'); assert.equal(fs.readFileSync(reference, 'utf8'), 'reference'); assert.equal(fs.readFileSync(removedReference, 'utf8'), 'removed');
+  const storedRejected = await post('remove-reference', { resource_id: stored.resource_id, relationship_id: storedRelation.id }); assert.equal(storedRejected.status, 400); assert.equal(resourceControl.ledger.resources.relationshipById(storedRelation.id).status, 'active'); const foreignRejected = await post('forget', { resource_id: foreign.resource_id, relationship_id: foreignRelation.id }); assert.equal(foreignRejected.status, 400); assert.equal(resourceControl.ledger.resources.relationshipById(foreignRelation.id).status, 'active'); const actionCount = resourceControl.describe(missing.resource_id).actions.length; const badCsrf = await post('keep', { resource_id: missing.resource_id }, 'bad'); assert.equal(badCsrf.status, 403); const expired = await post('relink', { resource_id: missing.resource_id, selection_id: 'SEL-00000000000000000000000000000000' }); assert.equal(expired.status, 400); assert.equal(resourceControl.describe(missing.resource_id).actions.length, actionCount);
 });
 
 test('Activity exposes local live updates and a replaceable fragment without whole-page refresh', async (t) => {
@@ -2100,6 +2630,28 @@ test('Opening a Project enters its Resource tree workspace', async (t) => {
 
   assert.equal(response.status, 303);
   assert.equal(response.headers.get('location'), '/projects/project-1/resources');
+});
+
+test('Resources folder fragment loads the selected directory beyond the bounded initial result', async (t) => {
+  const root = temporaryDirectory(t);
+  const projectRoot = path.join(root, 'project');
+  for (let index = 0; index < 170; index += 1) write(path.join(projectRoot, 'bulk', `file-${String(index).padStart(3, '0')}.md`), 'fixture');
+  write(path.join(projectRoot, 'test', '.tmp', 'v17-data-source.csv'), 'name,value\nAtlas,1\n');
+  const project = { id: 'project-1', name: 'Project One', status: 'active' };
+  const registry = {
+    list: () => [project],
+    show: () => ({ ...project, location: { root_path: projectRoot, relative_path: '' } }),
+  };
+  const server = await startAtlasUiServer({ stateDir: path.join(root, 'state'), ...serverServices(registry) });
+  t.after(() => server.close());
+
+  const response = await fetch(`${server.workspace_url}projects/project-1/resources?folder=test%2F.tmp&fragment=folder-files`);
+  const html = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type') ?? '', /text\/html/u);
+  assert.match(html, /^<section class="workspace-folder-files" data-folder-files="test\/\.tmp" data-folder-loaded="true"/u);
+  assert.match(html, /data-resource-name="v17-data-source\.csv"/u);
+  assert.doesNotMatch(html, /<!doctype html>/u);
 });
 
 test('Project Compare route stays in the shell, filters choices, and rejects the same file', async (t) => {

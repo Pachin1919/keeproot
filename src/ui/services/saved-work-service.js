@@ -1,29 +1,30 @@
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { contentFileFingerprint } from '../../content-inspection.js';
 import { projectPath } from '../project-files.js';
 
 function statePath(stateDir) { return path.join(path.resolve(stateDir), 'ui', 'saved-work.json'); }
-function samePath(left, right) { return process.platform === 'win32' ? path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase() : path.resolve(left) === path.resolve(right); }
-function writeState(stateDir, items) {
-  const target = statePath(stateDir); fs.mkdirSync(path.dirname(target), { recursive: true });
-  const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
-  try { fs.writeFileSync(temporary, `${JSON.stringify({ items }, null, 2)}\n`, 'utf8'); fs.renameSync(temporary, target); } finally { fs.rmSync(temporary, { force: true }); }
-}
-function writeRecoveryState(stateDir, issue) {
-  const target = path.join(path.resolve(stateDir), 'ui', 'saved-work-recovery.json');
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
-  try {
-    fs.writeFileSync(temporary, `${JSON.stringify({ issue }, null, 2)}\n`, 'utf8');
-    fs.renameSync(temporary, target);
-  } finally {
-    fs.rmSync(temporary, { force: true });
-  }
-}
 function validRecord(value) {
-  if (!value || !/^SWR-[a-f0-9-]{36}$/u.test(value.work_id ?? '') || typeof value.result_path !== 'string' || typeof value.source_path !== 'string') return null;
+  if (!value) return null;
+  // V1.7 Save Service owns current writes.  Historical SWR rows remain readable.
+  if (typeof value.save_id === 'string' && value.target) {
+    const fingerprint = value.verification?.sha256 ? {
+      file_path: value.target.path, sha256: value.verification.sha256,
+      bytes: value.candidate?.bytes ?? null,
+    } : null;
+    return {
+      ...value,
+      work_id: value.save_id,
+      result_path: value.target.path ?? null,
+      result_fingerprint: fingerprint,
+      source_path: value.source?.path ?? value.candidate?.path ?? value.target.path ?? null,
+      source_fingerprint: value.source?.fingerprint ?? value.candidate ?? null,
+      created_at: value.executed_at ?? value.created_at,
+      parameters: value.parameters ?? {}, result_summary: value.result_summary ?? {},
+      write: { target_path: value.target.path ?? null, verified_at: value.verification?.verified_at ?? null, undo_available: value.undo_available === true, redo_available: value.redo_available === true },
+    };
+  }
+  if (!/^SWR-[a-f0-9-]{36}$/u.test(value.work_id ?? '') || typeof value.result_path !== 'string' || typeof value.source_path !== 'string') return null;
   return value;
 }
 export function readSavedWorkState(stateDir) {
@@ -34,9 +35,10 @@ export function readSavedWorkState(stateDir) {
     return { items, error: null };
   } catch (error) { return error.code === 'ENOENT' ? { items: [], error: null } : { items: [], error: new Error('Saved Work could not be loaded.') }; }
 }
-function writable(stateDir) { const result = readSavedWorkState(stateDir); if (result.error) throw result.error; return result.items; }
 function regularDirectory(directory) { const stat = fs.lstatSync(directory); if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Destination folder is unavailable or linked outside this Project.'); }
-function destination(projectRoot, folder, fileName, sourcePath = null) {
+function destination(projectRoot, folder, fileName, sourcePath = null, checkExists = true) {
+  const selectedFolder = String(folder ?? '').trim();
+  if (!selectedFolder || selectedFolder === '.') throw new Error('Choose an existing destination folder in this Project.');
   let cleanName = String(fileName ?? '').trim();
   if (!cleanName || cleanName !== path.basename(cleanName) || cleanName.includes('\0')) throw new Error('Enter one file name.');
   const expectedExtension = path.extname(sourcePath ?? '').toLowerCase();
@@ -48,19 +50,20 @@ function destination(projectRoot, folder, fileName, sourcePath = null) {
       throw new Error(`This Data Work produces a ${format} result. Use a file name ending in ${expectedExtension}.`);
     }
   }
-  const folderPath = projectPath(projectRoot, folder ?? ''); regularDirectory(folderPath);
+  const folderPath = projectPath(projectRoot, selectedFolder); regularDirectory(folderPath);
+  if (path.resolve(folderPath) === path.resolve(projectRoot)) throw new Error('Choose an existing destination folder in this Project.');
   const target = path.resolve(folderPath, cleanName);
   const relative = path.relative(path.resolve(projectRoot), target);
   if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Destination is outside this Project.');
-  if (fs.existsSync(target)) { const error = new Error('File already exists. Choose a different name.'); error.code = 'ATLAS_STATE_CONFLICT'; throw error; }
+  if (checkExists && fs.existsSync(target)) { const error = new Error('File already exists. Choose a different name.'); error.code = 'ATLAS_STATE_CONFLICT'; throw error; }
   return target;
 }
 
-export function createSavedWorkService({ stateDir, writeStateFn = writeState }) {
+export function createSavedWorkService({ stateDir, saveService = null }) {
   const stateForProject = (projectId) => {
     const state = readSavedWorkState(stateDir);
     return {
-      items: state.items.filter((item) => item.status === 'active' && item.project?.id === projectId),
+      items: state.items.filter((item) => (['active', 'executed'].includes(item.status) || (item.status === 'undone' && item.write?.redo_available === true)) && item.project?.id === projectId),
       error: state.error,
     };
   };
@@ -69,92 +72,39 @@ export function createSavedWorkService({ stateDir, writeStateFn = writeState }) 
     if (state.error) throw state.error;
     return state.items;
   };
-  const find = (workId) => readSavedWorkState(stateDir).items.find((item) => item.work_id === workId) ?? null;
+  const find = (workId) => readSavedWorkState(stateDir).items.find((item) => item.work_id === workId || item.save_id === workId) ?? null;
+  const activityItems = () => readSavedWorkState(stateDir).items.filter((item) => item.save_id && item.status === 'executed').map((item) => ({
+    activity_id: item.save_id, work_id: item.save_id, save_id: item.save_id, file_path: item.result_path,
+    project: item.project, initiated_by: { channel: item.channel === 'host' ? 'host' : 'desktop', agent: item.caller?.tool ?? null }, caller: item.caller ?? null,
+    channel: item.channel ?? 'work', status: 'completed', updated_at: item.executed_at ?? item.created_at,
+    inspected_at: item.executed_at ?? item.created_at, executed_at: item.executed_at ?? item.created_at,
+    result_summary: item.result_summary ?? {}, verification: item.verification ?? null,
+    resource_href: item.resources_href, resources_href: item.resources_href,
+    resource_id: item.resource_id ?? null,
+  }));
   const prepareDestination = ({ projectRoot, folder, fileName, sourcePath }) => destination(projectRoot, folder, fileName, sourcePath);
-  const save = ({ project, projectRoot, folder, fileName, stagedPath, sourcePath, sourceFingerprint, parameters, resultSummary }) => {
+  const save = ({ project, projectRoot, root = projectRoot, target: targetInput = null, folder, fileName, stagedPath, expectedCandidateHash = null, sourcePath, sourceFingerprint, sourceResourceId = null, parameters, resultSummary, requestKey = null, caller = {} }) => {
+    if (!saveService) throw new Error('The Atlas Save Service is unavailable for current saves.');
     const current = contentFileFingerprint(sourcePath);
     if (current.sha256 !== sourceFingerprint.sha256) { const error = new Error('The original file changed while this Data Work was open. Review it before saving.'); error.code = 'ATLAS_STATE_CONFLICT'; throw error; }
-    const stage = contentFileFingerprint(stagedPath);
-    const target = destination(projectRoot, folder, fileName, sourcePath);
-    const temporary = path.join(path.dirname(target), `.${path.basename(target)}.atlas-${crypto.randomUUID()}.tmp`);
-    try {
-      fs.copyFileSync(stage.file_path, temporary, fs.constants.COPYFILE_EXCL);
-      const copied = contentFileFingerprint(temporary);
-      if (copied.sha256 !== stage.sha256 || copied.bytes !== stage.bytes) throw new Error('Atlas could not verify the staged result before saving.');
-      if (fs.existsSync(target)) { const error = new Error('File already exists. Choose a different name.'); error.code = 'ATLAS_STATE_CONFLICT'; throw error; }
-      fs.renameSync(temporary, target);
-      const result = contentFileFingerprint(target);
-      if (result.sha256 !== stage.sha256 || result.bytes !== stage.bytes) throw new Error('Atlas could not verify the saved result.');
-      const record = { work_id: `SWR-${crypto.randomUUID()}`, project: { id: project.id, name: project.name }, result_path: result.file_path, result_fingerprint: result, source_path: current.file_path, source_fingerprint: sourceFingerprint, operation_type: 'data_transform', parameters, result_summary: resultSummary, created_at: new Date().toISOString(), write: { target_path: result.file_path, verified_at: new Date().toISOString(), undo_available: true }, status: 'active' };
-      try {
-        const items = writable(stateDir); writeStateFn(stateDir, [record, ...items]); return record;
-      } catch (error) {
-        let rollbackError = null;
-        try {
-          const currentTarget = contentFileFingerprint(target);
-          if (currentTarget.sha256 !== result.sha256) throw new Error('The newly saved file changed before Atlas could remove it.');
-          fs.rmSync(target, { force: false });
-        } catch (caught) {
-          rollbackError = caught;
-        }
-        if (!rollbackError) throw error;
-        {
-          try {
-            writeRecoveryState(stateDir, {
-              operation: 'save', status: 'partial', result_path: target,
-              error: error.message, rollback_error: rollbackError.message,
-              recorded_at: new Date().toISOString(),
-            });
-          } catch { /* The explicit error below still reports the partial state. */ }
-          const partial = new Error(`Partial save: the result file was created, but Created Work could not be updated and Atlas could not remove the file. ${rollbackError.message}`);
-          partial.code = 'ATLAS_PARTIAL_STATE'; partial.cause = error; throw partial;
-        }
-      }
-    } finally { fs.rmSync(temporary, { force: true }); }
+    const resolvedTarget = destination(projectRoot, folder, fileName, sourcePath, false);
+    const targetPath = path.relative(root, resolvedTarget).replaceAll('\\', '/');
+    if (targetInput && String(targetInput).replaceAll('\\', '/') !== targetPath) throw new Error('Destination does not match the selected Project folder.');
+    const prepared = saveService.prepare({ root, candidateFile: stagedPath, expectedCandidateHash, projectId: project.id, target: targetPath,
+      inputs: [current.file_path],
+      origin: 'agent_generated', kind: 'intermediate', channel: 'work', requestKey: requestKey ?? `${Date.now()}`,
+      caller, source: { path: current.file_path, fingerprint: sourceFingerprint, ...(sourceResourceId ? { resource_id: sourceResourceId } : {}) }, parameters, resultSummary,
+      intent: 'Save one reviewed Data Work result.' });
+    const result = saveService.execute(prepared.save_id, { reason: 'User confirmed this Data Work result.' });
+    return validRecord(readSavedWorkState(stateDir).items.find((item) => item.save_id === result.save_id) ?? { ...result, source: { path: current.file_path, fingerprint: sourceFingerprint }, parameters, result_summary: resultSummary });
   };
   const undo = (workId) => {
-    const items = writable(stateDir); const index = items.findIndex((item) => item.work_id === workId && item.status === 'active');
-    if (index < 0) throw new Error('This saved result is no longer available for Undo.');
-    const record = items[index];
-    const current = contentFileFingerprint(record.result_path);
-    if (current.sha256 !== record.result_fingerprint?.sha256) throw new Error('The saved result changed after Atlas created it, so Atlas will not remove it.');
-    const backup = path.join(path.dirname(record.result_path), `.${path.basename(record.result_path)}.atlas-undo-${crypto.randomUUID()}.tmp`);
-    let keepBackup = false;
-    try {
-      fs.copyFileSync(record.result_path, backup, fs.constants.COPYFILE_EXCL);
-      if (contentFileFingerprint(backup).sha256 !== current.sha256) throw new Error('Atlas could not prepare a verified Undo recovery copy.');
-      fs.rmSync(record.result_path, { force: false });
-      if (fs.existsSync(record.result_path)) throw new Error('Atlas could not verify removal of the saved result.');
-      const undone = { ...record, status: 'undone', write: { ...record.write, undo_available: false, undone_at: new Date().toISOString() } };
-      items[index] = undone;
-      try {
-        writeStateFn(stateDir, items);
-        return undone;
-      } catch (error) {
-        try {
-          if (fs.existsSync(record.result_path)) throw new Error('The result path is no longer free for recovery.');
-          fs.renameSync(backup, record.result_path);
-          if (contentFileFingerprint(record.result_path).sha256 !== current.sha256) throw new Error('Atlas could not verify the restored result.');
-          const stopped = new Error(`Undo was not completed because Created Work could not be updated. The result file was restored. ${error.message}`);
-          stopped.code = 'ATLAS_STATE_CONFLICT'; stopped.cause = error; throw stopped;
-        } catch (restoreError) {
-          if (restoreError.code === 'ATLAS_STATE_CONFLICT') throw restoreError;
-          keepBackup = fs.existsSync(backup);
-          try {
-            writeRecoveryState(stateDir, {
-              operation: 'undo', status: 'partial', work_id: record.work_id,
-              result_path: record.result_path, recovery_copy: keepBackup ? backup : null,
-              error: error.message, rollback_error: restoreError.message,
-              recorded_at: new Date().toISOString(),
-            });
-          } catch { /* The explicit error below still reports the partial state. */ }
-          const partial = new Error(`Partial Undo: the result file was removed, Created Work could not be updated, and Atlas could not restore the file. ${restoreError.message}`);
-          partial.code = 'ATLAS_PARTIAL_STATE'; partial.cause = error; throw partial;
-        }
-      }
-    } finally {
-      if (!keepBackup) fs.rmSync(backup, { force: true });
-    }
+    if (!saveService) throw new Error('The Atlas Save Service is unavailable for current Undo.');
+    return saveService.undo(workId);
   };
-  return { stateForProject, listForProject, find, prepareDestination, save, undo };
+  const redo = (workId) => {
+    if (!saveService) throw new Error('The Atlas Save Service is unavailable for current Redo.');
+    return saveService.redo(workId);
+  };
+  return { stateForProject, listForProject, find, activityItems, prepareDestination, save, undo, redo };
 }

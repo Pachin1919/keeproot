@@ -6,6 +6,7 @@ import {
   runDataWork,
 } from '../content-inspection.js';
 import { Intake } from '../intake.js';
+import { createSaveService } from '../save-service.js';
 import { saveProjectImport } from './services/project-import-service.js';
 
 function execute(operation, args) {
@@ -24,10 +25,11 @@ function execute(operation, args) {
   if (operation === 'data-work') return runDataWork(args);
   if (operation === 'project-import-save') {
     const intake = new Intake({ stateDir: args.stateDir });
+    const saveService = createSaveService({ stateDir: args.stateDir, intake });
     try {
-      return saveProjectImport({ stateDir: args.stateDir, intake, imported: args.imported });
+      return saveProjectImport({ stateDir: args.stateDir, saveService, imported: args.imported });
     } finally {
-      intake.dispose();
+      saveService.dispose();
     }
   }
   throw new Error(`Unsupported Atlas UI content operation: ${operation}`);

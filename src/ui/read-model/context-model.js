@@ -68,35 +68,6 @@ function ruleHistorySummary(history, projectId) {
   };
 }
 
-function normalizeTask(task) {
-  return {
-    task_id: task.task_id,
-    task_status: task.task_status,
-    intent: task.intent,
-    target: task.target,
-    strategy: task.strategy,
-    write_mode: task.write_mode,
-    write_status: task.write_status,
-    started_at: task.started_at,
-    closed_at: task.closed_at ?? null,
-    rolled_back_at: task.rolled_back_at ?? null,
-    primary_source: task.primary_source ?? null,
-    selected_source_count: task.selected_source_count ?? 0,
-    source_set_id: task.source_set_id ?? null,
-    source_freshness: task.source_set_id
-      ? { status: 'not_checked', reason_code: 'explicit_refresh_required' }
-      : { status: 'unavailable', reason_code: 'task_has_no_source_set' },
-  };
-}
-
-function tasksForProject(registry, projectId) {
-  const repository = registry.ledger?.tasks;
-  const all = repository?.listForUiByProject
-    ? repository.listForUiByProject(projectId, { limit: 500 })
-    : (repository?.listPendingByProject(projectId, { limit: 8 }) ?? []);
-  return all.map(normalizeTask);
-}
-
 function recentWorkForProject(recentWork, projectId) {
   return recentWork
     .filter((item) => item.project?.id === projectId)
@@ -115,8 +86,6 @@ function recentWorkForProject(recentWork, projectId) {
 }
 
 function projectEntry(registry, activeRules, ruleHistory, project, location, relationship, recentWork) {
-  const tasks = tasksForProject(registry, project.id);
-  const pending = tasks.filter((task) => !['completed', 'rolled_back', 'rejected', 'cancelled', 'blocked'].includes(task.task_status));
   let file_preview = [];
   try {
     const root = projectDirectory(location);
@@ -126,10 +95,6 @@ function projectEntry(registry, activeRules, ruleHistory, project, location, rel
     relationship,
     project,
     location,
-    task_status: pending.length ? `${pending[0].task_status} / ${pending[0].task_id}` : 'idle',
-    pending_tasks: pending,
-    tasks,
-    task_history_truncated: tasks.length >= 500,
     routes: rulesForProject(activeRules, project.id),
     rule_history: ruleHistorySummary(ruleHistory, project.id),
     recent_work: recentWorkForProject(recentWork, project.id),

@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { locateAnalyticsPython } from './analytics-evaluation.js';
+import { locateContentPython } from './python-runtime.js';
 
 // Host and Desktop consumers share this application service and the same Python
 // delimited-file reader. Data Workspace is a local representation, not a second
@@ -95,10 +95,10 @@ export function prepareDataWorkspace({
       // Rebuild an incomplete or stale local workspace.
     }
   }
-  const executable = pythonPath ?? locateAnalyticsPython({ installationRoot });
+  const executable = pythonPath ?? locateContentPython({ installationRoot });
   if (!executable) {
     const error = new Error(
-      'Atlas local data workspace requires the optional Python component. Run atlas analytics install first.',
+      'Atlas local data workspace requires the installed Desktop Python component. Run atlas ui install first.',
     );
     error.code = 'ATLAS_CAPABILITY_UNAVAILABLE';
     throw error;

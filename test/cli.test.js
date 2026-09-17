@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { Bootstrap } from '../src/bootstrap.js';
 import { Registry } from '../src/registry.js';
 import { Tracker } from '../src/tracker.js';
+import { createResourceControl } from '../src/resource-control.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cliPath = path.join(projectRoot, 'bin', 'atlas.js');
@@ -65,124 +66,129 @@ test('CLI lists verified Ledger backups and restores only with the current canon
   assert.equal(cli(stateDir, ['doctor', '--json']).status, 0);
 });
 
-test('CLI exposes the bounded Task Contract create and rollback flow', () => {
-  const { caseRoot, vault, stateDir } = setup('cli-task-contract');
-  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Sources'), { recursive: true });
-  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Outputs'), { recursive: true });
-  fs.writeFileSync(path.join(vault, 'Projects', 'Atlas', 'Sources', 'source.md'), 'bounded source\n', 'utf8');
-  const bootstrap = new Bootstrap({ stateDir });
-  const scan = bootstrap.scan({ root: vault, scanMode: 'structure' });
-  const contract = bootstrap.contract(scan.scan_id, { profileId: 'project-work' });
-  bootstrap.adoptContract(scan.scan_id, {
-    contractId: contract.contract_id, profileId: 'project-work', reason: 'CLI Task fixture.',
-  });
-  bootstrap.dispose();
+test('CLI rejects removed Task and Analytics namespaces without creating state', () => {
+  const { stateDir } = setup('cli-removed-namespaces');
+  for (const command of [['task', 'show', 'TSK-old'], ['analytics', 'export']]) {
+    const result = cli(stateDir, [...command, '--json']);
+    assert.equal(result.status, 1);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.error.code, 'ATLAS_INVALID_ARGUMENT');
+    assert.match(envelope.error.message, /Unknown command/u);
+  }
+});
+
+test('installed product help and capabilities hide direct internal write engines', () => {
+  const { caseRoot, stateDir } = setup('cli-installed-product-boundary');
+  const installedEnv = { ATLAS_HOME: path.join(caseRoot, 'installed-atlas') };
+
+  const helpResult = cli(stateDir, ['--json'], installedEnv);
+  assert.equal(helpResult.status, 0, helpResult.stderr);
+  const help = JSON.parse(helpResult.stdout).data.usage;
+  assert.match(help, /atlas save prepare/u);
+  assert.doesNotMatch(help, /atlas (guarded|derive|intake) /u);
+
+  const capabilityResult = cli(stateDir, ['capabilities', '--json'], installedEnv);
+  assert.equal(capabilityResult.status, 0, capabilityResult.stderr);
+  const capabilities = JSON.parse(capabilityResult.stdout).data;
+  assert.equal(Object.hasOwn(capabilities.workflows, 'guarded'), false);
+  assert.equal(Object.hasOwn(capabilities.workflows, 'derived'), false);
+  assert.equal(Object.hasOwn(capabilities.workflows, 'intake'), false);
+  assert.deepEqual(capabilities.product_entrypoints.internal_foundation.commands, [
+    'bootstrap', 'tracked_direct', 'evolution',
+  ]);
+
+  for (const command of [['guarded', 'preview', 'GRD-old'], ['derive', 'preview', 'DRV-old'], ['intake', 'show', 'INT-old']]) {
+    const result = cli(stateDir, [...command, '--json'], installedEnv);
+    assert.equal(result.status, 1);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.error.code, 'ATLAS_INVALID_ARGUMENT');
+    assert.match(envelope.error.message, /does not expose/u);
+  }
+});
+
+test('CLI Save creates, verifies, undoes, and redoes one Host target', () => {
+  const { caseRoot, vault, stateDir } = setup('cli-save-host-target');
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas'), { recursive: true });
   const registry = new Registry({ stateDir });
   const project = registry.create({ name: 'Atlas', currentPath: 'Projects/Atlas' });
   registry.dispose();
-  const discoveredResult = cli(stateDir, [
-    'task', 'discover', '--root', vault, '--project', project.project_id,
-    '--role', 'source', '--extension', '.md', '--max-candidates', '5', '--json',
-  ]);
-  assert.equal(discoveredResult.status, 0, discoveredResult.stderr);
-  const discovered = JSON.parse(discoveredResult.stdout).data;
-  assert.deepEqual(discovered.candidates.map((item) => item.path), ['Projects/Atlas/Sources/source.md']);
-  assert.equal(discovered.content_files_read, 0);
-  const requestFile = path.join(caseRoot, 'task-request.json');
-  fs.writeFileSync(requestFile, JSON.stringify({
-    intent: 'Create one governed report.',
-    project_id: project.project_id,
-    inputs: [{ path: 'Projects/Atlas/Sources/source.md', required: true }],
-    output: {
-      target: 'Projects/Atlas/Outputs/report.md', role: 'report',
-      data_class: 'generated_output', action: 'auto',
-    },
-  }), 'utf8');
-  const preparedResult = cli(stateDir, ['task', 'prepare', '--root', vault, '--request-file', requestFile, '--json']);
-  assert.equal(preparedResult.status, 0, preparedResult.stderr);
-  const prepared = JSON.parse(preparedResult.stdout).data;
-  assert.equal(prepared.status, 'ready');
-  assert.equal(prepared.read.selected.length, 1);
-  const candidateFile = path.join(caseRoot, 'candidate.md');
-  fs.writeFileSync(candidateFile, '# Governed report\n', 'utf8');
-  const fulfilledResult = cli(stateDir, [
-    'task', 'fulfill', prepared.task_id, '--candidate-file', candidateFile,
-    '--reason', 'Exact Task authorization.', '--json',
-  ]);
-  assert.equal(fulfilledResult.status, 0, fulfilledResult.stderr);
-  const fulfilled = JSON.parse(fulfilledResult.stdout).data;
-  assert.equal(fulfilled.status, 'completed');
-  assert.equal(fulfilled.write_run.mode, 'derived');
-  const shown = cli(stateDir, ['task', 'show', prepared.task_id, '--json']);
-  assert.equal(JSON.parse(shown.stdout).data.run.status, 'completed');
-  const compactShown = cli(stateDir, ['show', fulfilled.write_run.run_id, '--compact', '--json']);
-  assert.equal(compactShown.status, 0, compactShown.stderr);
-  const compactRun = JSON.parse(compactShown.stdout).data;
-  assert.equal(compactRun.compact, true);
-  assert.equal(compactRun.changes.length, 1);
-  assert.equal(Object.hasOwn(compactRun, 'events'), false);
-  assert.equal(Object.hasOwn(compactRun.change_set, 'diff_text'), false);
-  assert.equal(cli(stateDir, ['task', 'rollback', prepared.task_id, '--json']).status, 0);
-  assert.equal(fs.existsSync(path.join(vault, 'Projects', 'Atlas', 'Outputs', 'report.md')), false);
-
-  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Archive'), { recursive: true });
-  const archiveRequest = path.join(caseRoot, 'archive-request.json');
-  fs.writeFileSync(archiveRequest, JSON.stringify({
-    intent: 'Retain and archive the source.',
-    project_id: project.project_id,
-    inputs: [{ path: 'Projects/Atlas/Sources/source.md' }],
-    output: {
-      target: 'Projects/Atlas/Archive/source.md',
-      base_input: 'Projects/Atlas/Sources/source.md',
-      role: 'archive', data_class: 'human_writing', action: 'archive',
-    },
-  }), 'utf8');
-  const archiveTaskResult = cli(stateDir, [
-    'task', 'prepare', '--root', vault, '--request-file', archiveRequest, '--json',
-  ]);
-  assert.equal(archiveTaskResult.status, 0, archiveTaskResult.stderr);
-  const archiveTask = JSON.parse(archiveTaskResult.stdout).data;
-  const archivePlanResult = cli(stateDir, ['task', 'archive-plan', archiveTask.task_id, '--json']);
-  assert.equal(archivePlanResult.status, 0, archivePlanResult.stderr);
-  assert.equal(JSON.parse(archivePlanResult.stdout).data.status, 'prepared');
-  assert.equal(fs.existsSync(path.join(vault, 'Projects', 'Atlas', 'Sources', 'source.md')), true);
-});
-
-test('CLI Intake creates one Agent-proposed target without a Library Contract', () => {
-  const { caseRoot, vault, stateDir } = setup('cli-intake-explicit-target');
-  fs.mkdirSync(path.join(vault, '08 AI聊天记录'), { recursive: true });
-  const registry = new Registry({ stateDir });
-  const project = registry.create({ name: 'AI聊天记录', currentPath: '08 AI聊天记录' });
-  registry.dispose();
   const candidateFile = path.join(caseRoot, 'chat-export.md');
   fs.writeFileSync(candidateFile, '# Chat export\n', 'utf8');
-  const target = '08 AI聊天记录/ChatGPT聊天记录 感情反转分析（2026-07）.md';
+  const target = 'Projects/Atlas/result.md';
 
   const preparedResult = cli(stateDir, [
-    'intake', 'prepare', '--root', vault, '--candidate-file', candidateFile,
+    'save', 'prepare', '--root', vault, '--candidate-file', candidateFile,
     '--origin', 'download', '--kind', 'source', '--project', project.project_id,
-    '--target', target, '--intent', 'Save one classified chat export.', '--json',
+    '--target', target, '--channel', 'host', '--request-key', 'cli-save-host',
+    '--tool', 'atlas-cli-test', '--client-run-id', 'cli-save-host-run', '--intent', 'Save one classified chat export.', '--json',
   ]);
   assert.equal(preparedResult.status, 0, preparedResult.stderr);
   const prepared = JSON.parse(preparedResult.stdout).data;
+  assert.equal(prepared.schema, 'atlas.save-result.v1');
   assert.equal(prepared.status, 'prepared');
-  assert.equal(prepared.target, target);
-  assert.equal(prepared.placement_policy.intake.route_source, 'agent_explicit_target');
+  assert.equal(prepared.run_id, prepared.save_id);
+  assert.equal(prepared.resources_href, `/projects/${project.project_id}/resources?path=result.md`);
 
   const executedResult = cli(stateDir, [
-    'intake', 'execute', prepared.run_id,
+    'save', 'execute', prepared.save_id,
     '--reason', 'The user authorized this exact destination.', '--json',
   ]);
   assert.equal(executedResult.status, 0, executedResult.stderr);
-  assert.equal(JSON.parse(executedResult.stdout).data.verified, true);
+  const executed = JSON.parse(executedResult.stdout).data;
+  assert.equal(executed.save_id, prepared.save_id);
+  assert.equal(executed.run_id, prepared.run_id);
+  assert.equal(executed.verified, true);
   assert.equal(fs.readFileSync(path.join(vault, target), 'utf8'), '# Chat export\n');
+  const shownResult = cli(stateDir, ['save', 'show', prepared.save_id, '--json']);
+  assert.equal(shownResult.status, 0, shownResult.stderr);
+  const shown = JSON.parse(shownResult.stdout).data;
+  assert.equal(shown.save_id, prepared.save_id); assert.equal(shown.target.path, executed.target.path); assert.equal(shown.resources_href, executed.resources_href);
 
-  const rolledBack = cli(stateDir, ['intake', 'rollback', prepared.run_id, '--json']);
+  const rolledBack = cli(stateDir, ['save', 'undo', prepared.save_id, '--json']);
   assert.equal(rolledBack.status, 0, rolledBack.stderr);
   assert.equal(fs.existsSync(path.join(vault, target)), false);
+  const undone = JSON.parse(rolledBack.stdout).data;
+  assert.equal(undone.status, 'undone');
+  assert.equal(undone.redo_available, true);
+
+  const redoneResult = cli(stateDir, ['save', 'redo', prepared.save_id, '--json']);
+  assert.equal(redoneResult.status, 0, redoneResult.stderr);
+  const redone = JSON.parse(redoneResult.stdout).data;
+  assert.equal(redone.save_id, prepared.save_id);
+  assert.equal(redone.status, 'executed');
+  assert.equal(redone.undo_available, true);
+  assert.equal(redone.redo_available, false);
+  assert.equal(redone.resource_id, executed.resource_id);
+  assert.equal(fs.readFileSync(path.join(vault, target), 'utf8'), '# Chat export\n');
 });
 
-test('CLI Intake imports multiple authorized attachments in one Runtime process', () => {
+test('CLI Host content inspection returns the persisted Recent Work Resource ID', (t) => {
+  const { caseRoot, stateDir } = setup('cli-content-resource-id');
+  const python = process.env.ATLAS_TEST_PYTHON ?? path.join(process.env.LOCALAPPDATA ?? '', 'Atlas', 'python', 'venv', 'Scripts', 'python.exe');
+  if (!python || !fs.existsSync(python)) { t.skip('Managed Atlas Python is unavailable for the CLI inspection fixture.'); return; }
+  const filePath = path.join(caseRoot, 'incoming.md'); fs.writeFileSync(filePath, '# Inspect me\n', 'utf8');
+  const result = cli(stateDir, ['content', 'inspect', '--file', filePath, '--purpose', 'content', '--tool', 'atlas-cli-test', '--client-run-id', 'inspect-resource-id', '--json'], { ATLAS_PYTHON: python });
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  const data = JSON.parse(result.stdout).data;
+  assert.match(data.coordination.resource_id, /^RES-/u);
+  const recent = JSON.parse(fs.readFileSync(path.join(stateDir, 'ui', 'recent-work.json'), 'utf8')).items;
+  assert.equal(recent.length, 1);
+  assert.equal(recent[0].resource_id, data.coordination.resource_id);
+});
+
+test('CLI resource relationships submit persists a structured Host batch', () => {
+  const { caseRoot, stateDir } = setup('cli-resource-relationships'); const external = path.join(caseRoot, 'external.md'); fs.writeFileSync(external, 'external');
+  const registry = new Registry({ stateDir }); const a = registry.create({ name: 'A', currentPath: 'A' }); const b = registry.create({ name: 'B', currentPath: 'B' }); const control = createResourceControl({ stateDir, ledger: registry.ledger }); const resource = control.identify({ filePath: external }); control.dispose(); registry.dispose();
+  const requestFile = path.join(caseRoot, 'relationships.json'); fs.writeFileSync(requestFile, JSON.stringify({ candidates: [{ source_resource_id: resource.resource_id, target: { kind: 'project', id: a.project_id }, type: 'used_by', evidence: { reason: 'Host review' } }, { source_resource_id: resource.resource_id, target: { kind: 'project', id: b.project_id }, type: 'used_by', evidence: { reason: 'Host review' } }] }));
+  const result = cli(stateDir, ['resource', 'relationships', 'submit', '--request-file', requestFile, '--tool', 'cli-test', '--client-run-id', 'relationships-run', '--json']); assert.equal(result.status, 0, result.stderr); const envelope = JSON.parse(result.stdout); const data = envelope.data; assert.equal(envelope.command, 'resource.relationships.submit'); assert.equal(data.relationships.length, 2); assert.ok(data.relationships.every((item) => item.source_resource_id === resource.resource_id && item.status === 'active' && item.evidence.reason === 'Host review' && item.effective_at));
+  const reopened = createResourceControl({ stateDir }); assert.equal(reopened.relationships(resource.resource_id).length, 2); reopened.dispose();
+});
+
+test('CLI resource relationships rejects an invalid batch without writes', () => {
+  const { caseRoot, stateDir } = setup('cli-resource-relationships-invalid'); const external = path.join(caseRoot, 'external.md'); fs.writeFileSync(external, 'external'); const registry = new Registry({ stateDir }); const project = registry.create({ name: 'A', currentPath: 'A' }); const control = createResourceControl({ stateDir, ledger: registry.ledger }); const resource = control.identify({ filePath: external }); control.dispose(); registry.dispose(); const requestFile = path.join(caseRoot, 'invalid.json'); fs.writeFileSync(requestFile, JSON.stringify({ candidates: [{ source_resource_id: resource.resource_id, target: { kind: 'project', id: project.project_id }, type: 'used_by', evidence: { reason: 'valid' } }, { source_resource_id: 'RES-missing', target: { kind: 'project', id: project.project_id }, type: 'used_by', evidence: { reason: 'invalid' } }] })); const result = cli(stateDir, ['resource', 'relationships', 'submit', '--request-file', requestFile, '--tool', 'cli-test', '--client-run-id', 'relationships-invalid', '--json']); assert.notEqual(result.status, 0); assert.equal(JSON.parse(result.stdout).ok, false); const reopened = createResourceControl({ stateDir }); assert.equal(reopened.relationships(resource.resource_id).length, 0); reopened.dispose();
+});
+
+test('legacy Intake execute routes are blocked without writing targets', () => {
   const { caseRoot, vault, stateDir } = setup('cli-intake-attachment-batch');
   fs.mkdirSync(path.join(vault, 'Reports'), { recursive: true });
   const registry = new Registry({ stateDir });
@@ -203,27 +209,21 @@ test('CLI Intake imports multiple authorized attachments in one Runtime process'
   const requestFile = path.join(caseRoot, 'batch.json');
   fs.writeFileSync(requestFile, JSON.stringify({ items }), 'utf8');
 
-  const result = cli(stateDir, [
-    'intake', 'batch-execute', '--root', vault, '--request-file', requestFile,
+  const commands = [
+    ['intake', 'execute', 'DRV-not-a-save', '--json'],
+    ['intake', 'rollback', 'DRV-not-a-save', '--json'],
+    ['intake', 'batch-execute', '--root', vault, '--request-file', requestFile,
     '--reason', 'The user submitted these three reports for the exact targets.',
     '--actor', 'agent', '--agent', 'Codex', '--model', 'test', '--tool', 'codex',
-    '--client-run-id', 'attachment-batch-test', '--json',
-  ]);
-  assert.equal(result.status, 0, result.stderr);
-  const receipt = JSON.parse(result.stdout).data;
-  assert.equal(receipt.status, 'executed');
-  assert.equal(receipt.summary.total, 3);
-  assert.equal(receipt.summary.executed, 3);
-  assert.equal(receipt.runtime_processes, 1);
-  assert.equal(receipt.local_input_bytes, items.reduce(
-    (total, item) => total + fs.statSync(item.candidateFile).size,
-    0,
-  ));
-  assert.equal(receipt.content_body_reads, 0);
-  assert.equal(receipt.model_visible_body_bytes, 0);
-  assert.equal(receipt.items.every((item) => item.verified && item.rollback_ready), true);
+    '--client-run-id', 'attachment-batch-test', '--json'],
+  ];
+  for (const command of commands) {
+    const result = cli(stateDir, command);
+    assert.notEqual(result.status, 0);
+    assert.match(JSON.parse(result.stdout).error.message, /Use atlas save/u);
+  }
   for (const item of items) {
-    assert.equal(fs.existsSync(path.join(vault, item.target)), true);
+    assert.equal(fs.existsSync(path.join(vault, item.target)), false);
   }
 });
 
@@ -356,12 +356,28 @@ test('Agent JSON protocol exposes version, capabilities, doctor, and structured 
     assert.equal(envelope.ok, true);
     assert.equal(envelope.command, expected);
     assert.ok(envelope.data);
+    if (expected === 'capabilities') {
+      assert.deepEqual(envelope.data.product_entrypoints.current_product.commands, [
+        'ui', 'ui install', 'ui doctor', 'ui remove',
+        'save prepare', 'save show', 'save execute', 'save undo', 'save redo',
+      ]);
+      assert.equal(envelope.data.product_entrypoints.internal_foundation.status, 'not_a_product_entrypoint');
+      assert.equal(Object.hasOwn(envelope.data.product_entrypoints, 'legacy_compatibility'), false);
+      assert.equal(Object.hasOwn(envelope.data.workflows, 'task'), false);
+      assert.equal(Object.hasOwn(envelope.data.workflows, 'analytics'), false);
+      assert.equal(Object.hasOwn(envelope.data.workflows, 'agent'), false);
+      assert.equal(Object.hasOwn(envelope.data.runtime_installation, 'codex_hook'), false);
+      assert.equal(envelope.data.legacy_fallback, false);
+    }
   }
 
   const doctor = JSON.parse(cli(stateDir, ['doctor', '--json']).stdout);
   assert.equal(doctor.data.status, 'ok');
   assert.equal(doctor.data.ledger.integrity, 'ok');
   assert.equal(doctor.data.ledger.schema_version, doctor.data.ledger.supported_schema_version);
+  assert.equal(Object.hasOwn(doctor.data.capabilities, 'analytics_export'), false);
+  assert.equal(Object.hasOwn(doctor.data.capabilities, 'analytics_python'), false);
+  assert.ok(doctor.data.capabilities.content_python);
 
   const outside = path.resolve(projectRoot, '..', 'atlas-json-outside-state');
   const failed = cli(outside, ['status', '--json']);

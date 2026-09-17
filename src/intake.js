@@ -191,7 +191,7 @@ function explicitTargetRecommendation(ledger, root, targetInput, projectId, role
   return {
     status: 'ready',
     decision: 'allow',
-    reason: 'The Agent proposed one absent target inside the selected Project and the user task authorized its placement.',
+    reason: 'The Agent proposed one absent target inside the selected Project and the current request authorized its placement.',
     configured: false,
     rule_version_id: null,
     environment_policy_id: null,
@@ -490,6 +490,7 @@ export class Intake {
       allowNoInputs: true,
       intakeContext,
       caller: options.caller ?? {},
+      runId: options.runId ?? null,
     });
     return {
       ...plan,
@@ -502,7 +503,10 @@ export class Intake {
   }
 
   show(runId) {
-    return this.derived.preview(runId);
+    try { return this.derived.preview(runId); } catch (error) {
+      if (error.message === `Run not found: ${runId}`) error.code = 'ATLAS_RUN_NOT_FOUND';
+      throw error;
+    }
   }
 
   correct({
@@ -579,7 +583,7 @@ export class Intake {
   }
 
   batchExecute({ root, items, reason, caller = {} }) {
-    if (!reason?.trim()) throw new Error('Intake batch execution requires the user task authorization reason.');
+    if (!reason?.trim()) throw new Error('Intake batch execution requires the current user authorization reason.');
     if (!Array.isArray(items) || items.length === 0) {
       throw new Error('Intake batch execution requires at least one item.');
     }
@@ -650,7 +654,7 @@ export class Intake {
   }
 
   execute(runId, { reason = null } = {}) {
-    if (!reason?.trim()) throw new Error('Intake execution requires the user task authorization reason.');
+    if (!reason?.trim()) throw new Error('Intake execution requires the current user authorization reason.');
     const detail = this.show(runId);
     const context = detail.placement.policy?.intake;
     if (!context?.auto_execute || context.confidence < 0.9) {
@@ -703,6 +707,10 @@ export class Intake {
 
   rollback(runId) {
     return this.derived.rollback(runId);
+  }
+
+  redo(runId) {
+    return this.derived.redo(runId);
   }
 
   dispose() {

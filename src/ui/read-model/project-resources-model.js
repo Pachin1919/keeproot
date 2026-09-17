@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { contentFileFingerprint, contentFilePath, readCachedContentInspection } from '../../content-inspection.js';
-import { projectPath, searchProjectFiles } from '../project-files.js';
+import { browseProjectFiles, listProjectFolders, projectPath, searchProjectFiles } from '../project-files.js';
 
 function samePath(left, right) {
   return process.platform === 'win32'
@@ -14,8 +14,13 @@ function resourceType(filePath) {
   return extension || 'Local file';
 }
 
-function resourceWork(recentWork, projectId, filePath) {
-  return recentWork.find((work) => work.project?.id === projectId && samePath(work.file_path, filePath)) ?? null;
+function resourceWork(recentWork, projectId, filePath, resourceId = null) {
+  if (resourceId) {
+    const matched = recentWork.find((work) => work.project?.id === projectId && work.resource_id === resourceId);
+    if (matched) return matched;
+  }
+  return recentWork.find((work) => work.project?.id === projectId
+    && (!resourceId || !work.resource_id) && samePath(work.file_path, filePath)) ?? null;
 }
 
 function sourceFingerprintStatus(work, filePath) {
@@ -42,24 +47,38 @@ function savedSourceStatus(saved) {
   }
 }
 
-function currentResourceActivity(currentActivity, projectId, filePath, work) {
+function currentResourceActivity(currentActivity, projectId, filePath, work, resourceId = null) {
   const completedAt = [work?.inspected_at, work?.last_continued_at]
     .filter((value) => typeof value === 'string').sort().at(-1) ?? null;
-  return currentActivity
-    .filter((entry) => entry.project?.id === projectId && samePath(entry.file_path, filePath))
+  const projectEntries = currentActivity.filter((entry) => entry.project?.id === projectId);
+  const candidates = resourceId
+    ? (() => {
+      const explicit = projectEntries.filter((entry) => entry.resource_id === resourceId);
+      return explicit.length ? explicit : projectEntries.filter((entry) => !entry.resource_id && samePath(entry.file_path, filePath));
+    })()
+    : projectEntries.filter((entry) => samePath(entry.file_path, filePath));
+  return candidates
     .sort((left, right) => String(right.updated_at ?? right.started_at ?? '').localeCompare(String(left.updated_at ?? left.started_at ?? '')))
     .find((entry) => !(['failed', 'interrupted'].includes(entry.status)
       && completedAt && String(entry.updated_at ?? entry.started_at ?? '') <= completedAt)) ?? null;
 }
 
-function resourceRecord(item, root, recentWork, projectId, savedWork = [], currentActivity = []) {
+function resourceRecord(item, root, recentWork, projectId, savedWork = [], currentActivity = [], resourceFacts = []) {
   const filePath = path.join(root, item.relative_path);
-  const work = resourceWork(recentWork, projectId, filePath);
+  const fact = resourceFacts.find((entry) => samePath(entry.path ?? entry.file_path ?? '', filePath)) ?? null;
+  const resourceId = fact?.resource_id ?? fact?.resource?.id ?? null;
+  const work = resourceWork(recentWork, projectId, filePath, resourceId);
   const transfer = work?.project_transfer ?? null;
-  const saved = savedWork.find((item) => samePath(item.result_path, filePath)) ?? null;
-  const createdWork = savedWork.filter((item) => samePath(item.source_path, filePath));
-  const activity = currentResourceActivity(currentActivity, projectId, filePath, work);
+  const saved = resourceId
+    ? savedWork.find((entry) => entry.resource_id === resourceId) ?? savedWork.find((entry) => !entry.resource_id && samePath(entry.result_path, filePath))
+    : savedWork.find((entry) => samePath(entry.result_path, filePath)) ?? null;
+  const createdWork = savedWork.filter((entry) => resourceId
+    ? entry.resource_id === resourceId || (!entry.resource_id && samePath(entry.source_path, filePath))
+    : samePath(entry.source_path, filePath));
+  const activity = currentResourceActivity(currentActivity, projectId, filePath, work, resourceId);
   return {
+    resource_fact: fact,
+    resource_id: resourceId ?? work?.resource_id ?? saved?.resource_id ?? activity?.resource_id ?? null,
     name: item.name,
     relative_path: item.relative_path,
     file_path: filePath,
@@ -120,11 +139,28 @@ function resourceState(resource) {
   return null;
 }
 
-function projectTree(records) {
+function recoveryActions(resource, projectId) {
+  const fact = resource.resource_fact ?? resource;
+  if (!fact?.resource_id || !fact.resource) return null;
+  const missing = fact.resource.status === 'missing';
+  const hasActiveLocation = (fact.locations ?? []).some((location) => location.status === 'active');
+  return {
+    keep_record: missing && !hasActiveLocation,
+    relink: missing && !hasActiveLocation,
+    relationships: (fact.relationships ?? [])
+      .filter((relationship) => relationship.status === 'active' && relationship.target_kind === 'project' && relationship.target_id === projectId)
+      .map((relationship) => ({
+        id: relationship.id,
+        type: relationship.type,
+        can_forget: true,
+        can_remove_reference: relationship.type === 'used_by',
+      })),
+  };
+}
+
+function projectTree(records, folderRecords = []) {
   const root = { folders: new Map(), files: [] };
-  for (const resource of records) {
-    const segments = resource.relative_path.split('/').filter(Boolean);
-    const fileName = segments.pop();
+  const ensureFolder = (segments) => {
     let cursor = root;
     let folderPath = '';
     for (const segment of segments) {
@@ -132,6 +168,13 @@ function projectTree(records) {
       if (!cursor.folders.has(segment)) cursor.folders.set(segment, { name: segment, relative_path: folderPath, folders: new Map(), files: [] });
       cursor = cursor.folders.get(segment);
     }
+    return cursor;
+  };
+  for (const folder of folderRecords) ensureFolder(folder.relative_path.split('/').filter(Boolean));
+  for (const resource of records) {
+    const segments = resource.relative_path.split('/').filter(Boolean);
+    const fileName = segments.pop();
+    const cursor = ensureFolder(segments);
     if (fileName) cursor.files.push({ ...resource, category: resourceCategory(resource), state: resourceState(resource) });
   }
   const serialize = (node) => ({
@@ -159,7 +202,7 @@ function missingSources(savedWork) {
     .map((item) => ({ name: path.basename(item.source_path), source_path: item.source_path }));
 }
 
-function focusedRecord(root, focusedPath, recentWork, projectId, savedWork, currentActivity) {
+function focusedRecord(root, focusedPath, recentWork, projectId, savedWork, currentActivity, resourceFacts) {
   if (!focusedPath) return null;
   try {
     const filePath = projectPath(root, focusedPath);
@@ -171,7 +214,7 @@ function focusedRecord(root, focusedPath, recentWork, projectId, savedWork, curr
       bytes: stat.size,
       modified_at: stat.mtime.toISOString(),
     };
-    const record = resourceRecord(item, root, recentWork, projectId, savedWork, currentActivity);
+    const record = resourceRecord(item, root, recentWork, projectId, savedWork, currentActivity, resourceFacts);
     return { ...record, state: resourceState(record) };
   } catch {
     return null;
@@ -224,27 +267,53 @@ function representationFor(resource, stateDir) {
   }
 }
 
-export function buildProjectResourcesModel({ project, root, base, recentWork, savedWork = [], currentActivity = [], savedWorkError = false, focusedPath = null, selectedFolderPath = null, stateDir = null, activityReturnHref = null }) {
+export function buildProjectResourcesModel({ project, root, base, recentWork, savedWork = [], currentActivity = [], resourceFacts = [], savedWorkError = false, focusedPath = null, focusedResourceId = null, selectedFolderPath = null, stateDir = null, activityReturnHref = null }) {
   const listed = searchProjectFiles(root, '');
-  const records = listed.items.map((item) => {
-    const record = resourceRecord(item, root, recentWork, project.id, savedWork, currentActivity);
+  const requestedFolder = typeof selectedFolderPath === 'string' ? selectedFolderPath.replaceAll('\\', '/').replace(/^\/+|\/+$/gu, '') : null;
+  const folders = listProjectFolders(root);
+  const requestedFolderExists = requestedFolder !== null
+    && (requestedFolder === '' || folders.items.some((folder) => folder.relative_path === requestedFolder));
+  const visibleItems = [...listed.items];
+  if (requestedFolderExists) {
+    for (const item of browseProjectFiles(root, requestedFolder).items.filter((entry) => entry.kind === 'file')) {
+      if (!visibleItems.some((entry) => entry.relative_path === item.relative_path)) visibleItems.push(item);
+    }
+  }
+  const records = visibleItems.map((item) => {
+    const record = resourceRecord(item, root, recentWork, project.id, savedWork, currentActivity, resourceFacts);
     return { ...record, state: resourceState(record) };
   });
   const known_sources = records.filter((item) => item.added_from && !item.saved_work);
   const created_work = records.filter((item) => item.saved_work);
   const other_files = records.filter((item) => !item.added_from && !item.saved_work);
   const explicitFocus = typeof focusedPath === 'string' && focusedPath.length > 0;
-  const focused_resource = explicitFocus
-    ? records.find((item) => item.relative_path === focusedPath)
-      ?? focusedRecord(root, focusedPath, recentWork, project.id, savedWork, currentActivity)
+  const ledgerFocus = typeof focusedResourceId === 'string' ? resourceFacts.find((item) => item.resource_id === focusedResourceId) ?? null : null;
+  const diskLedgerFocus = ledgerFocus ? records.find((item) => item.resource_id === ledgerFocus.resource_id) ?? null : null;
+  const ledgerRelativePath = ledgerFocus?.path
+    ? path.relative(root, ledgerFocus.path).replaceAll('\\', '/')
     : null;
-  const focused = focused_resource ? { ...focused_resource, representation: representationFor(focused_resource, stateDir) } : null;
-  const treeRecords = focused && !records.some((item) => item.relative_path === focused.relative_path)
+  const ledgerPathInsideProject = ledgerRelativePath && ledgerRelativePath !== '..'
+    && !ledgerRelativePath.startsWith('../') && !path.posix.isAbsolute(ledgerRelativePath)
+    ? ledgerRelativePath
+    : null;
+  const focusedPathRecord = ledgerFocus && !diskLedgerFocus && (explicitFocus || ledgerPathInsideProject)
+    ? focusedRecord(root, explicitFocus ? focusedPath : ledgerPathInsideProject, recentWork, project.id, savedWork, currentActivity, resourceFacts)
+    : null;
+  const verifiedPathLedgerFocus = focusedPathRecord?.resource_id === ledgerFocus?.resource_id ? focusedPathRecord : null;
+  const localLedgerFocus = diskLedgerFocus ?? verifiedPathLedgerFocus;
+  const redoSave = ledgerFocus ? savedWork.find((item) => item.resource_id === ledgerFocus.resource_id && item.status === 'undone' && item.write?.redo_available === true) ?? null : null;
+  const focused_resource = ledgerFocus ? localLedgerFocus ? { ...ledgerFocus, ...localLedgerFocus, relative_path: localLedgerFocus.relative_path, file_path: localLedgerFocus.file_path, open_available: true, state: localLedgerFocus.state, last_known_path: ledgerFocus.path, last_known_hash: ledgerFocus.content_hash, last_known_bytes: ledgerFocus.bytes, last_known_modified_at: ledgerFocus.modified_at }
+    : { ...ledgerFocus, name: ledgerFocus.resource?.display_name ?? ledgerFocus.name ?? 'Resource', type: ledgerFocus.resource?.kind ?? 'Local file', relative_path: null, open_available: false, state: ledgerFocus.status, last_known_path: ledgerFocus.path, last_known_hash: ledgerFocus.content_hash, last_known_bytes: ledgerFocus.bytes, last_known_modified_at: ledgerFocus.modified_at }
+    : explicitFocus
+    ? records.find((item) => item.relative_path === focusedPath)
+      ?? focusedRecord(root, focusedPath, recentWork, project.id, savedWork, currentActivity, resourceFacts)
+    : null;
+  const focused = focused_resource ? { ...focused_resource, redo_save: redoSave ? { save_id: redoSave.save_id ?? redoSave.work_id } : null, actions: recoveryActions(focused_resource, project.id), representation: representationFor(focused_resource, stateDir) } : null;
+  const treeRecords = focused?.relative_path && !records.some((item) => item.relative_path === focused.relative_path)
     ? [...records, focused]
     : records;
-  const tree = projectTree(treeRecords);
-  const focusFolder = focused?.relative_path.split('/').slice(0, -1).join('/') ?? null;
-  const requestedFolder = typeof selectedFolderPath === 'string' ? selectedFolderPath.replaceAll('\\', '/').replace(/^\/+|\/+$/gu, '') : null;
+  const tree = projectTree(treeRecords, folders.items);
+  const focusFolder = focused?.relative_path?.split('/').slice(0, -1).join('/') ?? null;
   const selected_folder_path = focusFolder ?? (projectFolderPaths(tree).has(requestedFolder) ? requestedFolder : '');
   return {
     mode: 'explorer',
@@ -260,7 +329,10 @@ export function buildProjectResourcesModel({ project, root, base, recentWork, sa
     focused_resource: focused,
     selected_folder_path,
     selected_folder_explicit: explicitFocus || requestedFolder !== null,
-    focus_error: explicitFocus && !focused ? 'The requested Resource is unavailable. It may have moved or been removed.' : null,
+    selected_folder_loaded: !listed.truncated || (requestedFolderExists && requestedFolder === selected_folder_path),
+    focus_error: (explicitFocus || focusedResourceId) && !focused ? 'The requested Resource is unavailable. It may have moved or been removed.' : null,
+    external_references: resourceFacts.filter((item) => item.relationship_to_project === 'used_by' && !item.locations?.some((location) => location.project_id === project.id && location.status === 'active')),
+    missing_resources: resourceFacts.filter((item) => item.resource?.status === 'missing' || item.last_known_location?.status === 'missing'),
     activity_return_href: activityReturnHref,
     missing_sources: missingSources(savedWork),
     saved_work_error: savedWorkError,
@@ -268,7 +340,7 @@ export function buildProjectResourcesModel({ project, root, base, recentWork, sa
   };
 }
 
-export function buildProjectResourceDetailModel({ project, root, base, recentWork, savedWork = [], relativePath }) {
+export function buildProjectResourceDetailModel({ project, root, base, recentWork, savedWork = [], currentActivity = [], resourceFacts = [], relativePath }) {
   const target = contentFilePath(projectPath(root, relativePath));
   const stat = fs.lstatSync(target);
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Choose a regular Project file.');
@@ -283,6 +355,6 @@ export function buildProjectResourceDetailModel({ project, root, base, recentWor
     project,
     root,
     base,
-    resource: resourceRecord(item, root, recentWork, project.id, savedWork),
+    resource: resourceRecord(item, root, recentWork, project.id, savedWork, currentActivity, resourceFacts),
   };
 }

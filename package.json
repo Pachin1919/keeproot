@@ -2,7 +2,7 @@
   "name": "atlas",
   "version": "1.5.2-rc.1",
   "private": true,
-  "description": "Atlas V1 local Agent file-governance Runtime and Skill",
+  "description": "Atlas local Project, Resource, and verified file-work Runtime",
   "type": "module",
   "bin": {
     "atlas": "./bin/atlas.js"
@@ -10,9 +10,7 @@
   "scripts": {
     "test": "node --test --test-concurrency=1",
     "runtime": "node ./scripts/runtime-manager.js",
-    "demo": "node ./scripts/demo.js",
-    "demo:v0.1": "node ./scripts/v1-demo.js",
-    "demo:v1": "npm run demo:v0.1"
+    "demo": "node ./scripts/demo.js"
   },
   "engines": {
     "node": ">=24.0.0"

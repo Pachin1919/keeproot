@@ -18,7 +18,7 @@ export function defaultInspectPurpose(filePath) {
   return 'content';
 }
 
-export function createFileWorkService({ stateDir, projectForFile, runContentOperation = runUiContentOperation }) {
+export function createFileWorkService({ stateDir, projectForFile, runContentOperation = runUiContentOperation, resourceControl = null }) {
   function finishInspection({ filePath, inspectOptions, inspection, sourceFingerprint, project, persistUnsupported }) {
     if (inspection?.extraction?.status === 'unsupported' && !persistUnsupported) {
       return { work: null, inspection, inspect: inspectOptions };
@@ -32,6 +32,7 @@ export function createFileWorkService({ stateDir, projectForFile, runContentOper
       project: project === undefined ? projectForFile(filePath) : project,
       caller: { actor: 'user', tool: 'atlas-desktop' },
       channel: 'desktop',
+      resourceControl,
     });
     return { work, inspection, inspect: inspectOptions };
   }

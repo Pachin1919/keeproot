@@ -18,7 +18,8 @@ export class InstalledSkillDriver {
 
   acceptsScenario(scenario) {
     assert.equal(typeof scenario.user_request, 'string');
-    assert.match(this.skill, /local coordination Runtime/i);
+    assert.match(this.skill, /name:\s+atlas-file-governance/u);
+    assert.match(this.skill, /installed Atlas Runtime/iu);
     assert.match(this.skill, /recovery/i);
     for (const command of scenario.required_commands ?? []) {
       assert.match(this.workflows, new RegExp(command.replace(' ', '\\s+')));
