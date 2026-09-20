@@ -57,9 +57,10 @@ test('repository Agent Skill is a complete user-installable source and reference
   const workflows = fs.readFileSync(path.join(skillRoot, 'references', 'workflows.md'), 'utf8');
   const currentResource = fs.readFileSync(path.join(skillRoot, 'references', 'current-resource.md'), 'utf8');
   const currentSave = fs.readFileSync(path.join(skillRoot, 'references', 'current-save.md'), 'utf8');
+  const currentTableWork = fs.readFileSync(path.join(skillRoot, 'references', 'current-table-work.md'), 'utf8');
 
   assert.match(skill, /^---\r?\nname: atlas-file-governance\r?\ndescription: .+\r?\n---/);
-  assert.doesNotMatch(`${skill}\n${metadata}\n${protocol}\n${workflows}\n${currentResource}\n${currentSave}`, /\bTODO\b|\[TODO/);
+  assert.doesNotMatch(`${skill}\n${metadata}\n${protocol}\n${workflows}\n${currentResource}\n${currentSave}\n${currentTableWork}`, /\bTODO\b|\[TODO/);
   assert.match(metadata, /\$atlas-file-governance/);
   assert.match(metadata, /Atlas File Governance/);
   assert.match(skill, /installed Atlas Runtime/u);
@@ -88,6 +89,10 @@ test('repository Agent Skill is a complete user-installable source and reference
   assert.match(currentSave, /save undo/u);
   assert.match(currentSave, /save redo/u);
   assert.match(currentSave, /atlas\.save-result\.v1/u);
+  assert.match(skill, /current-table-work\.md/u);
+  for (const command of ['table-work start', 'table-work prepare', 'table-work align', 'table-work recipe', 'table-work preview', 'table-work save', 'save undo', 'save redo']) {
+    assert.match(currentTableWork, new RegExp(command.replace(' ', '\\s+')));
+  }
   assert.match(workflows, /supporting reference, not the default route/u);
   for (const command of [
     'save prepare', 'save execute', 'save undo', 'save redo',
@@ -184,7 +189,7 @@ test('Skill command sequence completes Agent Bootstrap, Derived, Tracked Direct,
   assert.equal(agentCli(stateDir, ['doctor']).status, 'ok');
   const capabilities = agentCli(stateDir, ['capabilities']);
   assert.ok(capabilities.workflows.bootstrap.includes('scan'));
-  assert.deepEqual(capabilities.workflows.content, ['inspect', 'compare', 'branches', 'prepare-data']);
+  assert.deepEqual(capabilities.workflows.content, ['inspect', 'compare', 'branches', 'prepare-data', 'localize-conversation']);
   assert.deepEqual(capabilities.bootstrap_scan_modes, ['structure', 'metadata']);
   assert.ok(capabilities.workflows.tracked_direct.includes('rollback'));
   assert.ok(capabilities.workflows.guarded.includes('execute'));
@@ -194,6 +199,7 @@ test('Skill command sequence completes Agent Bootstrap, Derived, Tracked Direct,
   assert.ok(capabilities.workflows.bootstrap.includes('contract'));
   assert.ok(capabilities.workflows.bootstrap.includes('adopt'));
   assert.deepEqual(capabilities.workflows.save, ['prepare', 'show', 'execute', 'undo', 'redo']);
+  assert.deepEqual(capabilities.workflows.table_work, ['start', 'show', 'add-source', 'remove-source', 'prepare', 'sheet', 'align', 'recipe', 'preview', 'save', 'list']);
   assert.equal(capabilities.workflows.intake.includes('execute'), false);
   assert.deepEqual(capabilities.workflows.capture, ['fetch', 'localize', 'sample']);
   assert.equal(capabilities.browser_capture.maximum_sample_characters, 4000);

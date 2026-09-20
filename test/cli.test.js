@@ -10,9 +10,13 @@ import { Tracker } from '../src/tracker.js';
 import { createResourceControl } from '../src/resource-control.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const cliPath = path.join(projectRoot, 'bin', 'atlas.js');
+const cliPath = process.env.ATLAS_TEST_CLI_PATH
+  ? path.resolve(process.env.ATLAS_TEST_CLI_PATH)
+  : path.join(projectRoot, 'bin', 'atlas.js');
 const templateRoot = path.join(projectRoot, 'fixtures', 'vault-template');
-const tempRoot = path.join(projectRoot, 'test', '.tmp');
+const tempRoot = process.env.ATLAS_TEST_TMP_ROOT
+  ? path.resolve(process.env.ATLAS_TEST_TMP_ROOT)
+  : path.join(projectRoot, 'test', '.tmp');
 
 function setup(name) {
   const caseRoot = path.join(tempRoot, name);
@@ -90,6 +94,19 @@ test('installed product help and capabilities hide direct internal write engines
   const capabilityResult = cli(stateDir, ['capabilities', '--json'], installedEnv);
   assert.equal(capabilityResult.status, 0, capabilityResult.stderr);
   const capabilities = JSON.parse(capabilityResult.stdout).data;
+  assert.match(help, /atlas table-work start/u);
+  assert.deepEqual(capabilities.workflows.table_work, ['start', 'show', 'add-source', 'remove-source', 'prepare', 'sheet', 'align', 'recipe', 'preview', 'save', 'list']);
+  assert.deepEqual(capabilities.workflows.resource_views, ['list', 'evaluate', 'files', 'candidates-submit', 'properties', 'candidates-show', 'save']);
+  assert.deepEqual(capabilities.workflows.resource_facts, ['show']);
+  assert.deepEqual(capabilities.resource_views, {
+    modes: ['files', 'table', 'cards'],
+    host_access: 'read_write_views_and_submit_bounded_candidates',
+    evaluation_completeness: ['complete', 'partial', 'unknown'],
+    semantic_property_write: 'candidate_preview_with_user_decision',
+    property_candidate_limit: 10,
+    property_kinds: ['text', 'single', 'multi'],
+    list_files_scope: 'explicit_required',
+  });
   assert.equal(Object.hasOwn(capabilities.workflows, 'guarded'), false);
   assert.equal(Object.hasOwn(capabilities.workflows, 'derived'), false);
   assert.equal(Object.hasOwn(capabilities.workflows, 'intake'), false);
@@ -174,6 +191,85 @@ test('CLI Host content inspection returns the persisted Recent Work Resource ID'
   const recent = JSON.parse(fs.readFileSync(path.join(stateDir, 'ui', 'recent-work.json'), 'utf8')).items;
   assert.equal(recent.length, 1);
   assert.equal(recent[0].resource_id, data.coordination.resource_id);
+});
+
+test('CLI Host completes one persistent multi-source Table Work through the shared Work store', (t) => {
+  const python = process.env.ATLAS_TEST_PYTHON ?? path.join(process.env.LOCALAPPDATA ?? '', 'Atlas', 'python', 'venv', 'Scripts', 'python.exe');
+  if (!python || !fs.existsSync(python)) { t.skip('Managed Atlas Python is unavailable for the Host Table Work fixture.'); return; }
+  const { caseRoot, stateDir } = setup('cli-host-table-work');
+  const workspace = path.join(caseRoot, 'workspace'); const projectRootPath = path.join(workspace, 'Project');
+  const data = path.join(projectRootPath, 'Data'); const results = path.join(projectRootPath, 'Results');
+  fs.mkdirSync(data, { recursive: true }); fs.mkdirSync(results, { recursive: true });
+  const first = path.join(data, 'first.csv'); const second = path.join(data, 'second.csv');
+  fs.writeFileSync(first, 'id,name\n1,One\n2,Two\n', 'utf8');
+  fs.writeFileSync(second, 'Identifier,name\n3,Three\n2,Two\n', 'utf8');
+  const registry = new Registry({ stateDir });
+  const root = registry.adoptRoot({ rootPath: workspace, rootType: 'project_workspace', contentPolicy: 'bounded_content' });
+  const project = registry.create({ name: 'Project', currentPath: 'Project' });
+  registry.attachRoot(project.project_id, { rootId: root.root_id, relativePath: 'Project', reason: 'Bind Host Table Work fixture.' });
+  registry.dispose();
+  const env = { ATLAS_PYTHON: python };
+  const host = ['--actor', 'agent', '--agent', 'Codex', '--model', 'test', '--tool', 'atlas-cli-test', '--client-run-id', 'host-table-work'];
+  const invoke = (args) => {
+    const result = cli(stateDir, [...args, ...host, '--json'], env);
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+    return JSON.parse(result.stdout).data;
+  };
+
+  const started = invoke(['table-work', 'start', '--project', project.project_id, '--source', first, '--source', second]);
+  assert.match(started.session_id, /^DWT-/u); assert.equal(started.sources.length, 2);
+  const prepared = invoke(['table-work', 'prepare', started.session_id, '--base-revision', String(started.revision)]);
+  assert.deepEqual(prepared.sources.map((item) => item.status), ['ready', 'ready']);
+  const mappingFile = path.join(caseRoot, 'mapping.json');
+  fs.writeFileSync(mappingFile, JSON.stringify({ mapping: [
+    { source_key: prepared.sources[0].source_key, column: 'id', canonical: 'id' },
+    { source_key: prepared.sources[0].source_key, column: 'name', canonical: 'name' },
+    { source_key: prepared.sources[1].source_key, column: 'Identifier', canonical: 'id' },
+    { source_key: prepared.sources[1].source_key, column: 'name', canonical: 'name' },
+  ] }), 'utf8');
+  const aligned = invoke(['table-work', 'align', started.session_id, '--request-file', mappingFile, '--base-revision', String(prepared.revision)]);
+  assert.equal(aligned.mapping_complete, true);
+  const recipeFile = path.join(caseRoot, 'recipe.json');
+  fs.writeFileSync(recipeFile, JSON.stringify({ combine: 'concatenate', source_column: true, source_column_name: 'origin', deduplicate_columns: 'id', sort_column: 'id', sort_direction: 'asc' }), 'utf8');
+  const recipe = invoke(['table-work', 'recipe', started.session_id, '--request-file', recipeFile, '--base-revision', String(aligned.revision)]);
+  assert.equal(recipe.recipe.steps.some((item) => item.operation === 'source-column'), true);
+  const previewed = invoke(['table-work', 'preview', started.session_id, '--base-revision', String(recipe.revision)]);
+  assert.equal(previewed.preview.result_summary.rows, 3); assert.equal(previewed.preview_revision, previewed.revision);
+  const currentRevision = previewed.revision;
+  const saved = invoke(['table-work', 'save', started.session_id, '--base-revision', String(currentRevision), '--folder', 'Results', '--file-name', 'merged.csv', '--format', 'csv', '--request-key', 'host-table-work-save', '--reason', 'The user authorized this exact reviewed Preview and destination.']);
+  assert.equal(saved.status, 'executed'); assert.match(saved.verification.sha256, /^[a-f0-9]{64}$/u); assert.equal(saved.channel, 'host'); assert.equal(saved.source.sources.length, 2);
+  assert.equal(fs.existsSync(path.join(results, 'merged.csv')), true);
+  const replayed = invoke(['table-work', 'save', started.session_id, '--base-revision', String(currentRevision), '--folder', 'Results', '--file-name', 'merged.csv', '--format', 'csv', '--request-key', 'host-table-work-save', '--reason', 'The user authorized this exact reviewed Preview and destination.']);
+  assert.equal(replayed.save_id, saved.save_id); assert.equal(replayed.status, 'executed');
+  const conflicting = cli(stateDir, ['table-work', 'save', started.session_id, '--base-revision', String(currentRevision), '--folder', 'Results', '--file-name', 'merged.csv', '--format', 'csv', '--request-key', 'different-host-save', '--reason', 'Try a different request against the occupied target.', ...host, '--json'], env);
+  assert.notEqual(conflicting.status, 0); assert.equal(JSON.parse(conflicting.stdout).error.code, 'ATLAS_STATE_CONFLICT');
+  const shown = invoke(['table-work', 'show', started.session_id]);
+  assert.equal(shown.latest_save_id, saved.save_id); assert.equal(shown.session_id, started.session_id);
+  const reopened = new Registry({ stateDir }); const sharedSession = reopened.ledger.workSessions.latestOpenForProject(project.project_id);
+  assert.equal(sharedSession.session_id, started.session_id); assert.deepEqual(sharedSession.recipe, shown.recipe); reopened.dispose();
+  const control = createResourceControl({ stateDir });
+  for (const source of saved.source.sources) assert.equal(control.relationships(source.resource_id).some((item) => item.type === 'used_by' && item.target_id === project.project_id), true);
+  control.dispose();
+  const undone = cli(stateDir, ['save', 'undo', saved.save_id, '--json'], env); assert.equal(undone.status, 0, undone.stderr); assert.equal(fs.existsSync(path.join(results, 'merged.csv')), false);
+  const redone = cli(stateDir, ['save', 'redo', saved.save_id, '--json'], env); assert.equal(redone.status, 0, redone.stderr); assert.equal(fs.existsSync(path.join(results, 'merged.csv')), true);
+  fs.appendFileSync(first, '4,Four\n', 'utf8');
+  const stale = cli(stateDir, ['table-work', 'preview', started.session_id, '--base-revision', String(shown.revision), ...host, '--json'], env);
+  assert.notEqual(stale.status, 0); assert.equal(JSON.parse(stale.stdout).error.code, 'ATLAS_STATE_CONFLICT');
+});
+
+test('CLI Host Table Work rejects a Source outside the selected Project without creating a Session', () => {
+  const { caseRoot, stateDir } = setup('cli-host-table-work-boundary');
+  const workspace = path.join(caseRoot, 'workspace'); const firstRoot = path.join(workspace, 'First'); const secondRoot = path.join(workspace, 'Second');
+  fs.mkdirSync(firstRoot, { recursive: true }); fs.mkdirSync(secondRoot, { recursive: true });
+  const foreign = path.join(secondRoot, 'foreign.csv'); fs.writeFileSync(foreign, 'id\n1\n', 'utf8');
+  const registry = new Registry({ stateDir });
+  const root = registry.adoptRoot({ rootPath: workspace, rootType: 'project_workspace', contentPolicy: 'bounded_content' });
+  const first = registry.create({ name: 'First', currentPath: 'First' }); const second = registry.create({ name: 'Second', currentPath: 'Second' });
+  registry.attachRoot(first.project_id, { rootId: root.root_id, relativePath: 'First', reason: 'Bind first boundary fixture.' });
+  registry.attachRoot(second.project_id, { rootId: root.root_id, relativePath: 'Second', reason: 'Bind second boundary fixture.' }); registry.dispose();
+  const result = cli(stateDir, ['table-work', 'start', '--project', first.project_id, '--source', foreign, '--tool', 'atlas-cli-test', '--client-run-id', 'boundary', '--json']);
+  assert.notEqual(result.status, 0); assert.match(JSON.parse(result.stdout).error.message, /inside the selected Project/u);
+  const reopened = new Registry({ stateDir }); assert.equal(reopened.ledger.workSessions.latestOpenForProject(first.project_id), null); reopened.dispose();
 });
 
 test('CLI resource relationships submit persists a structured Host batch', () => {
@@ -360,12 +456,29 @@ test('Agent JSON protocol exposes version, capabilities, doctor, and structured 
       assert.deepEqual(envelope.data.product_entrypoints.current_product.commands, [
         'ui', 'ui install', 'ui doctor', 'ui remove',
         'save prepare', 'save show', 'save execute', 'save undo', 'save redo',
+        'table-work start', 'table-work show', 'table-work add-source', 'table-work remove-source',
+        'table-work prepare', 'table-work sheet', 'table-work align', 'table-work recipe', 'table-work preview', 'table-work save', 'table-work list',
+        'view list', 'view evaluate', 'view files', 'view properties', 'view candidates submit', 'view candidates show', 'view save',
+        'content localize-conversation',
+        'resource show',
       ]);
+      assert.equal(envelope.data.table_work.semantic_authority, 'user_or_host_proposal');
       assert.equal(envelope.data.product_entrypoints.internal_foundation.status, 'not_a_product_entrypoint');
       assert.equal(Object.hasOwn(envelope.data.product_entrypoints, 'legacy_compatibility'), false);
       assert.equal(Object.hasOwn(envelope.data.workflows, 'task'), false);
       assert.equal(Object.hasOwn(envelope.data.workflows, 'analytics'), false);
       assert.equal(Object.hasOwn(envelope.data.workflows, 'agent'), false);
+      assert.deepEqual(envelope.data.workflows.resource_views, ['list', 'evaluate', 'files', 'candidates-submit', 'properties', 'candidates-show', 'save']);
+      assert.deepEqual(envelope.data.workflows.resource_facts, ['show']);
+      assert.deepEqual(envelope.data.resource_views, {
+        modes: ['files', 'table', 'cards'],
+        host_access: 'read_write_views_and_submit_bounded_candidates',
+        evaluation_completeness: ['complete', 'partial', 'unknown'],
+        semantic_property_write: 'candidate_preview_with_user_decision',
+        property_candidate_limit: 10,
+        property_kinds: ['text', 'single', 'multi'],
+        list_files_scope: 'explicit_required',
+      });
       assert.equal(Object.hasOwn(envelope.data.runtime_installation, 'codex_hook'), false);
       assert.equal(envelope.data.legacy_fallback, false);
     }

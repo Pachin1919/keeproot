@@ -51,6 +51,76 @@ document.querySelectorAll('[data-resources-nav]').forEach((item) => {
   item.replaceWith(link);
 });
 
+const dirtyDraftForms = new Set();
+// Join fields stay in the saved form but cannot affect a concatenate submission.
+document.querySelectorAll('.recipe-form').forEach((form) => {
+  const combine = form.querySelector('select[name="combine"]');
+  const join = form.querySelector('[data-recipe-join]');
+  if (!combine || !join) return;
+  const syncCombine = () => {
+    join.hidden = combine.value !== 'join';
+    join.disabled = join.hidden;
+  };
+  combine.addEventListener('change', syncCombine);
+  syncCombine();
+});
+
+const markDirty = (event) => { dirtyDraftForms.add(event.currentTarget); };
+const clearDirty = (event) => { dirtyDraftForms.delete(event.currentTarget); };
+document.querySelectorAll('[data-draft-protect]').forEach((form) => {
+  form.addEventListener('input', markDirty);
+  form.addEventListener('change', markDirty);
+  form.addEventListener('submit', clearDirty);
+});
+window.addEventListener?.('beforeunload', (event) => {
+  if (!dirtyDraftForms.size) return;
+  event.preventDefault();
+  event.returnValue = '';
+});
+
+const resourcePropertyBatchFocusKey = 'atlas-ui-resource-property-batch-focus';
+const rememberResourcePropertyFocus = (candidate) => {
+  try {
+    sessionStorage.setItem(resourcePropertyBatchFocusKey, JSON.stringify({
+      resourceId: candidate?.value ?? null,
+      pathname: window.location.pathname,
+    }));
+  } catch {}
+};
+const resourcePropertyBatch = document.querySelector('#resource-property-batch');
+const propertyFocusCandidate = (checkbox) => {
+  const current = checkbox.closest('[data-resource-property-focus]');
+  const findSibling = (direction) => {
+    let sibling = current?.[direction];
+    while (sibling) {
+      const container = sibling.matches?.('[data-resource-property-focus]')
+        ? sibling
+        : sibling.querySelector?.('[data-resource-property-focus]');
+      const candidate = container?.querySelector('input[name="resource_id"]:not(:checked)');
+      if (candidate && !candidate.disabled && !container.hidden && !container.closest('[hidden]')) return candidate;
+      sibling = sibling[direction];
+    }
+    return null;
+  };
+  return findSibling('nextElementSibling') ?? findSibling('previousElementSibling');
+};
+resourcePropertyBatch?.addEventListener('submit', () => {
+  const selected = [...document.querySelectorAll('input[form="resource-property-batch"][name="resource_id"]:checked')];
+  rememberResourcePropertyFocus(propertyFocusCandidate(selected.at(-1)));
+});
+const restoreResourcePropertyFocus = () => {
+  let saved = null;
+  try { saved = JSON.parse(sessionStorage.getItem(resourcePropertyBatchFocusKey) ?? 'null'); } catch {}
+  if (!saved) return;
+  try { sessionStorage.removeItem(resourcePropertyBatchFocusKey); } catch {}
+  if (saved.pathname !== window.location.pathname) return;
+  const target = [...document.querySelectorAll('[data-resource-property-focus]')]
+    .find((container) => container.dataset.resourcePropertyFocus === saved.resourceId)
+    ?.querySelector('input[name="resource_id"]');
+  (target ?? document.querySelector('[data-resource-property-empty-action]'))?.focus();
+};
+restoreResourcePropertyFocus();
+
 document.querySelectorAll('[data-project-filter]').forEach((input) => {
   const list = input.closest('.projects-home-list-panel')?.querySelector('.projects-home-list');
   if (!(input instanceof HTMLInputElement) || !list) return;
@@ -86,6 +156,51 @@ document.querySelectorAll('[data-project-filter]').forEach((input) => {
     target.focus();
   }));
 });
+
+const updateTemporaryWorkSelection = (payload) => {
+  document.querySelectorAll('[data-work-source-count]').forEach((item) => { item.textContent = `Selected ${payload.count ?? 0} files`; });
+  document.querySelectorAll('[data-work-open]').forEach((item) => {
+    const active = Number(payload.count ?? 0) > 0 && payload.href;
+    item.href = active ? payload.href : '#';
+    item.classList.toggle('is-disabled', !active);
+    item.setAttribute('aria-disabled', String(!active));
+  });
+};
+
+const bindTemporaryWorkSources = (root, context) => {
+  root.querySelectorAll('[data-work-source]').forEach((checkbox) => {
+    if (checkbox.dataset.workSourceBound === 'true') return;
+    checkbox.dataset.workSourceBound = 'true';
+    checkbox.addEventListener('change', async () => {
+      const notice = document.querySelector('[data-work-source-notice]');
+      checkbox.disabled = true;
+      if (notice) notice.textContent = 'Updating selection…';
+      try {
+        const response = await fetch(`${context.projectBase}/work/selection`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+          body: new URLSearchParams({
+            csrf: context.csrf ?? '',
+            action: checkbox.checked ? 'add' : 'remove',
+            resource_id: checkbox.dataset.resourceId ?? '',
+            path: checkbox.dataset.resourcePath ?? '',
+            folder: context.folder ?? '',
+            focus: context.focus ?? '',
+            origin_view_id: context.viewId ?? '',
+          }),
+        });
+        const result = await response.json();
+        if (!response.ok || result.ok !== true) throw new Error(result.error || 'Selection could not be updated.');
+        document.querySelectorAll(`[data-work-source][data-resource-id="${CSS.escape(result.resource_id ?? '')}"]`).forEach((item) => { item.checked = result.selected === true; });
+        updateTemporaryWorkSelection(result);
+        if (notice) notice.textContent = '';
+      } catch (error) {
+        checkbox.checked = !checkbox.checked;
+        if (notice) notice.textContent = error.message;
+      } finally { checkbox.disabled = false; }
+    });
+  });
+};
 
 document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
   const projectId = workspace.dataset.projectId;
@@ -199,13 +314,20 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
     group.dataset.folderBound = 'true';
     group.querySelector('[data-resource-name-sort]')?.addEventListener('click', (event) => {
       const button = event.currentTarget;
-      const rows = [...group.querySelectorAll('[data-open-resource]')];
+      const rows = [...group.querySelectorAll('[data-resource-row]')];
       const direction = button.dataset.sortDirection === 'asc' ? 'desc' : 'asc';
       rows.sort((left, right) => (left.dataset.resourceName ?? '').localeCompare(right.dataset.resourceName ?? '', undefined, { numeric: true }) * (direction === 'asc' ? 1 : -1));
       group.append(...rows);
       button.dataset.sortDirection = direction;
       button.textContent = direction === 'asc' ? 'Name ↑' : 'Name ↓';
       button.setAttribute('aria-label', `Sort files by name ${direction === 'asc' ? 'descending' : 'ascending'}`);
+    });
+    bindTemporaryWorkSources(group, {
+      projectBase,
+      csrf: workspace.dataset.csrf,
+      folder: workspace.dataset.selectedFolder,
+      focus: tree.dataset.focusPath,
+      viewId: workspace.dataset.activeViewId,
     });
     group.querySelectorAll('[data-open-resource]').forEach((row) => {
       row.addEventListener('keydown', (event) => {
@@ -290,6 +412,30 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
     });
     workspace.dataset.selectedFolder = selectedPath;
     if (persist) storageSet('localStorage', selectedFolderKey, selectedPath);
+    if (!workspace.dataset.activeViewId) {
+      document.querySelectorAll('[data-resource-view-mode]').forEach((link) => {
+        const target = new URL(link.href, window.location.href);
+        target.searchParams.delete('view');
+        target.searchParams.set('scope_path', selectedPath);
+        if (link.dataset.resourceViewMode === 'files') target.searchParams.set('folder', selectedPath);
+        else target.searchParams.delete('folder');
+        link.href = `${target.pathname}${target.search}`;
+      });
+      document.querySelectorAll('[data-resource-view-scope-label]').forEach((label) => {
+        label.textContent = selectedPath || 'Project root';
+      });
+      document.querySelectorAll('[data-resource-view-scope-input], .resource-view-save input[name="scope_path"]').forEach((input) => {
+        input.value = selectedPath;
+      });
+      document.querySelectorAll('[data-resource-view-files-link]').forEach((link) => {
+        const target = new URL(link.href, window.location.href);
+        target.searchParams.delete('view');
+        target.searchParams.set('mode', 'files');
+        target.searchParams.set('scope_path', selectedPath);
+        target.searchParams.set('folder', selectedPath);
+        link.href = `${target.pathname}${target.search}`;
+      });
+    }
     if (clearResource) {
       const inspector = workspace.querySelector('[data-resource-inspector]');
       if (inspector) inspector.innerHTML = '<span class="workspace-kicker">Selected resource</span><h2>Choose a resource</h2><p>Select a file from the current folder to see its known local facts and open it with its default app.</p>';
@@ -300,7 +446,8 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
       topbarResource?.remove();
       if (topbar) topbar.dataset.currentResourcePath = '';
       storageRemove('sessionStorage', 'atlas-ui-current-resource-path');
-      window.history.replaceState({}, '', `${projectBase}/resources?folder=${encodeURIComponent(selectedPath)}`);
+      const locationQuery = new URLSearchParams({ mode: 'files', scope_path: selectedPath, folder: selectedPath });
+      window.history.replaceState({}, '', `${projectBase}/resources?${locationQuery}`);
     }
     return selectedPath;
   };
@@ -444,6 +591,16 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
   if (focusedRow) window.requestAnimationFrame(() => {
     focusedRow.focus({ preventScroll: true });
     focusedRow.scrollIntoView({ block: 'center' });
+  });
+});
+
+document.querySelectorAll('[data-work-selection-context]').forEach((context) => {
+  bindTemporaryWorkSources(context, {
+    projectBase: context.dataset.projectBase,
+    csrf: context.dataset.csrf,
+    folder: context.dataset.selectedFolder,
+    focus: context.dataset.focusPath,
+    viewId: context.dataset.activeViewId,
   });
 });
 
@@ -933,7 +1090,8 @@ document.querySelectorAll('[data-project-folder-form]').forEach((form) => {
   const groups = [...form.querySelectorAll('[data-project-folders]')];
   const submit = form.querySelector('button[type="submit"]');
   const pathLabel = form.querySelector('[data-project-path]');
-  const fileName = form.dataset.fileName ?? 'file';
+  const fileNameInput = form.querySelector('input[name="file_name"]');
+  const formatPicker = form.querySelector('select[name="format"]');
 
   const updateSelection = () => {
     const group = groups.find((item) => !item.hidden);
@@ -944,7 +1102,7 @@ document.querySelectorAll('[data-project-folder-form]').forEach((form) => {
     if (pathLabel) {
       const projectName = projectPicker?.selectedOptions[0]?.textContent?.replace(/ — unavailable$/u, '') ?? 'Project';
       pathLabel.textContent = selected
-        ? `${projectName} / ${selected.dataset.folderPath} / ${fileName}`
+        ? `${projectName} / ${selected.dataset.folderPath} / ${fileNameInput?.value || form.dataset.fileName || 'file'}`
         : 'Choose an existing folder.';
     }
   };
@@ -961,7 +1119,12 @@ document.querySelectorAll('[data-project-folder-form]').forEach((form) => {
   projectPicker?.addEventListener('change', updateProject);
   form.addEventListener('change', (event) => {
     if (event.target instanceof HTMLInputElement && event.target.name === 'folder') updateSelection();
+    if (event.target === formatPicker && fileNameInput) {
+      fileNameInput.value = fileNameInput.value.replace(/\.(csv|xlsx)$/iu, '') + `.${formatPicker.value}`;
+      updateSelection();
+    }
   });
+  fileNameInput?.addEventListener('input', updateSelection);
   updateProject();
 });
 
@@ -1008,3 +1171,6 @@ document.addEventListener('submit', (event) => {
   status.textContent = `${action}… Atlas is working locally. Keep this window open.`;
   document.body.append(status);
 }, true);
+
+const workDraftConflict = document.querySelector('#work-draft-conflict');
+workDraftConflict?.focus?.();

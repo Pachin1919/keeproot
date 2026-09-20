@@ -13,13 +13,14 @@ import {
 } from '../src/content-inspection.js';
 import { prepareDataWorkspace } from '../src/data-workspace.js';
 import { compactContextPackReceipt, prepareContextPack } from '../src/context-pack.js';
-import { localizeConversationSelection } from '../src/conversation-localization.js';
+import { prepareConversationSave } from '../src/conversation-localization.js';
 import { Derived } from '../src/derived.js';
 import { Evolution } from '../src/evolution.js';
 import { Guarded } from '../src/guarded.js';
 import { Intake } from '../src/intake.js';
 import { SaveService } from '../src/save-service.js';
 import { createResourceControl } from '../src/resource-control.js';
+import { createProjectViewService } from '../src/project-view-service.js';
 import { WorkspaceInspector } from '../src/inspect.js';
 import { Portfolio } from '../src/portfolio.js';
 import { PreferenceRules } from '../src/preference-rules.js';
@@ -35,6 +36,8 @@ import {
 } from '../src/desktop-ui-component.js';
 import { openLocalUi } from '../src/ui-launcher.js';
 import { startAtlasUiServer } from '../src/ui-server.js';
+import { createDataWorkService } from '../src/ui/services/data-work-service.js';
+import { createSavedWorkService } from '../src/ui/services/saved-work-service.js';
 import {
   ATLAS_VERSION,
   CAPABILITIES,
@@ -129,7 +132,7 @@ function foundationUsage() {
 Usage:
   atlas version [--json]
   atlas capabilities [--json]
-  Current product: atlas ui; atlas save prepare/show/execute/undo/redo
+  Current product: atlas ui; atlas view; atlas table-work; atlas save prepare/show/execute/undo/redo
   Other commands are supporting foundation or diagnostics.
   atlas doctor [ui] [--json]
   atlas inspect --root <path> [--max-depth <1..8>]
@@ -155,11 +158,36 @@ Usage:
                         [--actor <actor>] [--agent <name>] [--model <name>]
                         [--tool <name>] [--client-run-id <id>]
   atlas resource relationships submit --request-file <json> --tool <name> --client-run-id <id>
+  atlas resource show <resource_id> --project <project_id>
+  atlas view list --project <project_id>
+  atlas view properties --project <project_id>
+  atlas view save --project <project_id> --request-file <view.json> --tool <host> --client-run-id <id>
+  atlas view candidates show <batch_id> --project <project_id>
+  atlas view evaluate <view_id> [--limit <1..250>] [--continuation <opaque_token>]
+  atlas view files --project <project_id> --scope <relative_folder_or_.> [--extension <ext> ...]
+                   [--no-recursive] [--limit <1..250>] [--continuation <opaque_token>]
+  atlas view candidates submit --project <project_id> --request-file <json>
+                               --tool <name> --model <name> --client-run-id <id>
+  atlas table-work start --project <project_id> --source <path> [--source <path> ...]
+                         [--intent <work_goal>]
+  atlas table-work list --project <project_id> [--limit <1..100>] [--offset <number>]
+  atlas table-work show <session_id>
+  atlas table-work add-source <session_id> --source <path> --base-revision <revision>
+  atlas table-work remove-source <session_id> --resource <resource_id> --base-revision <revision>
+  atlas table-work prepare <session_id> --base-revision <revision>
+  atlas table-work sheet <session_id> --source-key <source_key> --sheet <sheet_name> --base-revision <revision>
+  atlas table-work align <session_id> --request-file <mapping.json> --base-revision <revision>
+  atlas table-work recipe <session_id> --request-file <recipe.json> --base-revision <revision>
+  atlas table-work preview <session_id> --base-revision <revision>
+  atlas table-work save <session_id> --folder <existing_relative_folder> --file-name <new.csv|new.xlsx>
+                        --format <csv|xlsx> --base-revision <revision> --request-key <key> --reason <authorization>
+                        --tool <name> --client-run-id <id>
   atlas content prepare-data --file <csv|tsv|xlsx> [--sheet <xlsx_sheet_name>]
   atlas content prepare-context --file <csv|tsv|xlsx> [--sheet <name>] --purpose <text> --include-column <exact_name> [...]
   atlas content compare --left <path> --right <path>
   atlas content branches --file <jsonl_path> --file <jsonl_path> [--file <jsonl_path> ...]
   atlas content localize-conversation --input <selection.json> --project <project_id>
+                                      --request-key <key> --tool <host> --client-run-id <id>
                                       --output-relative <new_file.md>
                                       --actor <actor> --agent <name> --model <name>
                                       --tool <name> --client-run-id <id>
@@ -272,11 +300,38 @@ Current product:
   atlas save undo <save_id>
   atlas save redo <save_id>
 
+  atlas table-work start --project <project_id> --source <path> [--source <path> ...]
+                         [--intent <work_goal>]
+  atlas table-work list --project <project_id> [--limit <1..100>] [--offset <number>]
+  atlas table-work show <session_id>
+  atlas table-work prepare|preview <session_id> --base-revision <revision>
+  atlas table-work add-source <session_id> --source <path> --base-revision <revision>
+  atlas table-work remove-source <session_id> --resource <resource_id> --base-revision <revision>
+  atlas table-work sheet <session_id> --source-key <source_key> --sheet <sheet_name> --base-revision <revision>
+  atlas table-work align|recipe <session_id> --request-file <json> --base-revision <revision>
+  atlas table-work save <session_id> --folder <existing_folder> --file-name <new_name>
+                        --format <csv|xlsx> --base-revision <revision> --request-key <key> --reason <authorization>
+                         --tool <name> --client-run-id <id>
+
+  atlas view list --project <project_id>
+  atlas view properties --project <project_id>
+  atlas view save --project <project_id> --request-file <view.json> --tool <host> --client-run-id <id>
+  atlas view candidates show <batch_id> --project <project_id>
+  atlas view evaluate <view_id> [--limit <1..250>] [--continuation <opaque_token>]
+  atlas view files --project <project_id> --scope <relative_folder_or_.> [--extension <ext> ...]
+                   [--no-recursive] [--limit <1..250>] [--continuation <opaque_token>]
+  atlas view candidates submit --project <project_id> --request-file <json>
+                               --tool <name> --model <name> --client-run-id <id>
+
 Current lookup and inspection:
+  atlas content localize-conversation --input <selection.json> --project <project_id>
+                                     --output-relative <existing_folder/new.md> --request-key <key>
+                                     --tool <host> --client-run-id <id>
   atlas project list | show <project_id> | resolve --path <current_directory>
   atlas content inspect --file <path> [--purpose <structure|content|data|visual>]
   atlas content compare --left <path> --right <path>
   atlas resource relationships submit --request-file <json> --tool <name> --client-run-id <id>
+  atlas resource show <resource_id> --project <project_id>
 
 Health and protocol:
   atlas version [--json]
@@ -1014,6 +1069,108 @@ function handleProject(registry, args) {
   throw new Error(`Unknown project action: ${action ?? '(missing)'}`);
 }
 
+function handleProjectViews(service, args) {
+  const [action, ...rest] = args;
+  if (action === 'save') {
+    const options = {};
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--project') options.projectId = rest[++index];
+      else if (rest[index] === '--request-file') options.requestFile = rest[++index];
+      else {
+        const consumed = parseCallerFlag(options, rest, index);
+        if (consumed == null) throw new Error(`Unknown view save argument: ${rest[index]}`);
+        index = consumed;
+      }
+    }
+    if (!options.projectId || !options.requestFile || !options.tool || !options.clientRunId) throw new Error('view save requires --project, --request-file, --tool, and --client-run-id.');
+    const request = readJsonFile(options.requestFile, 'Saved View');
+    if (!request || Array.isArray(request) || typeof request !== 'object') throw new Error('Saved View request must be an object.');
+    if (!request.config?.scope || typeof request.config.scope.path !== 'string') throw new Error('Host View save requires an explicit config.scope.path.');
+    const result = service.saveView({ projectId: options.projectId, viewId: request.view_id ?? null, name: request.name, mode: request.mode, config: request.config, baseRevision: request.base_revision ?? null });
+    emit('view.save', { ...result, desktop_href: `/projects/${encodeURIComponent(result.project_id)}/resources?view=${encodeURIComponent(result.view_id)}` }, (data) => console.log(`Saved ${data.name} (revision ${data.revision}).`));
+    return;
+  }
+  if (action === 'properties') {
+    if (rest.length !== 2 || rest[0] !== '--project' || !rest[1] || rest[1].startsWith('--')) throw new Error('view properties requires --project <project_id>.');
+    emit('view.properties', { project_id: rest[1], properties: service.listProperties(rest[1]) }, (data) => console.log(JSON.stringify(data, null, 2)));
+    return;
+  }
+  if (action === 'candidates') {
+    const subaction = rest.shift();
+    if (subaction === 'show') {
+      if (rest.length !== 3 || !rest[0] || rest[0].startsWith('--') || rest[1] !== '--project' || !rest[2] || rest[2].startsWith('--')) {
+        throw new Error('view candidates show requires one batch_id and --project <project_id>.');
+      }
+      emit('view.candidates.show', service.propertyCandidateBatch({ batchId: rest[0], projectId: rest[2] }), (data) => console.log(JSON.stringify(data, null, 2)));
+      return;
+    }
+    if (subaction !== 'submit') throw new Error('view candidates requires submit or show.');
+    const options = {};
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--project') options.projectId = rest[++index];
+      else if (rest[index] === '--request-file') options.requestFile = rest[++index];
+      else {
+        const consumed = parseCallerFlag(options, rest, index);
+        if (consumed == null) throw new Error(`Unknown view candidates submit argument: ${rest[index]}`);
+        index = consumed;
+      }
+    }
+    if (!options.projectId || !options.requestFile || !options.tool || !options.model || !options.clientRunId) throw new Error('view candidates submit requires --project, --request-file, --tool, --model, and --client-run-id.');
+    const request = readJsonFile(options.requestFile, 'Property suggestion Preview');
+    const result = service.submitPropertyCandidates({
+      projectId: options.projectId,
+      viewId: request.scope?.view_id ?? null,
+      resourceIds: request.scope?.resource_ids ?? [],
+      propertyId: request.property?.property_id ?? null,
+      property: request.property?.property_id ? null : request.property,
+      candidates: request.candidates,
+      caller: callerFromOptions(options),
+    });
+    emit('view.candidates.submit', result, (data) => console.log(`Stored ${data.candidates.length} Property suggestion${data.candidates.length === 1 ? '' : 's'} for user review.`));
+    return;
+  }
+  if (action === 'list') {
+    let projectId = null;
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--project') projectId = rest[++index];
+      else throw new Error(`Unknown view list argument: ${rest[index]}`);
+    }
+    if (!projectId) throw new Error('view list requires --project');
+    emit('view.list', service.listViews(projectId), (data) => console.log(JSON.stringify(data, null, 2)));
+    return;
+  }
+  if (action === 'evaluate') {
+    const viewId = rest[0];
+    if (!viewId || viewId.startsWith('--')) throw new Error('view evaluate requires one view_id');
+    let limit = 100; let continuation = null;
+    for (let index = 1; index < rest.length; index += 1) {
+      if (rest[index] === '--limit') limit = Number(rest[++index]);
+      else if (rest[index] === '--continuation') continuation = rest[++index];
+      else throw new Error(`Unknown view evaluate argument: ${rest[index]}`);
+    }
+    emit('view.evaluate', service.evaluateView({ viewId, limit, continuation }), (data) => console.log(JSON.stringify(data, null, 2)));
+    return;
+  }
+  if (action === 'files') {
+    let projectId = null; let scopePath = null; let recursive = true; let limit = 100; let continuation = null;
+    const extensions = [];
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === '--project') projectId = rest[++index];
+      else if (rest[index] === '--scope') scopePath = rest[++index];
+      else if (rest[index] === '--extension') extensions.push(rest[++index]);
+      else if (rest[index] === '--no-recursive') recursive = false;
+      else if (rest[index] === '--limit') limit = Number(rest[++index]);
+      else if (rest[index] === '--continuation') continuation = rest[++index];
+      else throw new Error(`Unknown view files argument: ${rest[index]}`);
+    }
+    if (!projectId || scopePath == null) throw new Error('view files requires --project and an explicit --scope');
+    if (scopePath === '.') scopePath = '';
+    emit('view.files', service.listProjectFiles({ projectId, scope: { path: scopePath, recursive, extensions }, limit, continuation }), (data) => console.log(JSON.stringify(data, null, 2)));
+    return;
+  }
+  throw new Error(`Unknown view action: ${action ?? '(missing)'}`);
+}
+
 function handleRule(rules, ledger, args) {
   const [action, ...rest] = args;
   if (action === 'list') {
@@ -1593,6 +1750,148 @@ function handleWork(storage, args) {
   throw new Error(`Unknown work action: ${action ?? '(missing)'}`);
 }
 
+function parseTableWork(args) {
+  const [action, ...rest] = args; const options = { action, positional: [], sources: [] };
+  for (let index = 0; index < rest.length; index += 1) {
+    const token = rest[index];
+    if (token === '--project') options.projectId = rest[++index];
+    else if (token === '--limit') options.limit = Number(rest[++index]);
+    else if (token === '--offset') options.offset = Number(rest[++index]);
+    else if (token === '--intent') options.intent = rest[++index];
+    else if (token === '--source') options.sources.push(rest[++index]);
+    else if (token === '--resource') options.resourceId = rest[++index];
+    else if (token === '--source-key') options.sourceKey = rest[++index];
+    else if (token === '--sheet') options.sheet = rest[++index];
+    else if (token === '--request-file') options.requestFile = rest[++index];
+    else if (token === '--base-revision') options.baseRevision = Number(rest[++index]);
+    else if (token === '--folder') options.folder = rest[++index];
+    else if (token === '--file-name') options.fileName = rest[++index];
+    else if (token === '--format') options.format = rest[++index];
+    else if (token === '--request-key') options.requestKey = rest[++index];
+    else if (token === '--reason') options.reason = rest[++index];
+    else {
+      const consumed = parseCallerFlag(options, rest, index);
+      if (consumed != null) index = consumed;
+      else if (token.startsWith('--')) throw new Error(`Unknown table-work argument: ${token}`);
+      else options.positional.push(token);
+    }
+  }
+  return options;
+}
+
+function tableWorkProject(registry, projectId) {
+  const project = registry.list().find((item) => item.id === projectId && item.status === 'active');
+  if (!project) throw new Error('Table Work requires one active Project id.');
+  const location = registry.show(project.id).location;
+  if (!location?.root_path || location.relative_path == null) throw new Error('The selected Project does not have an available local location.');
+  const root = path.resolve(location.root_path, ...String(location.relative_path).split('/').filter(Boolean));
+  return { project: { id: project.id, name: project.name }, root, workspaceRoot: path.resolve(location.root_path) };
+}
+
+async function handleTableWork(registry, saveService, args) {
+  const options = parseTableWork(args); const action = options.action;
+  if (!action) throw new Error('table-work requires an action.');
+  const resourceControl = createResourceControl({ stateDir, ledger: registry.ledger });
+  const dataWork = createDataWorkService({ stateDir, projectRoot, installationRoot, resourceControl });
+  const savedWork = createSavedWorkService({ stateDir, saveService });
+  const sessionEntry = (sessionId) => {
+    const initial = dataWork.session(sessionId);
+    if (!initial) throw new Error('This Work Session is unavailable.');
+    const entry = tableWorkProject(registry, initial.project_id);
+    dataWork.projectSession(entry.project);
+    return { entry, session: dataWork.session(sessionId) };
+  };
+  const sourcePath = (entry, input) => {
+    const resolved = path.resolve(entry.root, String(input ?? ''));
+    if (!input || !isPathInside(entry.root, resolved) || resolved === entry.root) throw new Error('Every Table Work Source must be a file inside the selected Project.');
+    const stat = fs.lstatSync(resolved);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Every Table Work Source must be a regular non-linked file.');
+    if (!['.csv', '.xlsx'].includes(path.extname(resolved).toLowerCase())) throw new Error('Table Work supports CSV and XLSX Sources.');
+    return resolved;
+  };
+  const readRequest = () => {
+    if (!options.requestFile) throw new Error(`table-work ${action} requires --request-file <json>.`);
+    return JSON.parse(fs.readFileSync(path.resolve(options.requestFile), 'utf8'));
+  };
+  const requireBaseRevision = () => {
+    if (!Number.isInteger(options.baseRevision) || options.baseRevision < 1) {
+      const error = new Error(`table-work ${action} requires --base-revision <current_revision>.`);
+      error.code = 'ATLAS_STATE_CONFLICT';
+      throw error;
+    }
+    return options.baseRevision;
+  };
+  try {
+    if (action === 'list') {
+      if (!options.projectId || options.positional.length) throw new Error('table-work list requires --project <project_id>.');
+      const entry = tableWorkProject(registry, options.projectId);
+      emit('table-work.list', dataWork.discoverProjectSessions(entry.project, { limit: options.limit, offset: options.offset }), (data) => console.log(JSON.stringify(data, null, 2)));
+      return;
+    }
+    if (action === 'start') {
+      if (!options.projectId || !options.sources.length || !options.tool || !options.clientRunId) throw new Error('table-work start requires --project, at least one --source, --tool, and --client-run-id.');
+      const entry = tableWorkProject(registry, options.projectId); const sourcePaths = options.sources.map((input) => sourcePath(entry, input));
+      const resourceIds = [];
+      for (const resolved of sourcePaths) {
+        const identified = resourceControl.identify({ filePath: resolved, project: entry.project });
+        resourceIds.push(identified.resource_id);
+      }
+      const session = dataWork.createProjectSession(entry.project, { origin: { kind: 'host' } }, resourceIds, { intent: options.intent, caller: callerFromOptions(options) });
+      emit('table-work.start', session, (value) => console.log(`Started ${value.session_id} with ${value.sources.length} Source(s).`)); return;
+    }
+    const sessionId = options.positional[0];
+    if (!sessionId || options.positional.length !== 1) throw new Error(`table-work ${action} requires one session_id.`);
+    const { entry } = sessionEntry(sessionId);
+    if (action === 'show') { emit('table-work.show', await dataWork.validateSources(sessionId), (value) => console.log(`${value.session_id}: ${value.sources.length} Source(s), Recipe v${value.recipe.version}.`)); return; }
+    if (action === 'add-source') {
+      if (options.sources.length !== 1) throw new Error('table-work add-source requires exactly one --source.');
+      const identified = resourceControl.identify({ filePath: sourcePath(entry, options.sources[0]), project: entry.project });
+      emit('table-work.add-source', dataWork.addSource(sessionId, identified.resource_id, { baseRevision: requireBaseRevision() }), (value) => console.log(`Added Source; ${value.sources.length} selected.`)); return;
+    }
+    if (action === 'remove-source') {
+      if (!options.resourceId) throw new Error('table-work remove-source requires --resource <resource_id>.');
+      emit('table-work.remove-source', dataWork.removeSource(sessionId, options.resourceId, { baseRevision: requireBaseRevision() }), (value) => console.log(`Removed Source; ${value.sources.length} selected.`)); return;
+    }
+    if (action === 'prepare') { emit('table-work.prepare', await dataWork.prepareSources(sessionId, { baseRevision: requireBaseRevision() }), (value) => console.log(`Prepared ${value.sources.length} Source(s).`)); return; }
+    if (action === 'sheet') {
+      if (!options.sourceKey || !options.sheet) throw new Error('table-work sheet requires --source-key and --sheet.');
+      dataWork.selectSourceSheet(sessionId, options.sourceKey, options.sheet, { baseRevision: requireBaseRevision() });
+      emit('table-work.sheet', await dataWork.prepareSources(sessionId), (value) => console.log(`Prepared Sheet for ${value.session_id}.`)); return;
+    }
+    if (action === 'align') {
+      const request = readRequest(); const mapping = Array.isArray(request) ? request : request.mapping;
+      emit('table-work.align', dataWork.confirmMapping(sessionId, mapping, { baseRevision: requireBaseRevision() }), (value) => console.log(`Confirmed ${value.mapping.length} field alignment(s).`)); return;
+    }
+    if (action === 'recipe') { emit('table-work.recipe', dataWork.updateRecipe(sessionId, readRequest(), { baseRevision: requireBaseRevision() }), (value) => console.log(`Saved Recipe v${value.recipe.version}.`)); return; }
+    if (action === 'preview') { emit('table-work.preview', await dataWork.previewPersistent(sessionId, { baseRevision: requireBaseRevision() }), (value) => console.log(`Previewed Recipe v${value.recipe.version}.`)); return; }
+    if (action === 'save') {
+      if (!options.folder || !options.fileName || !['csv', 'xlsx'].includes(options.format) || !options.requestKey || !options.reason || !options.tool || !options.clientRunId) throw new Error('table-work save requires --folder, --file-name, --format <csv|xlsx>, --request-key, --reason, --tool, and --client-run-id.');
+      const baseRevision = requireBaseRevision();
+      const session = await dataWork.validateSources(sessionId);
+      dataWork.assertRevision(sessionId, baseRevision);
+      if (!session.preview || session.preview_revision !== session.revision) { const error = new Error('Preview the current Recipe before saving.'); error.code = 'ATLAS_STATE_CONFLICT'; throw error; }
+      const extension = `.${options.format}`;
+      const stage = await dataWork.stagePersistent(sessionId, extension, { baseRevision });
+      const sources = session.sources.map((item) => ({ source_key: item.source_key, resource_id: item.resource_id, path: item.file_path, sheet: item.sheet, fingerprint: item.fingerprint }));
+      let record;
+      try {
+        dataWork.assertRevision(sessionId, baseRevision);
+        record = savedWork.save({
+          project: entry.project, projectRoot: entry.root, root: entry.workspaceRoot, folder: options.folder, fileName: options.fileName,
+          stagedPath: stage.path, expectedCandidateHash: stage.staged.sha256, sourcePath: sources[0].path, sourceFingerprint: sources[0].fingerprint,
+          sources, recipe: session.recipe, outputExtension: extension, requestKey: options.requestKey, caller: callerFromOptions(options), channel: 'host',
+          executionReason: options.reason,
+          parameters: { work_session_id: sessionId, mapping: session.mapping, recipe_version: session.recipe.version },
+          resultSummary: { ...stage.result.result_summary, validation: stage.result.validation, format: options.format.toUpperCase(), recipe_version: session.recipe.version },
+        });
+      } finally { dataWork.clearPersistentStage(sessionId); }
+      dataWork.recordSave(sessionId, record.work_id);
+      emit('table-work.save', record, (value) => console.log(`Saved and verified ${value.work_id}.`)); return;
+    }
+    throw new Error(`Unknown table-work action: ${action}.`);
+  } finally { resourceControl.dispose(); }
+}
+
 async function handleCapture(capture, args) {
   const [action, ...rest] = args;
   if (action === 'fetch') {
@@ -1802,6 +2101,7 @@ function parseContent(args) {
       if (rest[index] === '--input') options.inputPath = rest[++index];
       else if (rest[index] === '--project') options.projectId = rest[++index];
       else if (rest[index] === '--output-relative') options.outputRelative = rest[++index];
+      else if (rest[index] === '--request-key') options.requestKey = rest[++index];
       else {
         const callerIndex = parseCallerFlag(options, rest, index);
         if (callerIndex == null) throw new Error(`Unknown content localize-conversation argument: ${rest[index]}`);
@@ -1809,8 +2109,8 @@ function parseContent(args) {
         index = callerIndex;
       }
     }
-    if (!options.inputPath || !options.projectId || !options.outputRelative || !options.callerProvided) {
-      throw new Error('content localize-conversation requires --input, --project, --output-relative, and caller metadata');
+    if (!options.inputPath || !options.projectId || !options.outputRelative || !options.requestKey || !options.tool || !options.clientRunId) {
+      throw new Error('content localize-conversation requires --input, --project, --output-relative, --request-key, --tool, and --client-run-id.');
     }
     options.caller = callerFromOptions(options);
     return options;
@@ -1960,7 +2260,20 @@ async function main() {
 
   if (command === 'resource') {
     const [area, action, ...rest] = args;
-    if (area !== 'relationships' || action !== 'submit') throw new Error('Use atlas resource relationships submit.');
+    if (area === 'show') {
+      const resourceId = action;
+      let projectId = null;
+      for (let index = 0; index < rest.length; index += 1) {
+        if (rest[index] === '--project') projectId = rest[++index];
+        else throw new Error(`Unknown resource show argument: ${rest[index]}`);
+      }
+      if (!resourceId || !projectId) throw new Error('resource show requires a resource_id and --project');
+      const control = createResourceControl({ stateDir });
+      try { emit('resource.show', control.projectResource(projectId, resourceId, { refresh: true }), (data) => console.log(JSON.stringify(data, null, 2))); }
+      finally { control.dispose(); }
+      return;
+    }
+    if (area !== 'relationships' || action !== 'submit') throw new Error('Use atlas resource show or resource relationships submit.');
     let requestFile = null; let tool = null; let clientRunId = null;
     for (let index = 0; index < rest.length; index += 1) {
       if (rest[index] === '--request-file') requestFile = rest[++index];
@@ -1973,6 +2286,12 @@ async function main() {
     const control = createResourceControl({ stateDir });
     try { emit('resource.relationships.submit', { relationships: control.submitRelationships({ candidates: request.candidates, caller: { tool, client_run_id: clientRunId } }) }, (data) => console.log(JSON.stringify(data, null, 2))); }
     finally { control.dispose(); }
+    return;
+  }
+  if (command === 'view') {
+    const service = createProjectViewService({ stateDir });
+    try { handleProjectViews(service, args); }
+    finally { service.dispose(); }
     return;
   }
 
@@ -2082,20 +2401,12 @@ async function main() {
         );
       });
     } else {
-      const location = activeProjectLocation(options.projectId);
-      const outputPath = path.resolve(location.root, ...String(options.outputRelative).split(/[\\/]/u).filter(Boolean));
-      const result = localizeConversationSelection({
-        inputPath: options.inputPath,
-        outputPath,
-        projectRoot: location.root,
-      });
-      emit('content.localize-conversation', {
-        ...result,
-        project: location.project,
-        caller: options.caller,
-      }, (detail) => {
-        console.log(`Localized ${detail.decision_count} selected conversation decision(s) to ${detail.output.path}.`);
-      });
+      const registry = new Registry({ stateDir });
+      const saveService = new SaveService({ stateDir });
+      try {
+        const result = prepareConversationSave({ stateDir, registry, saveService, ...options });
+        emit('content.localize-conversation', result, (detail) => console.log(`Prepared ${detail.decision_count} selected decisions for Save ${detail.save_id}; review ${detail.desktop_href}.`));
+      } finally { saveService.dispose(); registry.dispose(); }
     }
     return;
   }
@@ -2165,6 +2476,8 @@ async function main() {
       handleIntake(intake, args);
     } else if (command === 'save') {
       handleSave(save, args);
+    } else if (command === 'table-work') {
+      await handleTableWork(registry, save, args);
     } else if (command === 'evolve') {
       handleEvolution(evolution, args);
     } else if (command === 'work') {

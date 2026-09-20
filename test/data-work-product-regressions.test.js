@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -359,6 +360,71 @@ test('Data Work binds existing destination folders to the selected Project', () 
   assert.match(html, /Cancel/u);
 });
 
+test('V18-04 mapping and Recipe forms opt into unsaved draft protection', () => {
+  const html = renderDataWorkView({
+    mode: 'sources', csrf: 'token', session: {
+      session_id: 'DW-draft-guard', revision: 3, mapping_complete: true,
+      sources: [{ name: 'first.csv', status: 'ready', resource_id: 'RES-1', source_key: 'SRC-1', profile: { profile: { fields: [{ name: 'id', inferred_type: 'number', missing_count: 0, distinct_count: 1, date_range: null }] } } }],
+      mapping: [{ source_key: 'SRC-1', column: 'id', canonical: 'id' }],
+      comparison: { common_fields: ['id'], unique_fields: [], type_conflicts: [] },
+      recipe: { version: 1, combine: { operation: 'concatenate' }, steps: [{ operation: 'validate' }] },
+    },
+  }, {});
+  const protectedForms = html.match(/<form[^>]+data-draft-protect[^>]*>/gu) ?? [];
+  assert.equal(protectedForms.length, 2, 'mapping and Recipe forms must opt into draft protection');
+  assert.match(html, /action="\/work\/DW-draft-guard\/action"[^>]+data-draft-protect/u);
+  assert.match(html, /class="recipe-form"[^>]+data-draft-protect/u);
+  assert.match(html, /<fieldset data-recipe-join hidden disabled>/u);
+  assert.match(html, /<details class="recipe-option" ><summary>Convert field type<\/summary>/u);
+  assert.doesNotMatch(html, /<details class="recipe-option" open>/u);
+});
+
+test('V18-04 source cards keep headings, facts, and field tables in explicit responsive regions', () => {
+  const html = renderDataWorkView({
+    mode: 'sources', csrf: 'token', session: {
+      session_id: 'DW-source-layout', revision: 1, mapping_complete: false,
+      sources: [{ name: 'orders-a.csv', status: 'ready', resource_id: 'RES-1', source_key: 'SRC-1', sheet: null, profile: { profile: { rows: 3, columns: 1, null_cells: 0, duplicate_rows: 0, fields: [{ name: 'order_id', inferred_type: 'integer', missing_count: 0, distinct_count: 3, date_range: null }] } } }],
+      mapping: [], comparison: { common_fields: [], unique_fields: [], type_conflicts: [] },
+      recipe: { version: 1, combine: { operation: 'concatenate' }, steps: [{ operation: 'validate' }] },
+    },
+  }, {});
+  assert.match(html, /class="surface work-source-card"/u);
+  assert.match(html, /class="work-source-card-header"/u);
+  assert.match(html, /3 rows · 1 fields · 0 empty cells · 0 duplicate rows/u);
+  assert.match(html, /<details class="work-profile-details"><summary>Inspect fields and data quality/u);
+  assert.match(html, /class="work-source-profile">[\s\S]*?class="facts"[\s\S]*?class="data-work-table-wrap"/u);
+  assert.match(html, /\.work-source-profile \{[^}]*grid-template-columns: minmax\(210px, \.38fr\) minmax\(0, 1fr\)/u);
+  assert.match(html, /@media \(max-width: 820px\) \{[\s\S]*?\.work-source-card-header, \.work-source-profile \{ grid-template-columns: 1fr; \}/u);
+  assert.match(html, /\.work-source-profile \.facts \{[^}]*grid-template-columns: minmax\(0, 1fr\) minmax\(48px, auto\)/u);
+  assert.match(html, /\.work-source-profile \.data-work-table-wrap \{[^}]*align-self: start/u);
+  assert.match(html, /\.facts dd \{[^}]*font-variant-numeric: tabular-nums/u);
+});
+
+test('workbench typography uses shared control metrics and collapses inactive history without grid gaps', () => {
+  const css = fs.readFileSync(path.resolve('src/ui/styles/components.css'), 'utf8');
+  assert.match(css, /:where\(button, input, select, textarea\) \{ font: inherit; color: inherit; \}/u);
+  assert.match(css, /select, textarea\) \{[^}]*font: 400 var\(--font-size-work\)\/1\.5 var\(--font-sans\);[^}]*min-height: 42px/u);
+  assert.match(css, /:where\(button, summary, a, input, select, textarea\):focus-visible \{ outline: 2px solid/u);
+  assert.match(css, /\.resource-view-page > details\.resource-property-candidates:not\(\[open\]\) \{ display: block; \}/u);
+  assert.match(css, /\.resource-view-config label \{[^}]*flex: 1 1 160px/u);
+  assert.match(css, /\.recipe-form label:has\(input\[type="checkbox"\]\) \{[^}]*display: flex/u);
+  assert.match(css, /\.resource-view-table th \{[^}]*var\(--font-size-small\)\/1\.5/u);
+  assert.match(css, /\.data-work-page \[data-project-folder-form\] \{[^}]*display: grid;[^}]*gap: 16px/u);
+  assert.match(css, /\.data-work-page \[data-project-folders\]\[hidden\] \{ display: none; \}/u);
+  assert.match(css, /\.project-home-secondary-target > span:first-child \{ display: grid; gap: 4px/u);
+  assert.match(css, /\.topbar-project-link strong \{[^}]*text-overflow: ellipsis/u);
+});
+
+test('V18-04 client draft guard tracks protected forms and beforeunload only while dirty', () => {
+  const client = fs.readFileSync(path.resolve('src', 'ui', 'client.js'), 'utf8');
+  assert.match(client, /querySelectorAll\('\[data-draft-protect\]'\)/u);
+  assert.match(client, /addEventListener\('input', markDirty\)/u);
+  assert.match(client, /addEventListener\('change', markDirty\)/u);
+  assert.match(client, /addEventListener\('submit', clearDirty\)/u);
+  assert.match(client, /beforeunload/u);
+  assert.match(client, /preventDefault\(\)[\s\S]*?returnValue/u);
+});
+
 test('Saved Work requires the canonical Save Service for current saves', (t) => {
   const root = temporaryDirectory(t);
   const input = saveInput(root);
@@ -436,173 +502,459 @@ test('Data Work keeps the last valid state after a bad filter and expires by ina
   assert.equal(service.session(session.session_id), null);
 });
 
-test('Data Work save uses refreshable GET pages after review and confirmation', async (t) => {
-  fs.mkdirSync(testRoot, { recursive: true });
-  const root = fs.mkdtempSync(path.join(testRoot, 'data-work-save-canonical-'));
-  const stateDir = path.join(root, 'state');
+function explicitWorkFixture(t) {
+  const root = temporaryDirectory(t); const stateDir = path.join(root, 'state'); const workspaceRoot = path.join(root, 'workspace'); const firstRoot = path.join(workspaceRoot, 'Project One'); const secondRoot = path.join(workspaceRoot, 'Project Two');
+  const firstPath = write(path.join(firstRoot, 'Data', 'first.csv'), 'name,value\nOne,1\n'); const secondPath = write(path.join(firstRoot, 'Data', 'second.csv'), 'name,value\nTwo,2\n'); const unsupportedPath = write(path.join(firstRoot, 'Data', 'notes.md'), '# notes\n'); const foreignPath = write(path.join(secondRoot, 'Data', 'foreign.csv'), 'name,value\nForeign,3\n');
+  const registry = new Registry({ stateDir }); const adopted = registry.adoptRoot({ rootPath: workspaceRoot, rootType: 'project_workspace', contentPolicy: 'bounded_content' }); const firstProject = registry.create({ name: 'Project One', currentPath: 'Project One' }); const secondProject = registry.create({ name: 'Project Two', currentPath: 'Project Two' }); registry.attachRoot(firstProject.project_id, { rootId: adopted.root_id, relativePath: 'Project One', reason: 'V18-04 Work fixture.' }); registry.attachRoot(secondProject.project_id, { rootId: adopted.root_id, relativePath: 'Project Two', reason: 'V18-04 Work fixture.' });
+  const control = createResourceControl({ stateDir, ledger: registry.ledger }); const project = { id: firstProject.project_id, name: firstProject.name }; const foreignProject = { id: secondProject.project_id, name: secondProject.name }; const first = control.identify({ filePath: firstPath, project }); const second = control.identify({ filePath: secondPath, project }); const unsupported = control.identify({ filePath: unsupportedPath, project }); const foreign = control.identify({ filePath: foreignPath, project: foreignProject }); const service = createDataWorkService({ stateDir, projectRoot: root, installationRoot: root, resourceControl: control });
+  t.after(() => { control.dispose(); registry.dispose(); }); return { root, stateDir, registry, control, service, project, first, second, unsupported, foreign };
+}
+
+test('V18-04 creates a second explicit Work without reusing the first', (t) => {
+  const f = explicitWorkFixture(t); const first = f.service.createProjectSession(f.project); const second = f.service.createProjectSession(f.project); assert.notEqual(second.session_id, first.session_id); assert.equal(f.registry.ledger.workSessions.listOpenForProject(f.project.id).length, 2); assert.deepEqual(f.service.session(first.session_id).sources, []); assert.deepEqual(f.service.session(second.session_id).sources, []);
+});
+
+test('V18-04 replaces one Work Sources atomically and binds base revision', (t) => {
+  const f = explicitWorkFixture(t); const workA = f.service.createProjectSession(f.project); const workB = f.service.createProjectSession(f.project); const baseRevision = workB.revision; const updated = f.service.replaceSources(workB.session_id, [f.first.resource_id, f.second.resource_id], { baseRevision }); assert.deepEqual(updated.sources.map((item) => item.resource_id), [f.first.resource_id, f.second.resource_id]); assert.equal(updated.revision, baseRevision + 1); assert.deepEqual(f.service.session(workA.session_id).sources, []);
+  assert.throws(() => f.service.replaceSources(workB.session_id, [f.first.resource_id], { baseRevision }), /stale|revision|changed|current/u); const afterStale = f.service.session(workB.session_id); assert.deepEqual(afterStale.sources.map((item) => item.resource_id), [f.first.resource_id, f.second.resource_id]); assert.equal(afterStale.revision, updated.revision);
+  assert.throws(() => f.service.replaceSources(workB.session_id, [f.foreign.resource_id], { baseRevision: updated.revision }), /Project|stored|unavailable/u); assert.throws(() => f.service.replaceSources(workB.session_id, [f.unsupported.resource_id], { baseRevision: updated.revision }), /CSV|XLSX|supported/u); const unchanged = f.service.session(workB.session_id); assert.deepEqual(unchanged.sources.map((item) => item.resource_id), [f.first.resource_id, f.second.resource_id]); assert.equal(unchanged.revision, updated.revision);
+});
+
+test('V18-04 rejects stale Sheet, mapping, and Recipe writes', (t) => {
+  const f = explicitWorkFixture(t); const work = f.service.createProjectSession(f.project); const updated = f.service.replaceSources(work.session_id, [f.first.resource_id], { baseRevision: work.revision }); const staleRevision = updated.revision - 1; assert.throws(() => f.service.selectSourceSheet(work.session_id, 'SRC-1', 'Sheet1', { baseRevision: staleRevision }), /stale|revision|changed|current/u); assert.throws(() => f.service.confirmMapping(work.session_id, [], { baseRevision: staleRevision }), /stale|revision|changed|current/u); assert.throws(() => f.service.updateRecipe(work.session_id, { combine: 'concatenate' }, { baseRevision: staleRevision }), /stale|revision|changed|current/u); const unchanged = f.service.session(work.session_id); assert.equal(unchanged.revision, updated.revision); assert.deepEqual(unchanged.sources.map((item) => item.resource_id), [f.first.resource_id]);
+});
+
+test('V18-04 Step 2 keeps Work selection temporary until explicit target commit', async (t) => {
+  const f = explicitWorkFixture(t); const firstWork = f.service.createProjectSession(f.project); const secondWork = f.service.createProjectSession(f.project); const server = await startAtlasUiServer({ stateDir: f.stateDir, registry: f.registry, resourceControl: f.control, projectRoot: f.root, installationRoot: f.root, rules: {}, runtime: {} }); t.after(() => server.close()); const base = `${server.workspace_url}projects/${f.project.id}`; const resources = await (await fetch(`${base}/resources`)).text(); const csrf = resources.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1]; const before = f.registry.ledger.workSessions.listOpenForProject(f.project.id).map((item) => ({ id: item.session_id, revision: item.revision, sources: item.sources.map((source) => source.resource_id) }));
+  const selected = new URLSearchParams({ csrf }); selected.append('resource_id', f.first.resource_id); selected.append('resource_id', f.second.resource_id); const selection = await fetch(`${base}/work/selection`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: selected }); assert.equal(selection.status, 200); assert.deepEqual(await selection.json(), { ok: true, count: 2, href: `/projects/${f.project.id}/work/review` }); const afterSelection = f.registry.ledger.workSessions.listOpenForProject(f.project.id); assert.deepEqual(afterSelection.map((item) => item.sources.map((source) => source.resource_id)), before.map((item) => item.sources));
+  const review = await fetch(`${base}/work/review`); assert.equal(review.status, 200); const reviewHtml = await review.text(); assert.match(reviewHtml, /Start new Work/u); assert.match(reviewHtml, new RegExp(firstWork.session_id, 'u')); assert.match(reviewHtml, new RegExp(secondWork.session_id, 'u'));
+  const commit = (target, extra = {}) => fetch(`${base}/work/commit`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, target, ...extra }), redirect: 'manual' }); const created = await commit('new'); assert.equal(created.status, 303); const newWorks = f.registry.ledger.workSessions.listOpenForProject(f.project.id); assert.equal(newWorks.length, 3); const stale = await commit('existing', { work_id: firstWork.session_id, base_revision: String(firstWork.revision) }); assert.notEqual(stale.status, 500); const cancelled = await fetch(`${base}/work/cancel`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf }), redirect: 'manual' }); assert.equal(cancelled.status, 303);
+});
+
+test('V18-04 Step 3 binds Desktop Work forms and rejects stale revisions', async (t) => {
+  const f = explicitWorkFixture(t);
+  let session = f.service.createProjectSession(f.project);
+  session = f.service.addSource(session.session_id, f.first.resource_id);
+  const fingerprint = contentFileFingerprint(f.firstPath ?? path.join(f.root, 'workspace', 'Project One', 'Data', 'first.csv'));
+  f.registry.ledger.workSessions.updateSource(session.session_id, session.sources[0].source_key, {
+    fingerprint,
+    profile: { profile: { fields: [{ name: 'name' }] } },
+    processorVersion: 'test', status: 'ready',
+  }, new Date().toISOString());
+  session = f.service.confirmMapping(session.session_id, [{ source_key: session.sources[0].source_key, column: 'name', canonical: 'name' }], { baseRevision: session.revision });
+  const server = await startAtlasUiServer({ stateDir: f.stateDir, registry: f.registry, resourceControl: f.control, projectRoot: f.root, installationRoot: f.root, rules: {}, runtime: {} });
+  t.after(async () => { await server.close(); });
+  const workUrl = `${server.workspace_url}work/${session.session_id}`;
+  const html = await (await fetch(workUrl)).text();
+  assert.match(html, new RegExp(`<input type="hidden" name="base_revision" value="${session.revision}">`, 'u'));
+  const csrf = html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1];
+  assert.ok(csrf);
+  const stale = await fetch(`${workUrl}/action`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'manual',
+    body: new URLSearchParams({ csrf, action: 'recipe', combine: 'concatenate', base_revision: String(session.revision - 1) }),
+  });
+  assert.equal(stale.status, 303);
+  assert.match(stale.headers.get('location') ?? '', /draft_conflict=/u);
+  const after = f.service.session(session.session_id);
+  assert.equal(after.revision, session.revision);
+  const conflictUrl = new URL(stale.headers.get('location'), server.workspace_url); const conflictHtml = await (await fetch(conflictUrl)).text();
+  assert.match(conflictHtml, /Your draft is still preserved/u); assert.match(conflictHtml, /Reapply on current revision/u); assert.match(conflictHtml, /Discard draft/u); assert.match(conflictHtml, /id="work-draft-conflict"[^>]*tabindex="-1"[^>]*role="alert"/u);
+  const conflictToken = conflictHtml.match(/name="conflict_token" value="([^"]+)"/u)?.[1]; assert.ok(conflictToken);
+  const reapplied = await fetch(`${workUrl}/conflict?decision=reapply`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'manual', body: new URLSearchParams({ csrf, conflict_token: conflictToken, return_to: `/work/${session.session_id}` }) });
+  assert.equal(reapplied.status, 303); const current = f.service.session(session.session_id); assert.equal(current.revision, session.revision + 1); assert.equal(current.recipe.combine.operation, 'concatenate');
+  const secondConflict = await fetch(`${workUrl}/action`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'manual',
+    body: new URLSearchParams({ csrf, action: 'recipe', combine: 'join', base_revision: String(session.revision) }),
+  });
+  assert.equal(secondConflict.status, 303); const secondConflictUrl = new URL(secondConflict.headers.get('location'), server.workspace_url); const secondConflictHtml = await (await fetch(secondConflictUrl)).text(); const secondToken = secondConflictHtml.match(/name="conflict_token" value="([^"]+)"/u)?.[1]; assert.ok(secondToken);
+  const discarded = await fetch(`${workUrl}/conflict?decision=discard`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'manual', body: new URLSearchParams({ csrf, conflict_token: secondToken }) });
+  assert.equal(discarded.status, 303); const afterDiscard = f.service.session(session.session_id); assert.equal(afterDiscard.revision, current.revision); assert.equal(afterDiscard.recipe.combine.operation, 'concatenate');
+});
+
+test('V18-04 Step 3 Host starts distinct Works and binds mutation revisions', (t) => {
+  const f = explicitWorkFixture(t);
+  const cliPath = path.resolve('bin', 'atlas.js');
+  const runHost = (args) => spawnSync(process.execPath, [cliPath, ...args, '--json'], {
+    cwd: path.resolve('.'), encoding: 'utf8', windowsHide: true,
+    env: { ...process.env, ATLAS_STATE_DIR: f.stateDir },
+  });
+  const startArgs = ['table-work', 'start', '--project', f.project.id, '--source', 'Data/first.csv', '--tool', 'test', '--client-run-id', 'v18-04-step3'];
+  const first = runHost(startArgs);
+  assert.equal(first.status, 0, first.stderr);
+  const firstEnvelope = JSON.parse(first.stdout);
+  assert.equal(firstEnvelope.ok, true);
+  const firstId = firstEnvelope.data.session_id;
+  const firstSnapshot = {
+    revision: firstEnvelope.data.revision,
+    sources: firstEnvelope.data.sources.map((item) => item.resource_id),
+  };
+  const second = runHost(startArgs.map((value) => value === 'v18-04-step3' ? 'v18-04-step3-second' : value));
+  assert.equal(second.status, 0, second.stderr);
+  const secondId = JSON.parse(second.stdout).data.session_id;
+  assert.notEqual(secondId, firstId);
+
+  const mutationCases = [
+    ['add-source', ['--source', 'Data/second.csv']],
+    ['remove-source', ['--resource', f.first.resource_id]],
+    ['sheet', ['--source-key', 'SRC-1', '--sheet', 'Sheet1']],
+    ['align', ['--request-file', write(path.join(f.root, 'mapping.json'), JSON.stringify({ mapping: [] }))]],
+    ['recipe', ['--request-file', write(path.join(f.root, 'recipe.json'), JSON.stringify({ combine: 'concatenate' }))]],
+  ];
+  for (const [action, extra] of mutationCases) {
+    const result = runHost(['table-work', action, firstId, ...extra]);
+    assert.notEqual(result.status, 0, `${action} unexpectedly succeeded`);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.error?.code, 'ATLAS_STATE_CONFLICT', `${action}: ${result.stdout}`);
+  }
+  const current = f.registry.ledger.workSessions.byId(firstId);
+  assert.equal(current.revision, firstSnapshot.revision);
+  assert.deepEqual(current.sources.map((item) => item.resource_id), firstSnapshot.sources);
+});
+
+test('V18-04 Step 4 binds Desktop Prepare and Preview to the current revision', async (t) => {
+  const f = explicitWorkFixture(t);
+  let session = f.service.createProjectSession(f.project);
+  session = f.service.addSource(session.session_id, f.first.resource_id);
+  const sourcePath = path.join(f.root, 'workspace', 'Project One', 'Data', 'first.csv');
+  const fingerprint = contentFileFingerprint(sourcePath);
+  f.registry.ledger.workSessions.updateSource(session.session_id, session.sources[0].source_key, {
+    fingerprint,
+    profile: { profile: { fields: [{ name: 'name' }] } },
+    processorVersion: 'test', status: 'ready',
+  }, new Date().toISOString());
+  session = f.service.confirmMapping(session.session_id, [{ source_key: session.sources[0].source_key, column: 'name', canonical: 'name' }], { baseRevision: session.revision });
+  const runContentOperation = async (operation, args) => {
+    if (operation === 'fingerprint') return contentFileFingerprint(args.filePath);
+    if (operation === 'data-work' && args.action === 'profile') return { status: 'ready', profile: { fields: [{ name: 'name' }] }, processor: { version: 'test' } };
+    if (operation === 'data-work' && args.action === 'preview') return { source_summary: { rows: 1, columns: 1 }, result_summary: { rows: 1, columns: 1 }, columns: ['name'], rows: [['One']] };
+    throw new Error(`Unexpected test operation: ${operation}`);
+  };
+  const server = await startAtlasUiServer({ stateDir: f.stateDir, registry: f.registry, resourceControl: f.control, projectRoot: f.root, installationRoot: f.root, runContentOperation, rules: {}, runtime: {} });
+  t.after(async () => { await server.close(); });
+  const workUrl = `${server.workspace_url}work/${session.session_id}`;
+  const html = await (await fetch(workUrl)).text();
+  const revisionInputs = html.match(new RegExp(`name="base_revision" value="${session.revision}"`, 'gu'));
+  assert.ok(revisionInputs && revisionInputs.length >= 4, 'Prepare, Sheet, mapping, Recipe, and Preview forms must carry base_revision.');
+  const csrf = html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1];
+  assert.ok(csrf);
+  const staleRevision = session.revision;
+  session = f.service.updateRecipe(session.session_id, { combine: 'concatenate' }, { baseRevision: staleRevision });
+  const stalePreview = await fetch(`${workUrl}/action`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'manual',
+    body: new URLSearchParams({ csrf, action: 'preview', base_revision: String(staleRevision) }),
+  });
+  assert.equal(stalePreview.status, 303);
+  assert.equal(f.registry.ledger.workSessions.byId(session.session_id).preview, null);
+  assert.match(await (await fetch(workUrl)).text(), /Work changed|Refresh/u);
+});
+
+test('V18-04 Step 4 Host execution commands require a current base revision', (t) => {
+  const f = explicitWorkFixture(t);
+  const runHost = (args) => spawnSync(process.execPath, [path.resolve('bin', 'atlas.js'), ...args, '--json'], {
+    cwd: path.resolve('.'), encoding: 'utf8', windowsHide: true, env: { ...process.env, ATLAS_STATE_DIR: f.stateDir },
+  });
+  const start = runHost(['table-work', 'start', '--project', f.project.id, '--source', 'Data/first.csv', '--tool', 'test', '--client-run-id', 'v18-04-step4']);
+  assert.equal(start.status, 0, start.stderr);
+  const sessionId = JSON.parse(start.stdout).data.session_id;
+  const requestFile = write(path.join(f.root, 'recipe-step4.json'), JSON.stringify({ combine: 'concatenate' }));
+  for (const args of [
+    ['table-work', 'prepare', sessionId],
+    ['table-work', 'preview', sessionId],
+    ['table-work', 'save', sessionId, '--folder', 'Results', '--file-name', 'result.csv', '--format', 'csv', '--request-key', 'step4', '--reason', 'test', '--tool', 'test', '--client-run-id', 'step4'],
+  ]) {
+    const result = runHost(args);
+    assert.notEqual(result.status, 0, `${args[1]} unexpectedly succeeded without --base-revision`);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.error?.code, 'ATLAS_STATE_CONFLICT', `${args[1]}: ${result.stdout}`);
+  }
+  const stale = runHost(['table-work', 'recipe', sessionId, '--request-file', requestFile, '--base-revision', '0']);
+  assert.notEqual(stale.status, 0);
+  assert.equal(JSON.parse(stale.stdout).error?.code, 'ATLAS_STATE_CONFLICT');
+});
+
+test('V18-04 Step 4 rejects a Preview that completes after the Work revision changes', async (t) => {
+  const f = explicitWorkFixture(t);
+  const sourcePath = path.join(f.root, 'workspace', 'Project One', 'Data', 'first.csv');
+  let release;
+  let started;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const runDataWorkFn = async (args) => {
+    if (args.action === 'preview') {
+      started?.();
+      await gate;
+      return { source_summary: { rows: 1, columns: 1 }, result_summary: { rows: 1, columns: 1 }, columns: ['name'], rows: [['One']] };
+    }
+    return { status: 'ready', profile: { fields: [{ name: 'name' }] }, processor: { version: 'test' } };
+  };
+  const service = createDataWorkService({
+    stateDir: f.stateDir, projectRoot: f.root, installationRoot: f.root, resourceControl: f.control,
+    runDataWorkFn, fingerprintFn: async (filePath) => contentFileFingerprint(filePath),
+  });
+  let session = service.createProjectSession(f.project);
+  session = service.addSource(session.session_id, f.first.resource_id);
+  const fingerprint = contentFileFingerprint(sourcePath);
+  f.registry.ledger.workSessions.updateSource(session.session_id, session.sources[0].source_key, {
+    fingerprint,
+    profile: { profile: { fields: [{ name: 'name' }] } },
+    processorVersion: 'test', status: 'ready',
+  }, new Date().toISOString());
+  session = service.confirmMapping(session.session_id, [{ source_key: session.sources[0].source_key, column: 'name', canonical: 'name' }], { baseRevision: session.revision });
+  const previewStarted = new Promise((resolve) => { started = resolve; });
+  const preview = service.previewPersistent(session.session_id);
+  await previewStarted;
+  const changed = service.updateRecipe(session.session_id, { combine: 'concatenate' }, { baseRevision: session.revision });
+  release();
+  await assert.rejects(preview, (error) => error?.code === 'ATLAS_STATE_CONFLICT');
+  assert.equal(changed.revision, session.revision + 1);
+  assert.equal(f.registry.ledger.workSessions.byId(session.session_id).preview, null);
+});
+
+test('multi-source Work selection persists Resource IDs and restores missing sources after restart', async (t) => {
+  const root = temporaryDirectory(t); const stateDir = path.join(root, 'state');
   const workspaceRoot = path.join(root, 'workspace');
-  const projectRoot = path.join(workspaceRoot, 'Project One');
-  const sourcePath = write(path.join(projectRoot, 'Data', 'source.csv'), 'name,amount\nOne,1\n');
+  const projectRoot = path.join(workspaceRoot, 'Project One'); fs.mkdirSync(projectRoot, { recursive: true });
+  const firstPath = write(path.join(projectRoot, 'Data', 'first.csv'), 'name,value\nOne,1\n');
+  const secondPath = write(path.join(projectRoot, 'Data', 'second.xlsx'), 'fixture');
+  const unsupportedPath = write(path.join(projectRoot, 'Data', 'notes.md'), '# notes\n');
   const registry = new Registry({ stateDir });
   const adopted = registry.adoptRoot({ rootPath: workspaceRoot, rootType: 'project_workspace', contentPolicy: 'bounded_content' });
   const created = registry.create({ name: 'Project One', currentPath: 'Project One' });
-  registry.attachRoot(created.project_id, { rootId: adopted.root_id, relativePath: 'Project One', reason: 'Bind Data Work regression Project.' });
-  const targetProjectRoot = path.join(workspaceRoot, 'Project Two');
-  fs.mkdirSync(path.join(targetProjectRoot, 'Data'), { recursive: true });
-  const targetProject = registry.create({ name: 'Project Two', currentPath: 'Project Two' });
-  registry.attachRoot(targetProject.project_id, { rootId: adopted.root_id, relativePath: 'Project Two', reason: 'Bind Data Work target Project.' });
-  const intake = new Intake({ stateDir });
-  const preview = {
-    columns: ['name', 'amount'], column_types: { name: 'text', amount: 'number' }, rows: [['One', 1]],
-    source_summary: { rows: 1, columns: 2 }, result_summary: { rows: 1, columns: 2 },
+  registry.attachRoot(created.project_id, { rootId: adopted.root_id, relativePath: 'Project One', reason: 'Bind Work Session fixture.' });
+  const project = { id: created.project_id, name: 'Project One' };
+  const resourceControl = createResourceControl({ stateDir, ledger: registry.ledger });
+  const first = resourceControl.identify({ filePath: firstPath, project });
+  const second = resourceControl.identify({ filePath: secondPath, project });
+  const unsupported = resourceControl.identify({ filePath: unsupportedPath, project });
+  const secondProjectRoot = path.join(workspaceRoot, 'Project Two'); fs.mkdirSync(secondProjectRoot, { recursive: true });
+  const secondCreated = registry.create({ name: 'Project Two', currentPath: 'Project Two' });
+  registry.attachRoot(secondCreated.project_id, { rootId: adopted.root_id, relativePath: 'Project Two', reason: 'Bind foreign Work Session fixture.' });
+  const foreign = resourceControl.identify({ filePath: write(path.join(secondProjectRoot, 'foreign.csv'), 'name\nForeign\n'), project: { id: secondCreated.project_id } });
+  const options = { stateDir, projectRoot: root, installationRoot: root, resourceControl };
+  const service = createDataWorkService(options);
+  const opened = service.projectSession(project, { folder: 'Data', resource_id: first.resource_id });
+  service.addSource(opened.session_id, first.resource_id);
+  service.addSource(opened.session_id, second.resource_id);
+  assert.deepEqual(service.session(opened.session_id).sources.map((item) => item.resource_id), [first.resource_id, second.resource_id]);
+  service.removeSource(opened.session_id, first.resource_id);
+  assert.deepEqual(service.session(opened.session_id).sources.map((item) => item.resource_id), [second.resource_id]);
+  assert.throws(() => service.addSource(opened.session_id, unsupported.resource_id), /CSV or XLSX/u);
+  assert.throws(() => service.addSource(opened.session_id, foreign.resource_id), /stored in this Project/u);
+  service.addSource(opened.session_id, first.resource_id);
+  fs.rmSync(secondPath);
+  const restarted = createDataWorkService(options);
+  const restored = restarted.projectSession(project);
+  assert.equal(restored.session_id, opened.session_id);
+  assert.equal(restored.sources.find((item) => item.resource_id === second.resource_id).status, 'missing');
+  assert.deepEqual(restored.return_state, { folder: 'Data', resource_id: first.resource_id });
+  const server = await startAtlasUiServer({ stateDir, ...serverServices(registry), resourceControl });
+  try {
+    const html = await (await fetch(`${server.workspace_url}work/${opened.session_id}`)).text();
+    assert.match(html, new RegExp(`topbar-project-link[^>]*><strong>${project.name}</strong>`, 'u'));
+    assert.doesNotMatch(html, /\[object Object\]/u);
+  } finally { await server.close(); }
+  resourceControl.dispose(); registry.dispose();
+});
+
+test('Resources keeps a temporary multi-source selection out of Work and clears it after UI server restart', async (t) => {
+  const root = temporaryDirectory(t); const stateDir = path.join(root, 'state'); const workspaceRoot = path.join(root, 'workspace');
+  const projectRoot = path.join(workspaceRoot, 'Project One');
+  const firstPath = write(path.join(projectRoot, 'Data', 'first.csv'), 'name,value\nOne,1\n');
+  const secondPath = write(path.join(projectRoot, 'Data', 'second.csv'), 'name,value\nTwo,2\n');
+  write(path.join(projectRoot, 'Data', 'notes.md'), '# notes\n');
+  const registry = new Registry({ stateDir });
+  const adopted = registry.adoptRoot({ rootPath: workspaceRoot, rootType: 'project_workspace', contentPolicy: 'bounded_content' });
+  const created = registry.create({ name: 'Project One', currentPath: 'Project One' });
+  registry.attachRoot(created.project_id, { rootId: adopted.root_id, relativePath: 'Project One', reason: 'Bind Work UI fixture.' });
+  const resourceControl = createResourceControl({ stateDir, ledger: registry.ledger });
+  const start = () => startAtlasUiServer({ stateDir, ...serverServices(registry), resourceControl });
+  let server = await start();
+  t.after(async () => { if (server) await server.close(); resourceControl.dispose(); registry.dispose(); });
+  const resourcesUrl = `${server.workspace_url}projects/${created.project_id}/resources?folder=Data`;
+  let html = await (await fetch(resourcesUrl)).text();
+  const csrf = html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1] ?? html.match(/data-csrf="([a-f0-9]+)"/u)?.[1];
+  assert.match(html, /Selected 0 files/u);
+  assert.equal((html.match(/data-resource-row data-resource-name="(?:first|second)\.csv"/gu) ?? []).length, 2);
+  const select = async (...resourceIds) => {
+    const payload = new URLSearchParams({ csrf }); resourceIds.forEach((id) => payload.append('resource_id', id));
+    const response = await fetch(`${server.workspace_url}projects/${created.project_id}/work/selection`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' }, body: payload });
+    const responseText = await response.text();
+    assert.equal(response.status, 200, responseText);
+    return JSON.parse(responseText);
   };
-  let exportCount = 0;
+  const firstResource = resourceControl.identify({ filePath: firstPath, project: { id: created.project_id } });
+  const secondResource = resourceControl.identify({ filePath: secondPath, project: { id: created.project_id } });
+  const selection = await select(firstResource.resource_id, secondResource.resource_id);
+  assert.equal(selection.count, 2);
+  assert.equal(registry.ledger.workSessions.listOpenForProject(created.project_id).length, 0);
+  await server.close(); server = await start();
+  const restartedResourcesUrl = `${server.workspace_url}projects/${created.project_id}/resources?folder=Data`;
+  html = await (await fetch(restartedResourcesUrl)).text(); assert.match(html, /Selected 0 files/u); assert.match(html, /data-work-open[^>]*aria-disabled="true"/u);
+  await server.close(); server = null;
+});
+
+test('Work profiles Sources independently, persists field alignment, and stops stale facts after a Source change', async (t) => {
+  const root = temporaryDirectory(t); const stateDir = path.join(root, 'state'); const workspaceRoot = path.join(root, 'workspace'); const projectRoot = path.join(workspaceRoot, 'Project');
+  const firstPath = write(path.join(projectRoot, 'first.csv'), 'id,date,name\n1,2026-01-01,One\n');
+  const workbookPath = write(path.join(projectRoot, 'second.xlsx'), 'workbook fixture');
+  const brokenPath = write(path.join(projectRoot, 'broken.csv'), 'id\n3\n');
+  const registry = new Registry({ stateDir }); const adopted = registry.adoptRoot({ rootPath: workspaceRoot, rootType: 'project_workspace', contentPolicy: 'bounded_content' }); const created = registry.create({ name: 'Project', currentPath: 'Project' }); registry.attachRoot(created.project_id, { rootId: adopted.root_id, relativePath: 'Project', reason: 'Bind Source profile fixture.' });
+  const project = { id: created.project_id, name: 'Project' }; const control = createResourceControl({ stateDir, ledger: registry.ledger });
+  const resources = [firstPath, workbookPath, brokenPath].map((filePath) => control.identify({ filePath, project }));
+  const profile = (fields, rows = 2) => ({ rows, columns: fields.length, fields, null_cells: 1, duplicate_rows: 1 });
+  const runDataWorkFn = async ({ filePath, sheet }) => {
+    if (filePath === brokenPath) throw new Error('Delimited parser rejected this Source.');
+    if (filePath === workbookPath && !sheet) return { processor: { version: '1.1.0' }, status: 'sheet_required', source: { sha256: contentFileFingerprint(filePath).sha256 }, sheets: [{ name: 'Sheet A', rows: 2 }] };
+    const fields = filePath === firstPath
+      ? [{ name: 'id', inferred_type: 'number', missing_count: 0, distinct_count: 2 }, { name: 'date', inferred_type: 'date', missing_count: 0, distinct_count: 2, date_range: { minimum: '2026-01-01', maximum: '2026-01-02' } }, { name: 'name', inferred_type: 'text', missing_count: 1, distinct_count: 1 }]
+      : [{ name: 'Identifier', inferred_type: 'number', missing_count: 0, distinct_count: 2 }, { name: 'date', inferred_type: 'text', missing_count: 0, distinct_count: 2 }];
+    return { processor: { version: '1.1.0' }, status: 'ready', source: { sha256: contentFileFingerprint(filePath).sha256 }, sheet, sheets: filePath === workbookPath ? [{ name: 'Sheet A', rows: 2 }] : [], profile: profile(fields) };
+  };
+  const options = { stateDir, projectRoot: root, installationRoot: root, resourceControl: control, fingerprintFn: async (filePath) => contentFileFingerprint(filePath), runDataWorkFn };
+  const service = createDataWorkService(options); let session = service.projectSession(project);
+  for (const resource of resources) session = service.addSource(session.session_id, resource.resource_id);
+  session = await service.prepareSources(session.session_id);
+  assert.deepEqual(session.sources.map((item) => item.status), ['ready', 'sheet_required', 'failed']);
+  assert.throws(() => service.updateRecipe(session.session_id, { combine: 'join', left_key: 'id', right_key: 'id' }), /exactly two Sources/u);
+  assert.equal(session.sources[0].profile.profile.duplicate_rows, 1); assert.equal(session.sources[0].profile.profile.fields[1].date_range.minimum, '2026-01-01');
+  service.selectSourceSheet(session.session_id, session.sources[1].source_key, 'Sheet A'); session = await service.prepareSources(session.session_id);
+  assert.deepEqual(session.sources.map((item) => item.status), ['ready', 'ready', 'failed']);
+  assert.deepEqual(session.comparison.common_fields, ['date']); assert.deepEqual(session.comparison.type_conflicts.map((item) => item.field), ['date']);
+  const mapping = [
+    { source_key: session.sources[0].source_key, column: 'id', canonical: 'id' },
+    { source_key: session.sources[0].source_key, column: 'date', canonical: 'date' },
+    { source_key: session.sources[0].source_key, column: 'name', canonical: 'name' },
+    { source_key: session.sources[1].source_key, column: 'Identifier', canonical: 'id' },
+    { source_key: session.sources[1].source_key, column: 'date', canonical: 'date' },
+  ];
+  assert.throws(() => service.confirmMapping(session.session_id, [mapping[0], mapping[0], ...mapping.slice(2)]), /exactly one result field/u);
+  service.confirmMapping(session.session_id, mapping); fs.appendFileSync(firstPath, '2,2026-01-02,Two\n');
+  session = await service.validateSources(session.session_id);
+  const mappingWithoutBasis = (items) => items.map(({ source_sha256: _sourceHash, source_sheet: _sourceSheet, ...item }) => item);
+  assert.equal(session.sources[0].status, 'changed'); assert.equal(session.sources[1].status, 'ready'); assert.equal(session.sources[2].status, 'failed'); assert.deepEqual(mappingWithoutBasis(session.mapping), mapping); assert.equal(session.preview, null); assert.equal(session.mapping_complete, true);
+  session = await service.prepareSources(session.session_id);
+  assert.equal(session.sources[0].status, 'ready'); assert.equal(session.sources[2].status, 'failed'); assert.deepEqual(mappingWithoutBasis(session.mapping), mapping); assert.equal(session.mapping_complete, false);
+  const restarted = createDataWorkService(options).projectSession(project); assert.deepEqual(mappingWithoutBasis(restarted.mapping), mapping); assert.equal(restarted.mapping_complete, false);
+  assert.throws(() => service.updateRecipe(session.session_id, { combine: 'concatenate', source_column: true, source_column_name: 'id' }), /Source column must use a new field name/u);
+  control.dispose(); registry.dispose();
+});
+
+test('multi-source Work saves one verified result and preserves Recipe, lineage, conflict, Undo, and Redo', async (t) => {
+  const root = temporaryDirectory(t); const stateDir = path.join(root, 'state'); const workspaceRoot = path.join(root, 'workspace');
+  const projectRoot = path.join(workspaceRoot, 'Project One'); fs.mkdirSync(path.join(projectRoot, 'Results'), { recursive: true });
+  const firstPath = write(path.join(projectRoot, 'Data', 'first.csv'), 'id,name\n1,One\n');
+  const secondPath = write(path.join(projectRoot, 'Data', 'second.csv'), 'Identifier,name\n2,Two\n');
+  const registry = new Registry({ stateDir });
+  const adopted = registry.adoptRoot({ rootPath: workspaceRoot, rootType: 'project_workspace', contentPolicy: 'bounded_content' });
+  const created = registry.create({ name: 'Project One', currentPath: 'Project One' });
+  registry.attachRoot(created.project_id, { rootId: adopted.root_id, relativePath: 'Project One', reason: 'Bind multi-source Save regression Project.' });
+  const control = createResourceControl({ stateDir, ledger: registry.ledger }); const intake = new Intake({ stateDir });
+  let exportCount = 0; const executions = [];
+  const operationResult = () => ({
+    processor: { version: '1.1.0' }, columns: ['id', 'name', 'origin'], rows: [[1, 'One', 'first.csv'], [2, 'Two', 'second.csv']],
+    preview: { rows_shown: 2, total_rows: 2 }, result_summary: { rows: 2, columns: 3 },
+    validation: { input_rows: 2, output_rows: 2, null_cells: 0, duplicate_rows: 0, conversion_failures: {} },
+  });
   const runContentOperation = async (operation, args) => {
     if (operation === 'fingerprint') return contentFileFingerprint(args.filePath);
     if (operation !== 'data-work') throw new Error(`Unexpected content operation: ${operation}`);
-    if (args.action === 'export') {
-      exportCount += 1;
-      fs.copyFileSync(args.filePath, args.outputPath);
-      const staged = contentFileFingerprint(args.outputPath);
-      return { ...structuredClone(preview), staged: { path: staged.file_path, sha256: staged.sha256, bytes: staged.bytes } };
+    if (args.action === 'profile') {
+      const fields = args.filePath === firstPath
+        ? [{ name: 'id', inferred_type: 'number', missing_count: 0, distinct_count: 1 }, { name: 'name', inferred_type: 'text', missing_count: 0, distinct_count: 1 }]
+        : [{ name: 'Identifier', inferred_type: 'number', missing_count: 0, distinct_count: 1 }, { name: 'name', inferred_type: 'text', missing_count: 0, distinct_count: 1 }];
+      return { processor: { version: '1.1.0' }, status: 'ready', source: contentFileFingerprint(args.filePath), profile: { rows: 1, columns: 2, fields, null_cells: 0, duplicate_rows: 0 }, sheets: [] };
     }
-    return structuredClone(preview);
+    const request = JSON.parse(fs.readFileSync(args.requestPath, 'utf8')); executions.push({ action: args.action, request });
+    const result = operationResult();
+    if (args.action === 'export') {
+      exportCount += 1; fs.writeFileSync(args.outputPath, 'id,name,origin\n1,One,first.csv\n2,Two,second.csv\n');
+      const staged = contentFileFingerprint(args.outputPath); return { ...result, staged: { path: staged.file_path, sha256: staged.sha256, bytes: staged.bytes } };
+    }
+    return result;
   };
-  const server = await startAtlasUiServer({
-    stateDir, runContentOperation, ...serverServices(registry), resourceControl: null, intake, projectRoot, installationRoot: projectRoot,
-  });
-  t.after(async () => { await server.close(); intake.dispose(); registry.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); });
+  let server = await startAtlasUiServer({ stateDir, runContentOperation, ...serverServices(registry), resourceControl: control, intake, projectRoot, installationRoot: projectRoot });
+  t.after(async () => { if (server) await server.close(); intake.dispose(); control.dispose(); registry.dispose(); });
 
-  const start = await fetch(`${server.workspace_url}projects/${created.project_id}/data-work?path=Data/source.csv`, { redirect: 'manual' });
-  assert.equal(start.status, 303);
-  const workUrl = new URL(start.headers.get('location'), server.workspace_url).toString();
-  const savePage = await fetch(`${workUrl}/save`);
-  const saveHtml = await savePage.text();
-  const csrf = saveHtml.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1];
-
-  const review = await fetch(`${workUrl}/save/review`, {
-    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ csrf, project_id: targetProject.project_id, folder: 'Data', file_name: 'cleaned.csv' }), redirect: 'manual',
-  });
-  assert.equal(review.status, 303);
-  if (!/\/save\/review\?/u.test(review.headers.get('location'))) {
-    const failure = await (await fetch(new URL(review.headers.get('location'), server.workspace_url))).text();
-    assert.fail(failure.match(/<section class="surface"><p class="callout warn">([^<]+)/u)?.[1] ?? review.headers.get('location'));
+  let html = await (await fetch(`${server.workspace_url}projects/${created.project_id}/resources?folder=Data`)).text();
+  let csrf = html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1];
+  const firstResource = control.identify({ filePath: firstPath, project: { id: created.project_id } });
+  const secondResource = control.identify({ filePath: secondPath, project: { id: created.project_id } });
+  const selectionBody = new URLSearchParams({ csrf }); selectionBody.append('resource_id', firstResource.resource_id); selectionBody.append('resource_id', secondResource.resource_id);
+  const selection = await fetch(`${server.workspace_url}projects/${created.project_id}/work/selection`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' }, body: selectionBody });
+  assert.equal(selection.status, 200, await selection.text());
+  const committed = await fetch(`${server.workspace_url}projects/${created.project_id}/work/commit`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, target: 'new' }), redirect: 'manual' });
+  assert.equal(committed.status, 303); const workPath = committed.headers.get('location'); let workUrl = new URL(workPath, server.workspace_url).toString();
+  html = await (await fetch(workUrl)).text(); csrf = html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1];
+  const postAction = (body) => fetch(`${workUrl}/action`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body, redirect: 'manual' });
+  let session = registry.ledger.workSessions.latestOpenForProject(created.project_id);
+  assert.equal((await postAction(new URLSearchParams({ csrf, action: 'prepare_sources', base_revision: String(session.revision) }))).status, 303);
+  session = registry.ledger.workSessions.latestOpenForProject(created.project_id); assert.deepEqual(session.sources.map((item) => item.status), ['ready', 'ready']);
+  const mapping = new URLSearchParams({ csrf, action: 'confirm_mapping' });
+  for (const [sourceKey, column, canonical] of [[session.sources[0].source_key, 'id', 'id'], [session.sources[0].source_key, 'name', 'name'], [session.sources[1].source_key, 'Identifier', 'id'], [session.sources[1].source_key, 'name', 'name']]) {
+    mapping.append('source_key', sourceKey); mapping.append('column', column); mapping.append('canonical', canonical);
   }
-  const reviewUrl = new URL(review.headers.get('location'), server.workspace_url).toString();
-  const reviewPage = await fetch(reviewUrl);
-  assert.equal(reviewPage.status, 200);
-  assert.match(await reviewPage.text(), /Review save/u);
+  mapping.set('base_revision', String(session.revision));
+  assert.equal((await postAction(mapping)).status, 303);
+  session = registry.ledger.workSessions.latestOpenForProject(created.project_id);
+  const recipe = new URLSearchParams({ csrf, action: 'recipe', base_revision: String(session.revision), combine: 'concatenate', source_column: 'yes', source_column_name: 'origin', deduplicate_columns: 'id', sort_column: 'id', sort_direction: 'asc' });
+  recipe.append('select_column', 'id'); recipe.append('select_column', 'name');
+  assert.equal((await postAction(recipe)).status, 303);
+  session = registry.ledger.workSessions.latestOpenForProject(created.project_id);
+  assert.equal((await postAction(new URLSearchParams({ csrf, action: 'preview', base_revision: String(session.revision) }))).status, 303);
+  session = registry.ledger.workSessions.latestOpenForProject(created.project_id);
+  assert.equal(session.preview_revision, session.revision); assert.equal(session.recipe.combine.operation, 'concatenate'); assert.equal(session.recipe.steps.at(-1).operation, 'validate');
+  assert.deepEqual(executions[0].request.recipe, session.recipe); assert.deepEqual(executions[0].request.mapping, session.mapping);
 
-  const existingTarget = path.join(targetProjectRoot, 'Data', 'cleaned.csv');
-  fs.writeFileSync(existingTarget, 'external result\n');
-  const conflicted = await fetch(`${workUrl}/save/confirm`, {
-    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ csrf, project_id: targetProject.project_id, folder: 'Data', file_name: 'cleaned.csv' }), redirect: 'manual',
-  });
-  assert.equal(conflicted.status, 303);
-  assert.match(conflicted.headers.get('location'), /\/save$/u);
-  assert.equal(fs.readFileSync(existingTarget, 'utf8'), 'external result\n');
-  const conflictHtml = await (await fetch(new URL(conflicted.headers.get('location'), server.workspace_url))).text();
-  assert.match(conflictHtml, /Rename file/u);
-  assert.match(conflictHtml, /Choose another folder/u);
-  assert.match(conflictHtml, /Cancel/u);
-  assert.equal(readSavedWorkState(stateDir).items.some((item) => item.status === 'executed'), false);
-  const renamedReview = await fetch(`${workUrl}/save/review`, {
-    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ csrf, project_id: targetProject.project_id, folder: 'Data', file_name: 'renamed.csv' }), redirect: 'manual',
-  });
-  assert.equal(renamedReview.status, 303);
+  await server.close(); server = await startAtlasUiServer({ stateDir, runContentOperation, ...serverServices(registry), resourceControl: control, intake, projectRoot, installationRoot: projectRoot });
+  workUrl = new URL(workPath, server.workspace_url).toString(); html = await (await fetch(workUrl)).text(); csrf = html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1]; assert.match(html, /Save full result/u); assert.match(html, /first\.csv/u); assert.match(html, /second\.csv/u);
+  assert.match(html, /name="source_column" value="yes" checked/u); assert.match(html, /name="source_column_name" value="origin"/u); assert.match(html, /name="deduplicate_columns" value="id"/u); assert.match(html, /name="sort_column"[\s\S]*value="id" selected/u);
+  const savePage = await fetch(`${workUrl}/save`); assert.equal(savePage.status, 200); assert.match(await savePage.text(), /Format/u);
+  const review = await fetch(`${workUrl}/save/review`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, project_id: created.project_id, folder: 'Results', file_name: 'combined.csv', format: 'csv' }), redirect: 'manual' });
+  assert.equal(review.status, 303); assert.match(review.headers.get('location'), /\/save\/review\?/u);
+  const reviewUrl = new URL(review.headers.get('location'), server.workspace_url); const reviewPage = await fetch(reviewUrl); assert.equal(reviewPage.status, 200); assert.match(await reviewPage.text(), /2 rows · 3 columns/u);
+  const reviewedCandidate = { stage_id: reviewUrl.searchParams.get('stage_id'), revision: reviewUrl.searchParams.get('revision'), candidate_sha256: reviewUrl.searchParams.get('candidate_sha256') };
+  const confirmParams = (fileName, format, candidate) => new URLSearchParams({ csrf, project_id: created.project_id, folder: 'Results', file_name: fileName, format, ...candidate });
 
-  const confirmed = await fetch(`${workUrl}/save/confirm`, {
-    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ csrf, project_id: targetProject.project_id, folder: 'Data', file_name: 'renamed.csv' }), redirect: 'manual',
-  });
-  assert.equal(confirmed.status, 303);
-  assert.match(confirmed.headers.get('location'), /\/saved\?work_id=SAV-/u);
-  const savedStates = readSavedWorkState(stateDir).items.filter((item) => item.save_id);
-  assert.equal(savedStates.filter((item) => item.status === 'executed').length, 1, JSON.stringify(savedStates.map((item) => ({ status: item.status, save_id: item.save_id, request_key: item.request_key, target: item.target }))));
-  const savedPage = await fetch(new URL(confirmed.headers.get('location'), server.workspace_url), { redirect: 'manual' });
-  assert.equal(savedPage.status, 200, `saved redirect: ${savedPage.headers.get('location')}`);
-  assert.match((await savedPage.text()).slice(-3000), /Atlas saved the new result/u);
-  assert.equal(fs.readFileSync(existingTarget, 'utf8'), 'external result\n');
-  const saves = readSavedWorkState(stateDir).items.filter((item) => item.save_id);
-  assert.equal(saves.filter((item) => item.status === 'failed').length, 1);
-  assert.equal(saves.filter((item) => item.status === 'executed').length, 1);
-  assert.match(saves.find((item) => item.status === 'executed').resources_href, /path=Data%2Frenamed\.csv/u);
-  const executed = saves.find((item) => item.status === 'executed');
-  const sourceResource = registry.ledger.resources.byPath(sourcePath);
-  assert.match(executed.resource_id, /^RES-/u);
-  assert.match(sourceResource.id, /^RES-/u);
-  assert.notEqual(executed.resource_id, sourceResource.id);
-  assert.deepEqual(executed.inputs, [{ relative_path: 'Project One/Data/source.csv', sha256: contentFileFingerprint(sourcePath).sha256 }]);
-  const derivedSave = intake.show(executed.save_id);
-  assert.equal(derivedSave.inputs.length, 1);
-  assert.equal(derivedSave.inputs[0].path, 'Project One/Data/source.csv');
-  assert.equal(derivedSave.lineage.length, 1);
-  assert.equal(derivedSave.lineage[0].input_material_id, derivedSave.inputs[0].material_id);
-  assert.equal(createSavedWorkService({ stateDir }).activityItems().find((item) => item.save_id === executed.save_id).resource_id, executed.resource_id);
-  assert.ok(registry.ledger.resources.listRelationships(sourceResource.id).some((entry) => entry.type === 'used_by' && entry.target_kind === 'project' && entry.target_id === targetProject.project_id));
-  assert.equal(exportCount, 1);
-  const savedTarget = path.join(targetProjectRoot, 'Data', 'renamed.csv');
-  assert.equal(executed.target.path, savedTarget);
-  const activeResourcePage = await fetch(new URL(executed.resources_href, server.workspace_url));
-  const activeResourceHtml = await activeResourcePage.text();
-  assert.match(activeResourceHtml, /renamed\.csv/u);
-  assert.match(activeResourceHtml, /Open in default app/u);
+  const existingTarget = path.join(projectRoot, 'Results', 'combined.csv'); fs.writeFileSync(existingTarget, 'external result\n');
+  const conflicted = await fetch(`${workUrl}/save/confirm`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: confirmParams('combined.csv', 'csv', reviewedCandidate), redirect: 'manual' });
+  assert.equal(conflicted.status, 303); assert.match(conflicted.headers.get('location'), /\/save$/u); assert.equal(fs.readFileSync(existingTarget, 'utf8'), 'external result\n');
+  html = await (await fetch(new URL(conflicted.headers.get('location'), server.workspace_url))).text(); assert.match(html, /target already exists|File already exists/u); assert.equal(readSavedWorkState(stateDir).items.some((item) => item.status === 'executed'), false);
 
-  const stateBeforeRejectedUndo = readSavedWorkState(stateDir).items.find((item) => item.save_id === executed.save_id);
-  const resourceBeforeRejectedUndo = registry.ledger.resources.describe(executed.resource_id);
-  const rejectedUndo = await fetch(`${server.workspace_url}data-work/undo`, {
-    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ csrf, work_id: executed.save_id, project_id: created.project_id }), redirect: 'manual',
-  });
-  assert.equal(rejectedUndo.status, 400, await rejectedUndo.text());
-  assert.equal(fs.existsSync(savedTarget), true);
-  assert.deepEqual(readSavedWorkState(stateDir).items.find((item) => item.save_id === executed.save_id), stateBeforeRejectedUndo);
-  assert.deepEqual(registry.ledger.resources.describe(executed.resource_id), resourceBeforeRejectedUndo);
+  const renamedReview = await fetch(`${workUrl}/save/review`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, project_id: created.project_id, folder: 'Results', file_name: 'combined-final.csv', format: 'csv' }), redirect: 'manual' });
+  assert.equal(renamedReview.status, 303); assert.equal(exportCount, 1);
+  const renamedUrl = new URL(renamedReview.headers.get('location'), server.workspace_url); const renamedCandidate = { stage_id: renamedUrl.searchParams.get('stage_id'), revision: renamedUrl.searchParams.get('revision'), candidate_sha256: renamedUrl.searchParams.get('candidate_sha256') };
+  const xlsxReview = await fetch(`${workUrl}/save/review`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, project_id: created.project_id, folder: 'Results', file_name: 'other.xlsx', format: 'xlsx' }), redirect: 'manual' });
+  assert.equal(xlsxReview.status, 303); assert.equal(exportCount, 2);
+  const staleCandidate = await fetch(`${workUrl}/save/confirm`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: confirmParams('combined-final.csv', 'csv', renamedCandidate), redirect: 'manual' });
+  assert.equal(staleCandidate.status, 303); assert.match(staleCandidate.headers.get('location'), /\/save$/u); assert.equal(readSavedWorkState(stateDir).items.some((item) => item.status === 'executed'), false);
+  const finalReview = await fetch(`${workUrl}/save/review`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, project_id: created.project_id, folder: 'Results', file_name: 'combined-final.csv', format: 'csv' }), redirect: 'manual' });
+  assert.equal(finalReview.status, 303); assert.equal(exportCount, 3);
+  const finalUrl = new URL(finalReview.headers.get('location'), server.workspace_url); const finalCandidate = { stage_id: finalUrl.searchParams.get('stage_id'), revision: finalUrl.searchParams.get('revision'), candidate_sha256: finalUrl.searchParams.get('candidate_sha256') };
+  const staleRevision = await fetch(`${workUrl}/save/confirm`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: confirmParams('combined-final.csv', 'csv', { ...finalCandidate, revision: String(Number(finalCandidate.revision) + 1) }), redirect: 'manual' });
+  assert.equal(staleRevision.status, 303); assert.match(staleRevision.headers.get('location'), /\/save$/u); assert.equal(readSavedWorkState(stateDir).items.some((item) => item.status === 'executed'), false);
+  const confirmed = await fetch(`${workUrl}/save/confirm`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: confirmParams('combined-final.csv', 'csv', finalCandidate), redirect: 'manual' });
+  assert.equal(confirmed.status, 303); assert.match(confirmed.headers.get('location'), /\/saved\?work_id=SAV-/u);
+  const saves = readSavedWorkState(stateDir).items.filter((item) => item.save_id); const executed = saves.find((item) => item.status === 'executed');
+  assert.equal(saves.filter((item) => item.status === 'failed').length, 1); assert.ok(executed); assert.equal(executed.source.sources.length, 2); assert.deepEqual(executed.source.recipe, session.recipe);
+  assert.deepEqual(executed.inputs.map((item) => item.relative_path), ['Project One/Data/first.csv', 'Project One/Data/second.csv']);
+  const derivedSave = intake.show(executed.save_id); assert.equal(derivedSave.inputs.length, 2); assert.equal(derivedSave.lineage.length, 2);
+  for (const sourcePath of [firstPath, secondPath]) {
+    const resource = registry.ledger.resources.byPath(sourcePath); assert.ok(registry.ledger.resources.listRelationships(resource.id).some((entry) => entry.type === 'used_by' && entry.target_id === created.project_id));
+  }
+  assert.equal(createSavedWorkService({ stateDir }).activityItems().find((item) => item.save_id === executed.save_id).status, 'completed');
+  const savedPage = await fetch(new URL(confirmed.headers.get('location'), server.workspace_url)); html = await savedPage.text(); assert.match(html, /first\.csv · second\.csv/u); assert.match(html, new RegExp(`Recipe<\/dt><dd>Version ${session.recipe.version}`, 'u'));
+  const savedTarget = path.join(projectRoot, 'Results', 'combined-final.csv'); assert.equal(fs.existsSync(savedTarget), true);
+  const resourceHtml = await (await fetch(new URL(executed.resources_href, server.workspace_url))).text(); assert.match(resourceHtml, /first\.csv/u); assert.match(resourceHtml, /second\.csv/u); assert.match(resourceHtml, /Recipe/u);
 
-  const undone = await fetch(`${server.workspace_url}data-work/undo`, {
-    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ csrf, work_id: executed.save_id, project_id: targetProject.project_id }), redirect: 'manual',
-  });
-  assert.equal(undone.status, 303, await undone.text());
-  assert.equal(fs.existsSync(savedTarget), false);
-  assert.match(undone.headers.get('location'), new RegExp(`resource_id=${executed.resource_id}`, 'u'));
-  const missingResourcePage = await fetch(new URL(executed.resources_href, server.workspace_url));
-  const missingResourceHtml = await missingResourcePage.text();
-  assert.match(missingResourceHtml, /Missing|Recorded file is missing/u);
-  assert.match(missingResourceHtml, /Redo/u);
-  fs.mkdirSync(path.join(workspaceRoot, 'Project Three'), { recursive: true });
-  const foreign = registry.create({ name: 'Project Three', currentPath: 'Project Three' });
-  registry.attachRoot(foreign.project_id, { rootId: adopted.root_id, relativePath: 'Project Three', reason: 'Cross-Project redo regression.' });
-  const foreignRedo = await fetch(`${server.workspace_url}projects/${foreign.project_id}/resources/actions/redo-save`, {
-    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ csrf, resource_id: executed.resource_id, work_id: executed.save_id }), redirect: 'manual',
-  });
-  assert.equal(foreignRedo.status, 400);
-  assert.equal(fs.existsSync(savedTarget), false);
-  assert.equal(createSavedWorkService({ stateDir }).find(executed.save_id).write.redo_available, true);
-  const redoPage = await fetch(new URL(confirmed.headers.get('location'), server.workspace_url));
-  assert.match(await redoPage.text(), /Redo/u);
-  const rejectedRedo = await fetch(`${server.workspace_url}data-work/redo`, {
-    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ csrf, work_id: executed.save_id, project_id: created.project_id }), redirect: 'manual',
-  });
-  assert.equal(rejectedRedo.status, 400, await rejectedRedo.text());
-  assert.equal(fs.existsSync(savedTarget), false);
-  assert.equal(createSavedWorkService({ stateDir }).find(executed.save_id).write.redo_available, true);
-
-  const redone = await fetch(`${server.workspace_url}data-work/redo`, {
-    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ csrf, work_id: executed.save_id, project_id: targetProject.project_id }), redirect: 'manual',
-  });
-  assert.equal(redone.status, 303);
-  assert.equal(fs.readFileSync(savedTarget, 'utf8'), 'name,amount\nOne,1\n');
-  const redoneRecord = createSavedWorkService({ stateDir }).find(executed.save_id);
-  assert.equal(redoneRecord.resource_id, executed.resource_id);
-  assert.equal(redoneRecord.write.undo_available, true);
-  assert.equal(redoneRecord.write.redo_available, false);
+  const undone = await fetch(`${server.workspace_url}data-work/undo`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, work_id: executed.save_id, project_id: created.project_id }), redirect: 'manual' });
+  assert.equal(undone.status, 303); assert.equal(fs.existsSync(savedTarget), false);
+  session = registry.ledger.workSessions.byId(session.session_id); assert.equal(session.latest_save_id, executed.save_id); assert.deepEqual(session.recipe, executed.source.recipe);
+  const redone = await fetch(`${server.workspace_url}data-work/redo`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, work_id: executed.save_id, project_id: created.project_id }), redirect: 'manual' });
+  assert.equal(redone.status, 303); assert.equal(fs.existsSync(savedTarget), true);
+  const redoneRecord = createSavedWorkService({ stateDir }).find(executed.save_id); assert.equal(redoneRecord.resource_id, executed.resource_id); assert.equal(redoneRecord.work_id, executed.save_id); assert.equal(redoneRecord.write.undo_available, true);
+  assert.deepEqual(executions.at(-1).request.recipe, executions[0].request.recipe); assert.deepEqual(executions.at(-1).request.mapping, executions[0].request.mapping);
+  fs.appendFileSync(firstPath, '5,Changed\n');
+  const staleSave = await fetch(`${workUrl}/save`, { redirect: 'manual' }); assert.equal(staleSave.status, 303); assert.equal(staleSave.headers.get('location'), workPath);
+  session = registry.ledger.workSessions.byId(session.session_id); assert.equal(session.sources[0].status, 'changed'); assert.equal(session.preview, null); assert.equal(fs.existsSync(savedTarget), true);
 });
 
 test('expired Data Work stays inside the Data Work surface', async (t) => {
@@ -953,6 +1305,113 @@ test('Project Resources keeps missing traces in context instead of a count tile'
   assert.doesNotMatch(html, /<span>Missing<\/span>/u);
 });
 
+test('Project Resources keeps unrelated Missing traces bounded without flattening path or hash details', () => {
+  const missing = Array.from({ length: 40 }, (_, index) => ({
+    resource_id: `RES-missing-${index}`,
+    resource: { display_name: `deleted-${index}.csv`, status: 'missing' },
+    path: `F:/deleted/deleted-${index}.csv`,
+    content_hash: `sha256-${index}`,
+    relationships: [],
+  }));
+  const html = renderProjectResourcesView({
+    mode: 'explorer', project: { id: 'project-1', name: 'Project One' }, base: '/projects/project-1',
+    tree: { folders: [], files: [] }, known_sources: [], created_work: [], current_output: null,
+    other_files: [], changed_resources: 0, missing_resources: missing, missing_sources: [],
+  });
+  assert.match(html, /Missing resources/u);
+  assert.match(html, /40 missing|many missing|review.*missing/iu);
+  assert.doesNotMatch(html, /deleted-39\.csv/u);
+  assert.doesNotMatch(html, /sha256-39/u);
+});
+
+test('Missing Resource deep link stays focused and exposes the actions valid for its archive state', (t) => {
+  const root = temporaryDirectory(t);
+  const missing = {
+    resource_id: 'RES-missing-focus',
+    resource: { display_name: 'deleted.csv', status: 'missing' },
+    locations: [{ status: 'missing', path: path.join(root, 'Data', 'deleted.csv') }],
+    relationships: [], path: path.join(root, 'Data', 'deleted.csv'), status: 'missing',
+  };
+  const model = buildProjectResourcesModel({
+    project: { id: 'project-1', name: 'Project One' }, root, base: '/projects/project-1', recentWork: [],
+    resourceFacts: [missing], focusedResourceId: missing.resource_id,
+  });
+  const html = renderProjectResourcesView(model, { csrfToken: 'csrf' });
+  assert.match(html, /deleted\.csv/u);
+  assert.match(html, /Record actions/u);
+  assert.match(html, /resources\/actions\/archive/u);
+  assert.match(html, /resources\/actions\/relink/u);
+  assert.doesNotMatch(html, /resources\/actions\/restore/u);
+  assert.doesNotMatch(html, /Missing resources[\s\S]{0,500}deleted\.csv/u);
+  const archivedModel = buildProjectResourcesModel({
+    project: { id: 'project-1', name: 'Project One' }, root, base: '/projects/project-1', recentWork: [],
+    resourceFacts: [{ ...missing, missing_record_archived: true }], focusedResourceId: missing.resource_id,
+  });
+  const archivedHtml = renderProjectResourcesView(archivedModel, { csrfToken: 'csrf' });
+  assert.match(archivedHtml, /resources\/actions\/restore/u);
+  assert.doesNotMatch(archivedHtml, /resources\/actions\/archive/u);
+  assert.doesNotMatch(archivedHtml, /resources\/actions\/relink/u);
+});
+
+test('Project-scoped Missing archive endpoint is CSRF-protected, idempotent, reversible, and preserves local facts', async (t) => {
+  const root = temporaryDirectory(t);
+  const stateDir = path.join(root, 'state');
+  const workspace = path.join(root, 'workspace');
+  const projectRoot = path.join(workspace, 'Project A');
+  const foreignRoot = path.join(workspace, 'Project B');
+  fs.mkdirSync(foreignRoot, { recursive: true });
+  const filePath = write(path.join(projectRoot, 'Data', 'missing.csv'), 'name\nmissing\n');
+  const activePath = write(path.join(projectRoot, 'Data', 'active.csv'), 'name\nactive\n');
+  const relatedPath = write(path.join(projectRoot, 'Data', 'related.csv'), 'name\nrelated\n');
+  const registry = new Registry({ stateDir });
+  const adopted = registry.adoptRoot({ rootPath: workspace, rootType: 'project_workspace', contentPolicy: 'bounded_content' });
+  const project = registry.create({ name: 'Project A', currentPath: 'Project A' });
+  const foreignProject = registry.create({ name: 'Project B', currentPath: 'Project B' });
+  registry.attachRoot(project.project_id, { rootId: adopted.root_id, relativePath: 'Project A', reason: 'Missing archive regression.' });
+  registry.attachRoot(foreignProject.project_id, { rootId: adopted.root_id, relativePath: 'Project B', reason: 'Missing archive scope regression.' });
+  const resourceControl = createResourceControl({ stateDir, ledger: registry.ledger });
+  const resource = resourceControl.identify({ filePath, project: { id: project.project_id } });
+  fs.rmSync(filePath);
+  const active = resourceControl.identify({ filePath: activePath, project: { id: project.project_id } });
+  const related = resourceControl.identify({ filePath: relatedPath, project: { id: project.project_id } });
+  fs.rmSync(relatedPath);
+  const relation = resourceControl.submitRelationships({
+    caller: { tool: 'test', client_run_id: 'missing-archive-setup' },
+    candidates: [{ source_resource_id: related.resource_id, target: { kind: 'project', id: project.project_id }, type: 'used_by', evidence: { reason: 'fixture' } }],
+  })[0];
+  resourceControl.projectResources(project.project_id, { refresh: true });
+  const server = await startAtlasUiServer({ stateDir, ...serverServices(registry), resourceControl });
+  t.after(async () => { await server.close(); resourceControl.dispose(); registry.dispose(); });
+  const page = await (await fetch(`${server.workspace_url}projects/${project.project_id}/resources?resource_id=${resource.resource_id}`)).text();
+  const csrf = page.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1];
+  assert.ok(csrf);
+  const post = (action, values = {}, token = csrf, projectId = project.project_id) => fetch(`${server.workspace_url}projects/${projectId}/resources/actions/${action}`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ csrf: token, resource_id: resource.resource_id, ...values }), redirect: 'manual',
+  });
+  const badCsrf = await post('archive', {}, 'bad');
+  assert.equal(badCsrf.status, 403);
+  const archived = await post('archive');
+  assert.equal(archived.status, 303);
+  const repeated = await post('archive');
+  assert.equal(repeated.status, 303);
+  let fact = resourceControl.projectResources(project.project_id).find((item) => item.resource_id === resource.resource_id);
+  assert.equal(fact.missing_record_archived, true);
+  assert.equal(resourceControl.projectResources(project.project_id).find((item) => item.resource_id === active.resource_id).missing_record_archived, false);
+  assert.equal(resourceControl.projectResources(project.project_id).find((item) => item.resource_id === related.resource_id).missing_record_archived, false);
+  assert.equal(resourceControl.describe(resource.resource_id).actions.filter((item) => item.action_type === 'archive_missing').length, 1);
+  assert.equal(fs.existsSync(filePath), false);
+  assert.equal(resourceControl.describe(resource.resource_id).locations.find((item) => item.status === 'missing')?.path, path.resolve(filePath));
+  assert.equal(resourceControl.ledger.resources.relationshipById(relation.id).status, 'active');
+  const foreign = await post('archive', {}, csrf, foreignProject.project_id);
+  assert.notEqual(foreign.status, 303);
+  const restored = await post('restore');
+  assert.equal(restored.status, 303);
+  fact = resourceControl.projectResources(project.project_id).find((item) => item.resource_id === resource.resource_id);
+  assert.equal(fact.missing_record_archived, false);
+  assert.equal(resourceControl.describe(resource.resource_id).actions.filter((item) => item.action_type === 'restore_missing').length, 1);
+});
+
 test('A later successful inspection supersedes an older failed Activity in Resource Context', (t) => {
   const root = temporaryDirectory(t);
   const filePath = write(path.join(root, 'Reference', 'brief.pdf'), 'pdf placeholder');
@@ -1270,7 +1729,7 @@ test('Resources starts with folders closed and remembers disclosure by Project',
   const html = renderProjectResourcesView(model, { csrfToken: 'token' });
   const client = fs.readFileSync(path.resolve('src', 'ui', 'client.js'), 'utf8');
   assert.equal(model.focused_resource, null);
-  assert.doesNotMatch(html, /data-focus-path=/u);
+  assert.doesNotMatch(html, /data-focus-path="[^"]+"/u);
   assert.doesNotMatch(html, /data-project-folder[^>]* open/u);
   assert.match(html, /Choose a resource/u);
   assert.match(client, /atlas-ui-open-folders:\$\{projectId\}/u);
@@ -1384,7 +1843,7 @@ test('Resource visibility keeps external and missing ledger facts outside the di
   const external = { resource_id: 'RES-external', resource: { display_name: 'external.md', status: 'active' }, locations: [], relationships: [], relationship_to_project: 'used_by', relationship_label: 'Used by', path: 'C:/outside/external.md' };
   const missing = { resource_id: 'RES-missing', resource: { display_name: 'missing.md', status: 'missing' }, locations: [], relationships: [], relationship_to_project: 'stored_in', relationship_label: 'Stored in', path: 'Data/missing.md', content_hash: 'a'.repeat(64), status: 'missing' };
   const model = buildProjectResourcesModel({ project, root, base: '/projects/project-1', recentWork: [], resourceFacts: [external, missing], focusedResourceId: 'RES-missing' }); const html = renderProjectResourcesView(model, { csrfToken: 'token' });
-  assert.equal(model.tree.folders[0].files.length, 1); assert.equal(model.external_references.length, 1); assert.equal(model.missing_resources.length, 1); assert.equal(model.focused_resource.resource_id, 'RES-missing'); assert.match(html, /External references/u); assert.match(html, /Missing resources/u); assert.match(html, /Resource ID/u); assert.doesNotMatch(html, /Delete file/u); assert.doesNotMatch(html, /Open in default app/u);
+  assert.equal(model.tree.folders[0].files.length, 1); assert.equal(model.external_references.length, 1); assert.equal(model.missing_resources.length, 1); assert.equal(model.focused_resource.resource_id, 'RES-missing'); assert.match(html, /External references/u); assert.match(html, /Recorded file is missing/u); assert.doesNotMatch(html, /Missing resources[\s\S]{0,500}missing\.md/u); assert.match(html, /Resource ID/u); assert.doesNotMatch(html, /Delete file/u); assert.doesNotMatch(html, /Open in default app/u);
   assert.equal(buildProjectResourcesModel({ project, root, base: '/projects/project-1', recentWork: [], resourceFacts: [external], focusedResourceId: 'RES-other' }).focused_resource, null);
 });
 
@@ -1393,9 +1852,9 @@ test('Resource recovery action contract is Project-scoped and renders distinct n
   const missing = { resource_id: 'RES-missing', resource: { display_name: 'missing.md', status: 'missing' }, locations: [{ id: 'RLOC-old', project_id: project.id, path: 'Data/missing.md', status: 'missing' }], relationships: [{ id: 'RREL-a-used', target_kind: 'project', target_id: project.id, type: 'used_by', status: 'active' }, { id: 'RREL-b-used', target_kind: 'project', target_id: 'project-b', type: 'used_by', status: 'active' }], relationship_to_project: 'stored_in', relationship_label: 'Stored in', path: 'Data/missing.md', content_hash: 'a'.repeat(64), status: 'missing' };
   const external = { resource_id: 'RES-external', resource: { display_name: 'external.md', status: 'active' }, locations: [], relationships: [{ id: 'RREL-a-external', target_kind: 'project', target_id: project.id, type: 'used_by', status: 'active' }], relationship_to_project: 'used_by', relationship_label: 'Used by', path: 'C:/outside/external.md' };
   const model = buildProjectResourcesModel({ project, root, base: '/projects/project-a', recentWork: [], resourceFacts: [missing, external], focusedResourceId: 'RES-missing' }); const html = renderProjectResourcesView(model, { csrfToken: 'token' }); const client = fs.readFileSync(path.resolve('src', 'ui', 'client.js'), 'utf8');
-  assert.equal(model.focused_resource.actions.keep_record, true); assert.equal(model.focused_resource.actions.relink, true); assert.deepEqual(model.focused_resource.actions.relationships.map((item) => item.id), ['RREL-a-used']); assert.equal(model.focused_resource.actions.relationships[0].can_remove_reference, true);
-  assert.match(html, /resources\/actions\/keep/u); assert.match(html, /resources\/actions\/relink/u); assert.match(html, /resources\/actions\/forget/u); assert.match(html, /resources\/actions\/remove-reference/u); assert.match(html, /Choose file to relink/u); assert.match(html, /data-resource-relink-picker/u); assert.match(html, /These actions do not delete files/u); assert.doesNotMatch(html, /Delete file/u);
-  const externalModel = buildProjectResourcesModel({ project, root, base: '/projects/project-a', recentWork: [], resourceFacts: [external], focusedResourceId: 'RES-external' }); const externalHtml = renderProjectResourcesView(externalModel, { csrfToken: 'token' }); assert.equal(externalModel.focused_resource.actions.keep_record, false); assert.equal(externalModel.focused_resource.actions.relink, false); assert.match(externalHtml, /Remove reference/u); assert.doesNotMatch(externalHtml, /Choose file to relink/u);
+  assert.equal(model.focused_resource.actions.archive_record, true); assert.equal(model.focused_resource.actions.restore_record, false); assert.equal(model.focused_resource.actions.relink, true); assert.deepEqual(model.focused_resource.actions.relationships.map((item) => item.id), ['RREL-a-used']); assert.equal(model.focused_resource.actions.relationships[0].can_remove_reference, true);
+  assert.match(html, /resources\/actions\/archive/u); assert.doesNotMatch(html, /resources\/actions\/restore/u); assert.match(html, /resources\/actions\/relink/u); assert.match(html, /resources\/actions\/forget/u); assert.match(html, /resources\/actions\/remove-reference/u); assert.match(html, /Choose file to relink/u); assert.match(html, /data-resource-relink-picker/u); assert.match(html, /do not delete files/u); assert.doesNotMatch(html, /Delete file/u);
+  const externalModel = buildProjectResourcesModel({ project, root, base: '/projects/project-a', recentWork: [], resourceFacts: [external], focusedResourceId: 'RES-external' }); const externalHtml = renderProjectResourcesView(externalModel, { csrfToken: 'token' }); assert.equal(externalModel.focused_resource.actions.archive_record, false); assert.equal(externalModel.focused_resource.actions.relink, false); assert.match(externalHtml, /Remove reference/u); assert.doesNotMatch(externalHtml, /Choose file to relink/u);
   const disk = buildProjectResourcesModel({ project, root, base: '/projects/project-a', recentWork: [], focusedPath: 'Data/disk.csv' }); assert.equal(disk.focused_resource.actions, null);
   assert.match(client, /\[data-resource-relink-picker\]/u); assert.match(client, /chooseDesktopFile\(button, 'pick_file'\)/u); assert.match(client, /selection\?\.selection_id/u); assert.match(client, /data-resource-relink-confirm/u);
 });
@@ -1546,9 +2005,9 @@ test('Import Selection Set saves through Intake and opens the exact Resource', a
   const server = await startAtlasUiServer({
     stateDir, desktopPickerEnabled: true, runContentOperation, runProjectImportSaveFn,
     ...serverServices(registry), intake,
-    temporaryRecordLifetimeMs: 30,
+    temporaryRecordLifetimeMs: 200,
     selectionSweepIntervalMs: 5,
-    queueLifetimeMs: 30,
+    queueLifetimeMs: 200,
   });
   t.after(() => server.close());
   const picked = await fetch(server.desktop_picker.registration_url, {
@@ -1610,7 +2069,7 @@ test('Import Selection Set saves through Intake and opens the exact Resource', a
   assert.equal(importedWork.project_transfer.undo_available, true);
   const activityHtml = await (await fetch(`${server.workspace_url}activity`)).text();
   assert.match(activityHtml, /report\.txt/u);
-  await new Promise((resolve) => setTimeout(resolve, 45));
+  await new Promise((resolve) => setTimeout(resolve, 220));
   const expiredStatus = await fetch(`${server.workspace_url}activity/import-status?import_id=${importId}`);
   assert.equal(expiredStatus.status, 410);
   assert.deepEqual(await expiredStatus.json(), { ok: false, status: 'unavailable', href: '/files' });
@@ -1913,7 +2372,7 @@ test('Recent Work serializes a worker update with a concurrent UI removal', asyn
   assert.equal(remaining[0].last_continued_at, '2026-09-09T09:00:00.000Z');
 });
 
-test('CSV inspection renders profile schema types and the Data Work entry', () => {
+test('CSV inspection renders profile schema types and requires a Project before Work', () => {
   const html = renderFileWorkView({
     mode: 'ready',
     inspection: {
@@ -1941,7 +2400,8 @@ test('CSV inspection renders profile schema types and the Data Work entry', () =
   for (const type of ['Date', 'Text', 'Integer', 'Number', 'Empty']) assert.match(html, new RegExp(`>${type}<`, 'u'));
   assert.match(html, /data-profile-table/u);
   assert.match(html, /Technical file details/u);
-  assert.match(html, /Work with data/u);
+  assert.doesNotMatch(html, /Work with data/u);
+  assert.match(html, /Add to Project/u);
   assert.doesNotMatch(html, />Re-inspect</u);
   assert.match(html, /Open in default app/u);
 });
@@ -2472,7 +2932,7 @@ test('Projects Home uses whole-row links and real recent resources instead of da
       recent_activity_text: 'Codex saved this today',
     }],
   });
-  assert.match(html, /class="projects-home-row"[^>]+href="\/projects\/p1\/resources"/u);
+  assert.match(html, /class="projects-home-row"[^>]+href="\/projects\/p1"/u);
   assert.match(html, /July report\.xlsx/u);
   assert.match(html, /Codex saved this today/u);
   assert.match(html, /data-project-filter/u);
@@ -2628,8 +3088,8 @@ test('Opening a Project enters its Resource tree workspace', async (t) => {
 
   const response = await fetch(`${server.workspace_url}projects/project-1`, { redirect: 'manual' });
 
-  assert.equal(response.status, 303);
-  assert.equal(response.headers.get('location'), '/projects/project-1/resources');
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /PROJECT HOME/u);
 });
 
 test('Resources folder fragment loads the selected directory beyond the bounded initial result', async (t) => {

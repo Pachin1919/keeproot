@@ -93,8 +93,12 @@ function renderNavIcon(name) {
 }
 
 export function renderTopbar({ section, project = null, resource = null, status = 'On this device' } = {}) {
+  const projectName = project?.name ?? project;
+  const projectLabel = project?.id
+    ? `<a class="topbar-project-link" href="${escapeHtml(`/projects/${encodeURIComponent(project.id)}`)}"><strong>${escapeHtml(projectName)}</strong></a>`
+    : `<strong>${escapeHtml(projectName)}</strong>`;
   const context = project
-    ? `<span class="topbar-context"><strong>${escapeHtml(project.name ?? project)}</strong>${resource ? `<small>${escapeHtml(resource)}</small>` : ''}</span>`
+    ? `<span class="topbar-context">${projectLabel}${resource ? `<small>${escapeHtml(resource)}</small>` : ''}</span>`
     : `<span class="topbar-context"><strong>${escapeHtml(section ?? 'Atlas')}</strong></span>`;
   return `<header class="topbar" data-current-project-id="${escapeHtml(project?.id ?? '')}" data-current-resource-path="${escapeHtml(resource ?? '')}">
     <div class="topbar-identity"><span class="label">Atlas Desktop</span>${context}</div>

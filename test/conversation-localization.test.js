@@ -62,7 +62,7 @@ test('conversation localization writes one bounded plain Markdown context file',
   assert.equal(receipt.decision_count, 2);
   assert.equal(receipt.output.path, output);
   assert.match(markdown, /^# Atlas V1\.6 product decisions/mu);
-  assert.match(markdown, /## Confirmed decisions/u);
+  assert.match(markdown, /## Selected decisions/u);
   assert.match(markdown, /### Context boundary/u);
   assert.match(markdown, /## Subagent task packet/u);
   assert.doesNotMatch(markdown, /<html|<!doctype/iu);
@@ -122,11 +122,15 @@ test('Host CLI localizes a selected conversation into an active Project', () => 
   const receipt = call(stateDir, [
     'content', 'localize-conversation', '--input', input,
     '--project', project.project_id, '--output-relative', 'docs/context.md',
+    '--request-key', 'conversation-localization-test',
     '--actor', 'agent', '--agent', 'Codex', '--model', 'gpt-5.6-sol',
     '--tool', 'codex-desktop', '--client-run-id', 'conversation-localization-test',
   ]);
 
-  assert.equal(receipt.verified, true);
+  assert.equal(receipt.status, 'prepared');
+  assert.equal(fs.existsSync(path.join(projectRoot, 'docs', 'context.md')), false);
+  const saved = call(stateDir, ['save', 'execute', receipt.save_id, '--reason', 'Fixture confirms selected note.']);
+  assert.equal(saved.verified, true);
   assert.equal(receipt.project.id, project.project_id);
   assert.equal(receipt.caller.agent, 'Codex');
   assert.equal(fs.existsSync(path.join(projectRoot, 'docs', 'context.md')), true);

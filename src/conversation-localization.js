@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { isPathInside } from './paths.js';
+import { RuntimeStorage } from './runtime-storage.js';
+import { projectDirectory, projectPath } from './ui/project-files.js';
 
 export const CONVERSATION_SELECTION_SCHEMA = 'atlas.conversation-selection.v1';
 export const CONVERSATION_LOCALIZATION_SCHEMA = 'atlas.conversation-localization.v1';
@@ -101,7 +103,7 @@ function renderMarkdown(selection) {
     `- Thread: ${selection.source.thread_id}`,
     `- Selected: ${selection.source.selected_at}`,
     '',
-    '## Confirmed decisions',
+    '## Selected decisions',
     '',
   ];
   for (const decision of selection.decisions) {
@@ -170,4 +172,47 @@ export function localizeConversationSelection({ inputPath, outputPath, projectRo
     pending_count: selected.pending.length,
     verified: fs.existsSync(output) && sha256(fs.readFileSync(output)) === sha256(outputBytes),
   };
+}
+
+// The product entry prepares a candidate; only Save executes the final file write.
+export function prepareConversationSave({ stateDir, registry, saveService, inputPath, projectId, outputRelative, requestKey, caller }) {
+  if (!requestKey?.trim() || !caller?.tool?.trim() || !caller?.client_run_id?.trim()) throw new Error('Conversation Save requires --request-key, --tool, and --client-run-id.');
+  const project = registry.list().find((item) => item.id === projectId && item.status === 'active');
+  if (!project) throw new Error('Conversation Save requires one active Project.');
+  const location = registry.show(projectId).location;
+  const root = projectDirectory(location);
+  const relative = String(outputRelative ?? '').replaceAll('\\', '/');
+  if (!relative || path.posix.isAbsolute(relative) || path.win32.isAbsolute(relative)) throw new Error('Conversation Save target must be Project-relative.');
+  const target = path.resolve(root, relative);
+  if (!isPathInside(root, target) || target === root || path.extname(target).toLowerCase() !== '.md') throw new Error('Conversation Save target must be a Markdown file inside the Project.');
+  const parent = projectPath(root, path.relative(root, path.dirname(target)));
+  if (!fs.statSync(parent).isDirectory()) throw new Error('Conversation Save destination must be an existing directory.');
+  if (fs.existsSync(target)) throw new Error('Conversation Save target already exists; choose a new name.');
+  assertNoLinkTraversal(path.resolve(stateDir));
+  const tmpRoot = path.join(path.resolve(stateDir), 'tmp');
+  fs.mkdirSync(tmpRoot, { recursive: true });
+  assertNoLinkTraversal(tmpRoot);
+  const temporary = fs.mkdtempSync(path.join(tmpRoot, 'conversation-'));
+  const output = path.join(temporary, 'selection.md');
+  const storage = new RuntimeStorage({ stateDir, ledger: registry.ledger });
+  try {
+    const localized = localizeConversationSelection({ inputPath, outputPath: output, projectRoot: temporary });
+    const candidate = storage.stage({ source: output, kind: 'candidate' });
+    const source = { ...localized.source, kind: 'conversation_selection', thread_id: localized.thread_id };
+    const workspaceRoot = path.resolve(location.root_path);
+    const record = saveService.prepare({
+      root: workspaceRoot, projectId, candidateFile: candidate.payload_path,
+      expectedCandidateHash: localized.output.sha256,
+      target: path.relative(workspaceRoot, target).replaceAll('\\', '/'),
+      origin: 'agent_generated', kind: 'note', relationType: 'summarizes',
+      inputs: isPathInside(root, localized.source.path) ? [localized.source.path] : [],
+      source, caller, requestKey, intent: 'Save selected conversation content as a local note.',
+      resultSummary: { decision_count: localized.decision_count, completed_count: localized.completed_count, pending_count: localized.pending_count },
+    });
+    return { ...record, decision_count: localized.decision_count, desktop_href: `/saves/${encodeURIComponent(record.save_id)}` };
+  } finally {
+    storage.dispose();
+    fs.rmSync(output, { force: true });
+    fs.rmdirSync(temporary);
+  }
 }

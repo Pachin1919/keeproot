@@ -114,7 +114,7 @@ function resultActions(work, csrfToken, {
   projectBasePath = null, backHref = '/files', currentHref = null,
 } = {}) {
   const projectLink = projectHref(work.project, projectBasePath);
-  const dataWorkLink = canUseSource && ['.csv', '.xlsx'].some((extension) => fileName(work.file_path).toLowerCase().endsWith(extension))
+  const dataWorkLink = canUseSource && work.project?.id && ['.csv', '.xlsx'].some((extension) => fileName(work.file_path).toLowerCase().endsWith(extension))
     ? `<a class="action-button action-button-secondary" href="/data-work/start?work_id=${encodeURIComponent(work.work_id)}">Work with data</a>` : '';
   return `<div class="inline-actions">
     ${canOpenOriginal && canUseSource ? `<form method="post" action="/files/open-original"><input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="work_id" value="${escapeHtml(work.work_id)}"><input type="hidden" name="return_to" value="${escapeHtml(currentHref ?? `/files/result/${encodeURIComponent(work.work_id)}`)}"><button class="action-button action-button-secondary" type="submit">Open in default app</button></form>` : ''}

@@ -13,6 +13,7 @@ export class ResourceRepository {
   activeLocations() { return this.db.prepare("SELECT * FROM resource_locations WHERE status='active'").all().map(resource); }
   activeLocationsForResources(resourceIds) { if(!resourceIds.length)return []; const marks=resourceIds.map(()=>'?').join(','); return this.db.prepare(`SELECT * FROM resource_locations WHERE status='active' AND resource_id IN (${marks})`).all(...resourceIds).map(resource); }
   refreshLocation(id,evidence) { this.db.prepare('UPDATE resource_locations SET content_hash=?,bytes=?,modified_at=?,evidence_json=? WHERE id=?').run(evidence.sha256,evidence.bytes,evidence.modified_at,JSON.stringify(evidence),id); }
+  assignLocationProject(id, projectId, displayName) { this.db.prepare('UPDATE resource_locations SET project_id=COALESCE(project_id,?),display_name=? WHERE id=?').run(projectId, displayName, id); return this.db.prepare('SELECT * FROM resource_locations WHERE id=?').get(id); }
   markLocationMissing(id, at) { this.db.prepare("UPDATE resource_locations SET status='missing',valid_to=? WHERE id=? AND status='active'").run(at,id); }
   refreshResourceStatus(resourceId, at) { const active=this.db.prepare("SELECT COUNT(*) AS count FROM resource_locations WHERE resource_id=? AND status='active'").get(resourceId).count; this.db.prepare('UPDATE resources SET status=?,updated_at=? WHERE id=?').run(active?'active':'missing',at,resourceId); }
   describe(resourceId) { const value=this.db.prepare('SELECT * FROM resources WHERE id=?').get(resourceId); if(!value) return null; return { resource:resource(value), locations:this.locations(resourceId), relationships:this.listRelationships(resourceId) }; }
@@ -21,6 +22,14 @@ export class ResourceRepository {
   updateRelationshipStatus(id,status) { const changed=this.db.prepare("UPDATE resource_relationships SET status=? WHERE id=? AND status='active'").run(status,id).changes; if(changed!==1) throw new Error('Relationship is unavailable.'); return this.relationshipById(id); }
   recordAction({resourceId,type,details,at}) { const id=`RACT-${crypto.randomUUID()}`; this.db.prepare("INSERT INTO resource_actions(id,resource_id,action_type,details_json,created_at,status) VALUES(?,?,?,?,?,'completed')").run(id,resourceId,type,JSON.stringify(details),at); return {id,resource_id:resourceId,action_type:type,details,created_at:at,status:'completed'}; }
   listActions(resourceId) { return this.db.prepare('SELECT * FROM resource_actions WHERE resource_id=? ORDER BY created_at,id').all(resourceId).map(item=>({...item,details:parse(item.details_json)})); }
+  missingArchiveState(resourceId, projectId) {
+    const latest = this.listActions(resourceId).findLast((item) => ['archive_missing', 'restore_missing'].includes(item.action_type) && item.details?.project_id === projectId);
+    return {
+      archived: latest?.action_type === 'archive_missing',
+      batch_id: latest?.details?.batch_id ?? null,
+      action: latest ?? null,
+    };
+  }
   actionForSave(resourceId,type,saveId,transitionId=null) { return this.listActions(resourceId).find((item)=>item.action_type===type&&item.details?.save_id===saveId&&(transitionId==null||item.details?.transition_id===transitionId))??null; }
   activeLocationAt(resourceId,filePath,projectId=null) { const query="SELECT * FROM resource_locations WHERE resource_id=? AND path=? COLLATE NOCASE AND status='active'"+(projectId==null?'':' AND project_id=?'); return resource(this.db.prepare(query).get(resourceId,filePath,...(projectId==null?[]:[projectId]))); }
   missingLocationAt(resourceId,filePath) { return resource(this.db.prepare("SELECT * FROM resource_locations WHERE resource_id=? AND path=? COLLATE NOCASE AND status='missing' ORDER BY valid_to DESC,id DESC LIMIT 1").get(resourceId,filePath)); }

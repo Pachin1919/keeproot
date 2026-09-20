@@ -15,9 +15,12 @@ import { renderFileWorkView } from './ui/views/file-work-view.js';
 import { renderFileCompareView } from './ui/views/file-compare-view.js';
 import { renderProjectFilesView } from './ui/views/project-files-view.js';
 import { renderProjectsHomeView, renderProjectOnboardingView } from './ui/views/projects-home-view.js';
+import { renderProjectHomeView } from './ui/views/project-home-view.js';
 import { renderBatchWorkView } from './ui/views/batch-work-view.js';
 import { renderProjectResourceFolderGroup, renderProjectResourcesView } from './ui/views/project-resources-view.js';
 import { renderDataWorkView } from './ui/views/data-work-view.js';
+import { renderWorkTargetView } from './ui/views/work-target-view.js';
+import { renderSaveResultView } from './ui/views/save-result-view.js';
 import { renderActivityFragment, renderActivityView } from './ui/views/activity-view.js';
 import { renderSearchView } from './ui/views/search-view.js';
 import { browseProjectFiles, projectDirectory, projectPath, searchProjectFiles } from './ui/project-files.js';
@@ -36,7 +39,9 @@ import { createFileWorkService, defaultInspectPurpose } from './ui/services/file
 import { createProjectImportService } from './ui/services/project-import-service.js';
 import { createBatchWorkService } from './ui/services/batch-work-service.js';
 import { createDataWorkService } from './ui/services/data-work-service.js';
-import { createSavedWorkService } from './ui/services/saved-work-service.js';
+import { createSavedWorkService, savedResultState } from './ui/services/saved-work-service.js';
+import { createProjectHomeService } from './ui/services/project-home-service.js';
+import { createProjectViewService } from './project-view-service.js';
 import { createSaveService } from './save-service.js';
 import { createResourceControl } from './resource-control.js';
 import { projectResourceHref } from './resource-links.js';
@@ -44,9 +49,20 @@ import { runUiContentOperation } from './ui/content-worker-client.js';
 import {
   buildProjectResourceDetailModel, buildProjectResourcesModel,
 } from './ui/read-model/project-resources-model.js';
+import { buildProjectHomeModel } from './ui/read-model/project-home-model.js';
 
 const MAX_BODY_BYTES = 8 * 1024;
 const MAX_BATCH_FILES = 20;
+const RESOURCE_THUMBNAIL_TYPES = new Map([
+  ['.jpg', 'image/jpeg'], ['.jpeg', 'image/jpeg'], ['.png', 'image/png'], ['.webp', 'image/webp'],
+  ['.gif', 'image/gif'], ['.bmp', 'image/bmp'],
+]);
+const MAX_RESOURCE_THUMBNAIL_BYTES = 25 * 1024 * 1024;
+const DEFAULT_RESOURCE_VIEW_ITEMS = 150;
+const DEFAULT_RESOURCE_CARD_ITEMS = 24;
+const RESOURCE_VIEW_PAGE_SIZE = 250;
+const RESOURCE_CARD_PAGE_SIZE = 24;
+const MAX_RESOURCE_VIEW_ITEMS = 5000;
 const CHROMIUM_RESTRICTED_PORTS = new Set([
   1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95,
   101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161,
@@ -57,6 +73,44 @@ const CHROMIUM_RESTRICTED_PORTS = new Set([
 
 function chromiumRestrictedPort(port) {
   return CHROMIUM_RESTRICTED_PORTS.has(Number(port));
+}
+
+function filterResourceTree(tree, allowedPaths) {
+  const folders = (tree?.folders ?? []).map((folder) => ({
+    ...folder,
+    ...filterResourceTree(folder, allowedPaths),
+  })).filter((folder) => folder.files.length || folder.folders.length);
+  const files = (tree?.files ?? []).filter((file) => allowedPaths.has(file.relative_path));
+  return { folders, files };
+}
+
+function resourceViewItemLimit(value, defaultItems = DEFAULT_RESOURCE_VIEW_ITEMS) {
+  const parsed = Number(value ?? defaultItems);
+  if (!Number.isInteger(parsed) || parsed < 1) return defaultItems;
+  return Math.min(parsed, MAX_RESOURCE_VIEW_ITEMS);
+}
+
+function evaluateResourceViewPages({ projectViews, activeView = null, projectId, config, requestedItems }) {
+  const members = [];
+  let continuation = null;
+  let first = null;
+  let current = null;
+  do {
+    const remaining = requestedItems - members.length;
+    const limit = Math.min(RESOURCE_VIEW_PAGE_SIZE, remaining);
+    current = activeView
+      ? projectViews.evaluateView({ viewId: activeView.view_id, limit, continuation })
+      : projectViews.evaluateConfiguration({ projectId, config, limit, continuation });
+    first ??= current;
+    members.push(...current.members);
+    continuation = current.continuation;
+  } while (continuation && members.length < requestedItems);
+  return {
+    ...current,
+    evaluation_id: first.evaluation_id,
+    members,
+    returned_count: members.length,
+  };
 }
 
 async function listenOnUsablePort(server, { host, port }) {
@@ -197,6 +251,7 @@ export async function startAtlasUiServer({
   selectionSweepIntervalMs = 60_000,
   queueLifetimeMs = temporaryRecordLifetimeMs,
   resourceControl: injectedResourceControl = null,
+  openLocalFileFn = openLocalFile,
 }) {
   const sendPage = (response, statusCode, html) => sendHtml(response, statusCode, html, {
     desktopBridge: desktopPickerEnabled,
@@ -214,6 +269,8 @@ export async function startAtlasUiServer({
   const imports = new Map();
   const batchResults = new Map();
   const batchImports = new Map();
+  const workSelections = new Map();
+  const workDraftConflicts = new Map();
   const desktopSelections = createDesktopSelectionService({ maxBatchFiles: MAX_BATCH_FILES, now, queueLifetimeMs });
   const projectOnboarding = createProjectOnboardingService({ registry });
   const projectImportSaveRunner = runProjectImportSaveFn ?? (intake?.stateDir
@@ -232,13 +289,92 @@ export async function startAtlasUiServer({
     resourceControl,
   });
   const savedWork = createSavedWorkService({ stateDir, saveService });
+  const projectHome = createProjectHomeService({ stateDir });
+  const projectViews = registry?.ledger?.projectViews
+    ? createProjectViewService({ stateDir, registry })
+    : null;
+  const requireProjectViews = () => {
+    if (!projectViews) throw new Error('Saved Resource Views require the persistent Atlas Registry.');
+    return projectViews;
+  };
   const dataWork = createDataWorkService({
     stateDir,
     projectRoot,
     installationRoot,
+    resourceControl,
     runDataWorkFn: (args) => runContentOperation('data-work', args),
     fingerprintFn: (filePath) => runContentOperation('fingerprint', { filePath }),
   });
+  const applyPersistentWorkAction = async (sessionId, form, revisionOverride = null) => {
+    const action = String(form.get('action') ?? '');
+    const baseRevision = revisionOverride ?? Number(form.get('base_revision'));
+    if (!Number.isInteger(baseRevision) || baseRevision < 1) throw Object.assign(new Error('Work changed or the current revision is missing. Refresh before applying this update.'), { code: 'ATLAS_STATE_CONFLICT' });
+    if (action === 'prepare_sources') await dataWork.prepareSources(sessionId, { baseRevision });
+    else if (action === 'sheet') { dataWork.selectSourceSheet(sessionId, form.get('source_key'), form.get('sheet'), { baseRevision }); await dataWork.prepareSources(sessionId); }
+    else if (action === 'confirm_mapping') {
+      const sourceKeys = form.getAll('source_key'); const columns = form.getAll('column'); const canonical = form.getAll('canonical');
+      if (sourceKeys.length !== columns.length || columns.length !== canonical.length) throw new Error('Field mapping is incomplete.');
+      dataWork.confirmMapping(sessionId, sourceKeys.map((sourceKey, index) => ({ source_key: sourceKey, column: columns[index], canonical: String(canonical[index] ?? '').trim() })).filter((item) => item.canonical), { baseRevision });
+    } else if (action === 'recipe') {
+      dataWork.updateRecipe(sessionId, {
+        combine: form.get('combine'), join_how: form.get('join_how'), left_key: form.get('left_key'), right_key: form.get('right_key'),
+        source_column: form.get('source_column') === 'yes', source_column_name: form.get('source_column_name'),
+        cast_column: form.get('cast_column'), cast_type: form.get('cast_type'),
+        filter_column: form.get('filter_column'), filter_operator: form.get('filter_operator'), filter_value: form.get('filter_value'),
+        fill_column: form.get('fill_column'), fill_value: form.get('fill_value'), select_columns: form.getAll('select_column'),
+        deduplicate_columns: form.get('deduplicate_columns'), sort_column: form.get('sort_column'), sort_direction: form.get('sort_direction'),
+        rename_column: form.get('rename_column'), rename_to: form.get('rename_to'),
+      }, { baseRevision });
+    } else if (action === 'preview') await dataWork.previewPersistent(sessionId, { baseRevision });
+    else throw new Error('Unsupported Work action.');
+    return action;
+  };
+  const storeWorkDraftConflict = (sessionId, action, form, submittedRevision, currentRevision) => {
+    const token = `WDCF-${crypto.randomUUID()}`;
+    const entries = [...form.entries()].filter(([key]) => !['csrf', 'base_revision'].includes(key)).slice(0, 500);
+    workDraftConflicts.set(token, { token, session_id: sessionId, action, entries, submitted_revision: submittedRevision, current_revision: currentRevision, created_at: Date.now() });
+    while (workDraftConflicts.size > 50) workDraftConflicts.delete(workDraftConflicts.keys().next().value);
+    return token;
+  };
+  const workDraftConflictModel = (sessionId, token) => {
+    const conflict = workDraftConflicts.get(token);
+    if (!conflict || conflict.session_id !== sessionId || Date.now() - conflict.created_at > 30 * 60 * 1000) { if (conflict) workDraftConflicts.delete(token); return null; }
+    const currentRevision = dataWork.session(sessionId)?.revision ?? conflict.current_revision;
+    return {
+      conflict_token: token, csrf_token: csrfToken, return_to: `/work/${encodeURIComponent(sessionId)}`,
+      submitted_revision: conflict.submitted_revision, current_revision: currentRevision,
+      operation_label: conflict.action === 'confirm_mapping' ? 'Field alignment' : conflict.action === 'recipe' ? 'Recipe' : 'Work update',
+      summary: 'Another user or Host updated this Work after the form was opened. Review the current Work before reapplying this preserved draft.',
+      reapply_action: `/work/${encodeURIComponent(sessionId)}/conflict?decision=reapply`,
+      discard_action: `/work/${encodeURIComponent(sessionId)}/conflict?decision=discard`,
+    };
+  };
+  const workSelectionFor = (projectId) => workSelections.get(projectId) ?? {
+    project_id: projectId,
+    resource_ids: [],
+    return_state: { origin: { kind: 'files', folder: '', path: null } },
+  };
+  const workSourceFact = (entry, resourceId) => {
+    const fact = resourceControl.projectResource(entry.project.id, resourceId);
+    const location = fact.locations.find((item) => item.project_id === entry.project.id && item.status === 'active');
+    if (!location) throw new Error('Choose a Resource stored in this Project.');
+    if (!['.csv', '.xlsx'].includes(path.extname(location.path).toLowerCase())) throw new Error('Work supports CSV or XLSX Resources.');
+    return {
+      resource_id: resourceId,
+      name: fact.resource?.display_name ?? path.basename(location.path),
+      relative_path: path.relative(entry.root, location.path).replaceAll('\\', '/'),
+    };
+  };
+  const workSelectionBackHref = (entry, selection) => {
+    const origin = selection?.return_state?.origin ?? {};
+    if (origin.kind === 'view' && origin.id) return `${entry.base}/resources?view=${encodeURIComponent(origin.id)}`;
+    const query = new URLSearchParams();
+    const folder = origin.folder ?? selection?.return_state?.folder ?? '';
+    const focus = origin.path ?? selection?.return_state?.path ?? null;
+    if (folder) query.set('folder', folder);
+    if (focus) query.set('path', focus);
+    return `${entry.base}/resources${query.size ? `?${query}` : ''}`;
+  };
   const desktopPickerToken = desktopPickerEnabled ? crypto.randomBytes(32).toString('hex') : null;
   const temporaryRecordExpired = (value) => (
     value?.job_status !== 'running'
@@ -484,11 +620,64 @@ export async function startAtlasUiServer({
   };
   const renderProjectFiles = (response, entry, data, extra = {}) => sendPage(response, 200, renderProjectFilesView({ ...entry, ...data, ...extra }, { csrfToken, ...displayOptions() }));
   const renderProjectResources = (response, model, statusCode = 200) => sendPage(response, statusCode, renderProjectResourcesView(model, { csrfToken, ...displayOptions() }));
-  const renderDataWork = (response, model, statusCode = 200) => sendPage(response, statusCode, renderDataWorkView({ ...model, csrf: csrfToken }, displayOptions()));
+  const renderProjectHome = (response, model, statusCode = 200) => sendPage(response, statusCode, renderProjectHomeView(model, { csrfToken, ...displayOptions() }));
+  const renderDataWork = (response, model, statusCode = 200) => {
+    let project = model.project ?? null;
+    if (!project && model.session?.project_id) {
+      try { project = projectEntry(model.session.project_id).project; } catch { project = model.session.project ?? null; }
+    }
+    sendPage(response, statusCode, renderDataWorkView({ ...model, project, csrf: csrfToken }, displayOptions()));
+  };
+  const renderWorkTarget = (response, model, statusCode = 200) => sendPage(response, statusCode, renderWorkTargetView({ ...model, csrf: csrfToken }, displayOptions()));
 
   const recentWorkModel = () => {
     const recent = readRecentWorkState(stateDir);
     return { recent_work: recent.items, recent_work_error: Boolean(recent.error) };
+  };
+  const projectHomeModel = (entry) => {
+    const storedHomeState = projectHome.project(entry.project.id);
+    const savedState = savedWork.stateForProject(entry.project.id);
+    let resourceFacts = [];
+    let readError = storedHomeState.error ?? savedState.error ?? null;
+    try { resourceFacts = resourceControl.projectResources(entry.project.id); } catch (error) { readError ??= new Error(safeNotice(error)); }
+    let hasProjectFiles = false;
+    try { hasProjectFiles = searchProjectFiles(entry.root, '').items.length > 0; } catch (error) { readError ??= new Error(safeNotice(error)); }
+    let workSessions = [];
+    try { workSessions = dataWork.openProjectSessions(entry.project); } catch (error) { readError ??= new Error(safeNotice(error)); }
+    return buildProjectHomeModel({
+      ...entry,
+      homeState: { ...storedHomeState, error: readError },
+      resourceFacts,
+      workSessions,
+      savedWork: savedState.items,
+      savedViews: projectViews?.listViews(entry.project.id).views ?? [],
+      currentActivity: readCurrentActivityState(stateDir).items,
+      hasProjectFiles,
+    });
+  };
+  const recordContinueSafely = (projectId, reference, noticeKey = null) => {
+    try {
+      projectHome.recordContinue(projectId, reference);
+      return true;
+    } catch (error) {
+      if (noticeKey) notices.set(noticeKey, `This page is available, but Atlas could not update Project Continue: ${safeNotice(error)}`);
+      return false;
+    }
+  };
+  const recordWorkContinue = (session) => recordContinueSafely(session.project_id, {
+    kind: 'work', id: session.session_id, revision: session.revision, label: 'Continue data Work',
+    origin: {
+      kind: 'files', folder: session.return_state?.folder ?? null,
+      path: session.return_state?.path ?? null,
+    },
+  }, `work:${session.session_id}`);
+  const recordFilesContinue = (entry, filePath) => {
+    const relative = path.relative(entry.root, filePath).replaceAll('\\', '/');
+    const folder = path.posix.dirname(relative).replace(/^\.$/u, '');
+    return recordContinueSafely(entry.project.id, {
+      kind: 'files', id: `files:${folder || '.'}`, relative_path: relative,
+      label: path.basename(filePath), origin: { kind: 'files', folder, path: relative },
+    });
   };
   const renderFilesHome = (response, notice, statusCode = 200) => renderBatch(response, {
     mode: 'empty-selection', notice, desktop_picker_enabled: desktopPickerEnabled,
@@ -512,11 +701,12 @@ export async function startAtlasUiServer({
     const current = readCurrentActivityState(stateDir);
     const recent = recentWorkModel();
     const saves = savedWork.activityItems();
+    const propertyChanges = projectViews?.propertyActivity() ?? [];
     return {
       ...recent,
       recent_work: [...recent.recent_work
         .filter((item) => !saves.some((save) => save.save_id === item.project_transfer?.run_id))
-        .map((item) => ({ ...item, status: 'completed', resource_href: activityResourceHref(item) })), ...saves]
+        .map((item) => ({ ...item, status: 'completed', resource_href: activityResourceHref(item) })), ...saves, ...propertyChanges]
         .filter((item, index, all) => all.findIndex((other) => (other.save_id ?? other.work_id) === (item.save_id ?? item.work_id)) === index),
       current_activity: current.items.map((item) => ({ ...item, resource_href: activityResourceHref(item) })),
       current_activity_error: Boolean(current.error),
@@ -567,7 +757,7 @@ export async function startAtlasUiServer({
       if (term && matches(project.name)) {
         addItem({
           kind: 'project', project_id: project.id, project_name: project.name, name: project.name,
-          href: `/projects/${encodeURIComponent(project.id)}/resources`,
+          href: `/projects/${encodeURIComponent(project.id)}`,
         });
       }
       if (!term || items.length >= 100) continue;
@@ -635,6 +825,33 @@ export async function startAtlasUiServer({
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, `http://${host}`);
     try {
+      const saveMatch = url.pathname.match(/^\/saves\/(SAV-[a-f0-9-]+)(?:\/(execute|undo|redo))?$/u);
+      if (saveMatch) {
+        if (!saveService) throw new Error('Save is unavailable in this Desktop session.');
+        const id = saveMatch[1];
+        const action = saveMatch[2];
+        const record = saveService.show(id);
+        projectEntry(record.project?.id);
+        if (request.method === 'GET' && !action) {
+          sendPage(response, 200, renderSaveResultView({ ...saveService.review(id), csrf: csrfToken }, displayOptions()));
+          return;
+        }
+        if (request.method === 'POST' && action) {
+          const form = await readForm(request);
+          if (!equalSecret(csrfToken, form.get('csrf'))) {
+            response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }); response.end('Atlas UI session token is invalid.'); return;
+          }
+          try {
+            if (action === 'execute') saveService.execute(id, { reason: 'User confirmed the Save preview in Desktop.' });
+            else if (action === 'undo') saveService.undo(id);
+            else saveService.redo(id);
+            redirect(response, `/saves/${encodeURIComponent(id)}`);
+          } catch (error) {
+            sendPage(response, 409, renderSaveResultView({ ...saveService.review(id), csrf: csrfToken, notice: safeNotice(error) }, displayOptions()));
+          }
+          return;
+        }
+      }
       if (url.pathname === '/ui.js' && request.method === 'GET') {
         sendUiClient(response);
         return;
@@ -741,9 +958,12 @@ export async function startAtlasUiServer({
       if (url.pathname === '/activity/dismiss' && request.method === 'POST') {
         const form = await readForm(request);
         if (!equalSecret(csrfToken, form.get('csrf'))) {
-          response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
-          response.end('Atlas UI session token is invalid.');
-          return;
+          if (action === 'archive-missing' || action === 'restore-missing') {
+            response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+            response.end('Atlas UI session token is invalid.');
+            return;
+          }
+          throw new Error('Atlas UI session token is invalid.');
         }
         finishCurrentActivity(stateDir, form.get('activity_id'));
         redirect(response, '/activity');
@@ -1139,18 +1359,278 @@ export async function startAtlasUiServer({
           return;
         }
         const project = work.project ?? projectImport.projectForFile(work.file_path) ?? null;
-        const inspection = fileWork.cachedInspection(work);
-        const knownSheets = inspection?.extraction?.sheets ?? null;
-        const started = await dataWork.begin({ filePath: work.file_path, project, knownSheets });
-        redirect(response, `/data-work/${encodeURIComponent(started.session_id)}`);
+        if (!project?.id) { redirect(response, `/files/add-to-project?work_id=${encodeURIComponent(work.work_id)}`); return; }
+        const entry = projectEntry(project.id);
+        const relative = path.relative(entry.root, work.file_path);
+        if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) { redirect(response, `/files/add-to-project?work_id=${encodeURIComponent(work.work_id)}`); return; }
+        const identified = resourceControl.identify({ filePath: work.file_path, project: entry.project });
+        const relativePath = relative.replaceAll('\\', '/');
+        const folder = path.dirname(relative).replaceAll('\\', '/').replace(/^\.$/u, '');
+        workSourceFact(entry, identified.resource_id);
+        workSelections.set(entry.project.id, {
+          project_id: entry.project.id,
+          resource_ids: [identified.resource_id],
+          return_state: { folder, resource_id: identified.resource_id, path: relativePath, origin: { kind: 'files', folder, path: relativePath } },
+        });
+        redirect(response, `${entry.base}/work/review`);
         return;
+      }
+      const projectWorkSelectionMatch = url.pathname.match(/^\/projects\/([^/]+)\/work\/(selection|sources)$/u);
+      if (projectWorkSelectionMatch && request.method === 'POST') {
+        const entry = projectEntry(decodeURIComponent(projectWorkSelectionMatch[1]));
+        const form = await readForm(request);
+        if (!equalSecret(csrfToken, form.get('csrf'))) {
+          sendJson(response, 403, { ok: false, error: 'Atlas UI session token is invalid.' }); return;
+        }
+        try {
+          const current = workSelectionFor(entry.project.id);
+          const action = String(form.get('action') ?? '');
+          let requested = form.getAll('resource_id').map(String).filter(Boolean);
+          if (!requested.length && form.get('path')) {
+            const source = contentFilePath(projectPath(entry.root, String(form.get('path'))));
+            requested = [resourceControl.identify({ filePath: source, project: entry.project }).resource_id];
+          }
+          const resourceId = requested[0] ?? null;
+          let resourceIds;
+          if (action === 'add') resourceIds = [...current.resource_ids, ...requested];
+          else if (action === 'remove') resourceIds = current.resource_ids.filter((id) => !requested.includes(id));
+          else resourceIds = requested;
+          resourceIds = [...new Set(resourceIds)];
+          for (const id of resourceIds) workSourceFact(entry, id);
+
+          const folder = String(form.get('folder') ?? current.return_state?.folder ?? '');
+          const focus = String(form.get('focus') ?? current.return_state?.path ?? '') || null;
+          const viewId = String(form.get('origin_view_id') ?? '');
+          let origin = current.return_state?.origin ?? { kind: 'files', folder, path: focus };
+          if (viewId) {
+            const view = requireProjectViews().listViews(entry.project.id).views.find((item) => item.view_id === viewId);
+            if (!view) throw new Error('The selected Saved View is unavailable in this Project.');
+            origin = { kind: 'view', id: view.view_id, revision: view.revision };
+          } else if (form.has('folder') || form.has('focus')) origin = { kind: 'files', folder, path: focus };
+          const selection = {
+            project_id: entry.project.id,
+            resource_ids: resourceIds,
+            return_state: { folder, resource_id: resourceId, path: focus, origin },
+          };
+          workSelections.set(entry.project.id, selection);
+          const baseResult = { ok: true, count: resourceIds.length, href: `${entry.base}/work/review` };
+          sendJson(response, 200, action
+            ? { ...baseResult, resource_id: resourceId, selected: resourceId ? resourceIds.includes(resourceId) : false }
+            : baseResult);
+        } catch (error) {
+          sendJson(response, 400, { ok: false, error: safeNotice(error) });
+        }
+        return;
+      }
+      const projectWorkTargetMatch = url.pathname.match(/^\/projects\/([^/]+)\/work\/(review|commit|cancel)$/u);
+      if (projectWorkTargetMatch) {
+        const entry = projectEntry(decodeURIComponent(projectWorkTargetMatch[1]));
+        const operation = projectWorkTargetMatch[2];
+        const noticeKey = `work-target:${entry.project.id}`;
+        if (operation === 'review' && request.method === 'GET') {
+          const selection = workSelectionFor(entry.project.id);
+          const resources = [];
+          let notice = notices.get(noticeKey) ?? null;
+          notices.delete(noticeKey);
+          for (const resourceId of selection.resource_ids) {
+            try { resources.push(workSourceFact(entry, resourceId)); } catch (error) { notice ??= safeNotice(error); }
+          }
+          const works = dataWork.openProjectSessions(entry.project).map((work) => ({
+            session_id: work.session_id,
+            revision: work.revision,
+            sources: work.sources,
+            updated_at: work.updated_at,
+            return_state: work.return_state?.path ?? work.return_state?.folder ?? 'Project Resources',
+          }));
+          const origin = selection.return_state?.origin ?? {};
+          renderWorkTarget(response, {
+            project: entry.project,
+            selection: {
+              resource_ids: [...selection.resource_ids], resources, count: selection.resource_ids.length,
+              origin_label: origin.kind === 'view' ? 'Saved View' : origin.folder ? `Files / ${origin.folder}` : 'Project Resources',
+            },
+            works,
+            notice,
+            back_href: workSelectionBackHref(entry, selection),
+            commit_action: `${entry.base}/work/commit`,
+            cancel_action: `${entry.base}/work/cancel`,
+          });
+          return;
+        }
+        if (operation === 'commit' && request.method === 'POST') {
+          const form = await readForm(request);
+          if (!equalSecret(csrfToken, form.get('csrf'))) throw new Error('Atlas UI session token is invalid.');
+          const selection = workSelectionFor(entry.project.id);
+          try {
+            if (!selection.resource_ids.length) throw new Error('Choose at least one CSV or XLSX Resource before starting Work.');
+            let work;
+            if (form.get('target') === 'new') {
+              work = dataWork.createProjectSession(entry.project, selection.return_state, selection.resource_ids);
+            } else if (form.get('target') === 'existing') {
+              const workId = String(form.get('work_id') ?? '');
+              const existing = dataWork.session(workId);
+              if (!existing || existing.project_id !== entry.project.id) throw new Error('Choose an available Work in this Project.');
+              const baseRevision = Number(form.get('base_revision'));
+              if (!Number.isInteger(baseRevision) || baseRevision < 1) throw new Error('Updating Work requires its current revision.');
+              work = dataWork.replaceSources(workId, selection.resource_ids, { baseRevision, returnState: selection.return_state });
+            } else throw new Error('Choose whether to start a new Work or update one named Work.');
+            workSelections.delete(entry.project.id);
+            recordWorkContinue(work);
+            redirect(response, `/work/${encodeURIComponent(work.session_id)}`);
+          } catch (error) {
+            notices.set(noticeKey, safeNotice(error));
+            redirect(response, `${entry.base}/work/review`);
+          }
+          return;
+        }
+        if (operation === 'cancel' && request.method === 'POST') {
+          const form = await readForm(request);
+          if (!equalSecret(csrfToken, form.get('csrf'))) throw new Error('Atlas UI session token is invalid.');
+          const selection = workSelectionFor(entry.project.id);
+          workSelections.delete(entry.project.id);
+          redirect(response, workSelectionBackHref(entry, selection));
+          return;
+        }
+      }
+      const workMatch = url.pathname.match(/^\/work\/(DWT-[a-f0-9]{32})(?:\/(action|conflict|save|save\/review|save\/confirm|saved))?$/u);
+      if (workMatch) {
+        const [, sessionId, operation] = workMatch;
+        let session = dataWork.session(sessionId);
+        if (!session) { renderDataWork(response, { mode: 'unavailable', back_href: '/projects' }, 410); return; }
+        const noticeKey = `work:${sessionId}`;
+        if (operation === 'conflict' && request.method === 'POST') {
+          const form = await readForm(request);
+          if (!equalSecret(csrfToken, form.get('csrf'))) throw new Error('Atlas UI session token is invalid.');
+          const token = String(form.get('conflict_token') ?? ''); const conflict = workDraftConflicts.get(token);
+          if (!conflict || conflict.session_id !== sessionId || Date.now() - conflict.created_at > 30 * 60 * 1000) { workDraftConflicts.delete(token); throw new Error('This preserved Work draft is no longer available.'); }
+          if (url.searchParams.get('decision') === 'discard') { workDraftConflicts.delete(token); redirect(response, `/work/${encodeURIComponent(sessionId)}`); return; }
+          if (url.searchParams.get('decision') !== 'reapply') throw new Error('Choose Reapply or Discard for this Work draft.');
+          try {
+            const current = dataWork.session(sessionId); const restored = new URLSearchParams(conflict.entries);
+            await applyPersistentWorkAction(sessionId, restored, current.revision);
+            workDraftConflicts.delete(token); recordWorkContinue(dataWork.session(sessionId));
+            redirect(response, `/work/${encodeURIComponent(sessionId)}`); return;
+          } catch (error) {
+            conflict.current_revision = dataWork.session(sessionId)?.revision ?? conflict.current_revision;
+            notices.set(noticeKey, safeNotice(error));
+            redirect(response, `/work/${encodeURIComponent(sessionId)}?draft_conflict=${encodeURIComponent(token)}`); return;
+          }
+        }
+        if (operation === 'action' && request.method === 'POST') {
+          const form = await readForm(request);
+          if (!equalSecret(csrfToken, form.get('csrf'))) throw new Error('Atlas UI session token is invalid.');
+          let actionCompleted = false;
+          try {
+            await applyPersistentWorkAction(sessionId, form);
+            actionCompleted = true;
+          } catch (error) {
+            const action = String(form.get('action') ?? '');
+            if (error?.code === 'ATLAS_STATE_CONFLICT' && ['confirm_mapping', 'recipe'].includes(action)) {
+              const token = storeWorkDraftConflict(sessionId, action, form, Number(form.get('base_revision')), dataWork.session(sessionId)?.revision ?? null);
+              redirect(response, `/work/${encodeURIComponent(sessionId)}?draft_conflict=${encodeURIComponent(token)}`); return;
+            }
+            notices.set(noticeKey, safeNotice(error));
+          }
+          if (actionCompleted) recordWorkContinue(dataWork.session(sessionId));
+          redirect(response, `/work/${encodeURIComponent(sessionId)}`); return;
+        }
+        if (!operation && request.method === 'GET') {
+          session = await dataWork.validateSources(sessionId);
+          const entry = projectEntry(session.project_id);
+          const folder = session.return_state?.folder ?? '';
+          const query = new URLSearchParams();
+          if (folder) query.set('folder', folder);
+          if (session.return_state?.resource_id) query.set('resource_id', session.return_state.resource_id);
+          recordWorkContinue(session);
+          const notice = notices.get(noticeKey) ?? null; notices.delete(noticeKey);
+          const draftConflict = workDraftConflictModel(sessionId, String(url.searchParams.get('draft_conflict') ?? ''));
+          renderDataWork(response, { mode: 'sources', session, back_href: `${entry.base}/resources${query.size ? `?${query}` : ''}`, notice, draft_conflict: draftConflict }); return;
+        }
+        if (operation === 'save' && request.method === 'GET') {
+          session = await dataWork.validateSources(sessionId);
+          if (session.sources.some((item) => item.status !== 'ready') || !session.preview || session.preview_revision !== session.revision) { notices.set(noticeKey, 'Refresh all Sources and preview the current Recipe before saving.'); redirect(response, `/work/${encodeURIComponent(sessionId)}`); return; }
+          const notice = notices.get(noticeKey) ?? null; notices.delete(noticeKey);
+          const projects = projectImport.projectChoices().filter((item) => item.id === session.project_id);
+          renderDataWork(response, { mode: 'save', session, projects, back_href: `/work/${encodeURIComponent(sessionId)}`, notice }); return;
+        }
+        if (operation === 'save/review' && request.method === 'POST') {
+          const form = await readForm(request); if (!equalSecret(csrfToken, form.get('csrf'))) throw new Error('Atlas UI session token is invalid.');
+          try {
+            session = await dataWork.validateSources(sessionId);
+            if (!session.preview || session.preview_revision !== session.revision) throw new Error('Preview the current Recipe before saving.');
+            const entry = projectEntry(form.get('project_id'));
+            if (entry.project.id !== session.project_id) throw new Error('Save this Work result inside its active Project.');
+            const format = form.get('format') === 'csv' ? 'csv' : 'xlsx'; const extension = `.${format}`;
+            const target = savedWork.prepareDestination({ projectRoot: entry.root, folder: form.get('folder'), fileName: form.get('file_name'), sourcePath: session.sources[0]?.file_path, outputExtension: extension });
+            const existingStage = dataWork.persistentStage(sessionId);
+            if (!existingStage || existingStage.revision !== session.revision || existingStage.extension !== extension) {
+              dataWork.clearPersistentStage(sessionId); await dataWork.stagePersistent(sessionId, extension, { baseRevision: session.revision });
+            }
+            const stage = dataWork.persistentStage(sessionId);
+            const query = new URLSearchParams({ project_id: entry.project.id, folder: form.get('folder'), file_name: path.basename(target), format, stage_id: stage.stage_id, revision: String(stage.revision), candidate_sha256: stage.staged.sha256 });
+            redirect(response, `/work/${encodeURIComponent(sessionId)}/save/review?${query}`); return;
+          } catch (error) { notices.set(noticeKey, safeNotice(error)); redirect(response, `/work/${encodeURIComponent(sessionId)}/save`); return; }
+        }
+        if (operation === 'save/review' && request.method === 'GET') {
+          try {
+            session = await dataWork.validateSources(sessionId);
+            const entry = projectEntry(url.searchParams.get('project_id'));
+            if (entry.project.id !== session.project_id) throw new Error('Save this Work result inside its active Project.');
+            const format = url.searchParams.get('format') === 'csv' ? 'csv' : 'xlsx'; const extension = `.${format}`;
+            const target = savedWork.prepareDestination({ projectRoot: entry.root, folder: url.searchParams.get('folder'), fileName: url.searchParams.get('file_name'), sourcePath: session.sources[0]?.file_path, outputExtension: extension });
+            const stage = dataWork.persistentStage(sessionId);
+            if (!stage || stage.revision !== session.revision || stage.extension !== extension || stage.stage_id !== url.searchParams.get('stage_id') || String(stage.revision) !== url.searchParams.get('revision') || stage.staged.sha256 !== url.searchParams.get('candidate_sha256')) throw new Error('The reviewed result is no longer current. Review the save again.');
+            renderDataWork(response, { mode: 'review', session, stage, save: { project: entry.project, folder: url.searchParams.get('folder'), file_name: path.basename(target), target, format }, back_href: `/work/${encodeURIComponent(sessionId)}` }); return;
+          } catch (error) { notices.set(noticeKey, safeNotice(error)); redirect(response, `/work/${encodeURIComponent(sessionId)}/save`); return; }
+        }
+        if (operation === 'save/confirm' && request.method === 'POST') {
+          const form = await readForm(request); if (!equalSecret(csrfToken, form.get('csrf'))) throw new Error('Atlas UI session token is invalid.');
+          try {
+            session = await dataWork.validateSources(sessionId);
+            const entry = projectEntry(form.get('project_id'));
+            if (entry.project.id !== session.project_id) throw new Error('Save this Work result inside its active Project.');
+            const stage = dataWork.persistentStage(sessionId);
+            const format = form.get('format') === 'csv' ? 'csv' : 'xlsx'; const extension = `.${format}`;
+            if (!stage || stage.revision !== session.revision || stage.extension !== extension || stage.stage_id !== form.get('stage_id') || String(stage.revision) !== form.get('revision') || stage.staged.sha256 !== form.get('candidate_sha256')) throw new Error('The reviewed result is no longer current. Review the save again.');
+            const fileName = path.basename(form.get('file_name')).normalize('NFC');
+            const sources = session.sources.map((item) => ({ source_key: item.source_key, resource_id: item.resource_id, path: item.file_path, sheet: item.sheet, fingerprint: item.fingerprint }));
+            const record = savedWork.save({
+              project: entry.project, projectRoot: entry.root, root: entry.location.root_path, folder: form.get('folder'), fileName,
+              stagedPath: stage.path, expectedCandidateHash: stage.staged.sha256, sourcePath: sources[0].path, sourceFingerprint: sources[0].fingerprint,
+              sources, recipe: session.recipe, outputExtension: extension,
+              requestKey: `${sessionId}:r${session.revision}:${entry.project.id}:${form.get('folder')}:${fileName}`,
+              caller: { actor: 'user', tool: 'atlas-ui', client_run_id: sessionId },
+              parameters: { work_session_id: sessionId, mapping: session.mapping, recipe_version: session.recipe.version },
+              resultSummary: { ...stage.result.result_summary, validation: stage.result.validation, format: format.toUpperCase(), recipe_version: session.recipe.version },
+            });
+            dataWork.recordSave(sessionId, record.work_id); dataWork.clearPersistentStage(sessionId);
+            redirect(response, `/work/${encodeURIComponent(sessionId)}/saved?work_id=${encodeURIComponent(record.work_id)}`); return;
+          } catch (error) { notices.set(noticeKey, safeNotice(error)); redirect(response, `/work/${encodeURIComponent(sessionId)}/save`); return; }
+        }
+        if (operation === 'saved' && request.method === 'GET') {
+          const record = savedWork.find(url.searchParams.get('work_id'));
+          if (!record || record.project?.id !== session.project_id) { notices.set(noticeKey, 'The saved result is no longer available.'); redirect(response, `/work/${encodeURIComponent(sessionId)}`); return; }
+          recordContinueSafely(session.project_id, {
+            kind: 'result', id: record.work_id, label: path.basename(record.result_path), revision: session.revision,
+            origin: { kind: 'work', id: session.session_id, folder: session.return_state?.folder ?? null, path: session.return_state?.path ?? null },
+          }, noticeKey);
+          renderDataWork(response, { mode: 'saved', session, record: { ...record, output_status: savedResultState(record) }, back_href: `/work/${encodeURIComponent(sessionId)}` }); return;
+        }
       }
       const projectDataWorkMatch = url.pathname.match(/^\/projects\/([^/]+)\/data-work$/u);
       if (projectDataWorkMatch && request.method === 'GET') {
         const entry = projectEntry(decodeURIComponent(projectDataWorkMatch[1]));
-        const source = contentFilePath(projectPath(entry.root, url.searchParams.get('path') ?? ''));
-        const started = await dataWork.begin({ filePath: source, project: entry.project });
-        redirect(response, `/data-work/${encodeURIComponent(started.session_id)}`);
+        const relativePath = String(url.searchParams.get('path') ?? '');
+        const source = contentFilePath(projectPath(entry.root, relativePath));
+        const identified = resourceControl.identify({ filePath: source, project: entry.project });
+        const folder = path.dirname(relativePath).replaceAll('\\', '/').replace(/^\.$/u, '');
+        workSourceFact(entry, identified.resource_id);
+        workSelections.set(entry.project.id, {
+          project_id: entry.project.id,
+          resource_ids: [identified.resource_id],
+          return_state: { folder, resource_id: identified.resource_id, path: relativePath, origin: { kind: 'files', folder, path: relativePath } },
+        });
+        redirect(response, `${entry.base}/work/review`);
         return;
       }
       const dataWorkMatch = url.pathname.match(/^\/data-work\/(DWT-[a-f0-9]{32})(?:\/(action|save|save\/review|save\/confirm|saved))?$/u);
@@ -1242,7 +1722,7 @@ export async function startAtlasUiServer({
             notices.set(`data-work:${sessionId}`, 'The saved result is no longer available.');
             redirect(response, `/data-work/${encodeURIComponent(sessionId)}`); return;
           }
-          renderDataWork(response, { mode: 'saved', session, record, back_href: backHref }); return;
+          renderDataWork(response, { mode: 'saved', session, record: { ...record, output_status: savedResultState(record) }, back_href: backHref }); return;
         }
       }
       if (url.pathname === '/data-work/undo' && request.method === 'POST') {
@@ -1261,7 +1741,7 @@ export async function startAtlasUiServer({
         const record = savedWork.redo(existing.work_id);
         redirect(response, record.resources_href ?? `/projects/${encodeURIComponent(projectId)}/resources`); return;
       }
-      const projectResourceActionMatch = url.pathname.match(/^\/projects\/([^/]+)\/resources\/actions\/(keep|relink|forget|remove-reference|redo-save)$/u);
+      const projectResourceActionMatch = url.pathname.match(/^\/projects\/([^/]+)\/resources\/actions\/(keep|archive|restore|relink|forget|remove-reference|redo-save|accept-current)$/u);
       if (projectResourceActionMatch && request.method === 'POST') {
         const [, encodedId, action] = projectResourceActionMatch;
         const entry = projectEntry(decodeURIComponent(encodedId));
@@ -1276,11 +1756,23 @@ export async function startAtlasUiServer({
         const fact = facts.find((item) => item.resource_id === resourceId);
         if (!fact) throw new Error('The requested Resource is unavailable in this Project.');
         const caller = { tool: 'atlas-ui', client_run_id: uiClientRunId };
-        if (action === 'redo-save') {
+        if (action === 'accept-current') {
+          resourceControl.acceptCurrentVersion({ projectId: entry.project.id, resourceId, expectedCurrentVersion: String(form.get('expected_current_version') ?? ''), caller });
+          const currentFacts = resourceControl.projectResources(entry.project.id, { refresh: true });
+          projectHome.recordCheck(entry.project.id, {
+            status: 'complete', scopeLabel: `${currentFacts.length} tracked Project Resource${currentFacts.length === 1 ? '' : 's'}`,
+            changedResources: currentFacts.filter((item) => item.external_change?.status === 'changed').map((item) => ({
+              resource_id: item.resource_id, title: item.resource?.display_name ?? item.resource_id,
+              baseline_version: item.external_change?.baseline?.sha256 ?? null, current_version: item.external_change?.current?.sha256 ?? null,
+            })),
+          });
+        } else if (action === 'redo-save') {
           const record = savedWork.find(String(form.get('work_id') ?? ''));
           if (!record || record.resource_id !== resourceId || record.project?.id !== entry.project.id || record.write?.redo_available !== true) throw new Error('The requested saved Resource is unavailable in this Project.');
           savedWork.redo(record.work_id);
         } else if (action === 'keep') resourceControl.keepRecord(resourceId, { caller });
+        else if (action === 'archive') resourceControl.archiveMissingRecords({ projectId: entry.project.id, resourceIds: [resourceId], caller });
+        else if (action === 'restore') resourceControl.restoreMissingRecords({ projectId: entry.project.id, resourceIds: [resourceId], caller });
         else if (action === 'relink') {
           const selected = desktopSelections.selection(form.get('selection_id'), { consume: true, kind: 'file' });
           if (!selected) throw new Error('The selected file is no longer available. Choose it again.');
@@ -1295,6 +1787,80 @@ export async function startAtlasUiServer({
         }
         redirect(response, `${entry.base}/resources?resource_id=${encodeURIComponent(resourceId)}`);
         return;
+      }
+      const projectHomeActionMatch = url.pathname.match(/^\/projects\/([^/]+)\/home\/(pins|check|archive-missing|restore-missing)$/u);
+      if (projectHomeActionMatch && request.method === 'POST') {
+        const [, encodedId, action] = projectHomeActionMatch;
+        const entry = projectEntry(decodeURIComponent(encodedId));
+        const form = await readForm(request);
+        if (!equalSecret(csrfToken, form.get('csrf'))) {
+          if (action === 'archive-missing' || action === 'restore-missing') {
+            response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+            response.end('Atlas UI session token is invalid.');
+            return;
+          }
+          throw new Error('Atlas UI session token is invalid.');
+        }
+        if (action === 'archive-missing' || action === 'restore-missing') {
+          const homeModel = projectHomeModel(entry);
+          const resourceIds = action === 'archive-missing'
+            ? homeModel.missing_records.resource_ids
+            : homeModel.missing_records.archived_resource_ids;
+          const caller = { tool: 'atlas-ui', client_run_id: uiClientRunId };
+          if (action === 'archive-missing') resourceControl.archiveMissingRecords({ projectId: entry.project.id, resourceIds, caller });
+          else resourceControl.restoreMissingRecords({ projectId: entry.project.id, resourceIds, caller });
+          redirect(response, entry.base);
+          return;
+        }
+        if (action === 'check') {
+          try {
+            const facts = resourceControl.projectResources(entry.project.id, { refresh: true });
+            projectHome.recordCheck(entry.project.id, {
+              status: 'complete',
+              scopeLabel: `${facts.length} tracked Project Resource${facts.length === 1 ? '' : 's'}`,
+              changedResources: facts.filter((fact) => fact.external_change?.status === 'changed').map((fact) => ({
+                resource_id: fact.resource_id,
+                title: fact.resource?.display_name ?? fact.resource_id,
+                baseline_version: fact.external_change?.baseline?.sha256 ?? null,
+                current_version: fact.external_change?.current?.sha256 ?? null,
+              })),
+            });
+          } catch (error) {
+            projectHome.recordCheck(entry.project.id, { status: 'failed', scopeLabel: 'Tracked Project Resources', errorMessage: safeNotice(error) });
+          }
+          redirect(response, entry.base); return;
+        }
+        const kind = String(form.get('kind') ?? '');
+        const id = String(form.get('id') ?? '');
+        if (form.get('action') === 'unpin') {
+          projectHome.unpin(entry.project.id, { kind, id });
+        } else if (kind === 'result') {
+          const record = savedWork.find(id);
+          if (!record || record.project?.id !== entry.project.id) throw new Error('The requested Result is unavailable in this Project.');
+          projectHome.pin(entry.project.id, {
+            kind: 'result', id: record.work_id, label: path.basename(record.result_path),
+            origin: { kind: 'work', id: record.parameters?.work_session_id ?? null },
+          });
+        } else if (kind === 'view') {
+          const view = requireProjectViews().listViews(entry.project.id).views.find((item) => item.view_id === id);
+          if (!view) throw new Error('The requested Saved View is unavailable in this Project.');
+          projectHome.pin(entry.project.id, {
+            kind: 'view', id: view.view_id, label: view.name, revision: view.revision,
+            origin: { kind: 'view', id: view.view_id },
+          });
+        } else if (kind === 'resource') {
+          const relativePath = String(form.get('path') ?? '');
+          const filePath = contentFilePath(projectPath(entry.root, relativePath));
+          const identified = resourceControl.identify({ filePath, project: entry.project });
+          projectHome.pin(entry.project.id, {
+            kind: 'resource', id: identified.resource_id, resource_id: identified.resource_id,
+            relative_path: relativePath, label: path.basename(filePath),
+            origin: { kind: 'files', folder: path.dirname(relativePath).replaceAll('\\', '/').replace(/^\.$/u, ''), path: relativePath },
+          });
+        } else throw new Error('Choose a supported Project item to pin.');
+        const returnTo = String(form.get('return_to') ?? '');
+        const safeReturn = returnTo.startsWith(`${entry.base}/resources`) && !returnTo.startsWith('//') ? returnTo : entry.base;
+        redirect(response, safeReturn); return;
       }
       const projectResourcesMatch = url.pathname.match(/^\/projects\/([^/]+)\/resources(?:\/(detail))?$/u);
       if (projectResourcesMatch && request.method === 'GET') {
@@ -1317,10 +1883,18 @@ export async function startAtlasUiServer({
             }));
             return;
           }
-          renderProjectResources(response, buildProjectResourceDetailModel({
+          const detailModel = buildProjectResourceDetailModel({
             ...entry, recentWork, currentActivity, resourceFacts, savedWork: savedState.items,
             relativePath: url.searchParams.get('path') ?? '',
-          }));
+          });
+          const detailPinned = new Set(projectHome.project(entry.project.id).pinned.filter((item) => item.kind === 'resource').map((item) => item.id));
+          detailModel.resource.pinned = detailModel.resource.resource_id ? detailPinned.has(detailModel.resource.resource_id) : false;
+          recordContinueSafely(entry.project.id, {
+            kind: 'resource', id: detailModel.resource.resource_id ?? `path:${detailModel.resource.relative_path}`,
+            resource_id: detailModel.resource.resource_id, relative_path: detailModel.resource.relative_path, label: detailModel.resource.name,
+            origin: { kind: 'files', folder: path.dirname(detailModel.resource.relative_path).replaceAll('\\', '/').replace(/^\.$/u, ''), path: detailModel.resource.relative_path },
+          });
+          renderProjectResources(response, detailModel);
           return;
         }
         const activityKey = url.searchParams.get('from') === 'activity' ? url.searchParams.get('activity') : null;
@@ -1328,6 +1902,104 @@ export async function startAtlasUiServer({
         const resourcesModel = buildProjectResourcesModel({
           ...entry, recentWork, currentActivity, resourceFacts, savedWork: savedState.items, savedWorkError: Boolean(savedState.error),
           focusedPath: url.searchParams.get('path'), focusedResourceId: url.searchParams.get('resource_id'), selectedFolderPath: url.searchParams.get('folder'), stateDir, activityReturnHref,
+          workSession: dataWork.currentProjectSession(entry.project),
+        });
+        const pinnedResourceIds = new Set(projectHome.project(entry.project.id).pinned.filter((item) => item.kind === 'resource').map((item) => item.id));
+        if (resourcesModel.focused_resource) {
+          resourcesModel.focused_resource.pinned = resourcesModel.focused_resource.resource_id ? pinnedResourceIds.has(resourcesModel.focused_resource.resource_id) : false;
+        }
+        const requestedViewId = url.searchParams.get('view');
+        const savedViews = projectViews?.listViews(entry.project.id).views ?? [];
+        const activeView = requestedViewId ? savedViews.find((item) => item.view_id === requestedViewId) ?? null : null;
+        if (requestedViewId && !activeView) throw new Error('The requested Saved View is unavailable in this Project.');
+        const requestedMode = String(url.searchParams.get('mode') ?? activeView?.mode ?? 'files').toLowerCase();
+        const mode = ['files', 'table', 'cards'].includes(requestedMode) ? requestedMode : 'files';
+        const hasTemporaryConfig = ['scope_path', 'extensions', 'name_contains', 'property_filter_id', 'property_filter_operator', 'property_filter_value', 'sort_field', 'sort_direction', 'group_by', 'visible_fields']
+          .some((name) => url.searchParams.has(name));
+        const baseConfig = activeView?.config ?? { scope: { path: url.searchParams.get('folder') ?? '', recursive: true, extensions: [] }, filters: [], sort: [], group_by: null, visible_fields: [] };
+        const temporaryConfig = hasTemporaryConfig ? {
+          scope: {
+            path: url.searchParams.get('scope_path') ?? baseConfig.scope?.path ?? '',
+            recursive: true,
+            extensions: String(url.searchParams.get('extensions') ?? '').split(',').map((item) => item.trim()).filter(Boolean),
+          },
+          filters: [
+            ...(String(url.searchParams.get('name_contains') ?? '').trim()
+              ? [{ field: 'name', operator: 'contains', value: String(url.searchParams.get('name_contains')).trim() }] : []),
+            ...(String(url.searchParams.get('property_filter_id') ?? '').trim()
+              ? [{
+                field: `property:${String(url.searchParams.get('property_filter_id')).trim()}`,
+                operator: String(url.searchParams.get('property_filter_operator') ?? 'equals'),
+                value: String(url.searchParams.get('property_filter_value') ?? ''),
+              }] : []),
+          ],
+          sort: [{
+            field: String(url.searchParams.get('sort_field') ?? 'relative_path'),
+            direction: String(url.searchParams.get('sort_direction') ?? 'asc'),
+          }],
+          group_by: String(url.searchParams.get('group_by') ?? '').trim() || null,
+          visible_fields: String(url.searchParams.get('visible_fields') ?? '').split(',').map((item) => item.trim()).filter(Boolean),
+        } : baseConfig;
+        let evaluation = null;
+        const defaultViewItems = mode === 'cards' ? DEFAULT_RESOURCE_CARD_ITEMS : DEFAULT_RESOURCE_VIEW_ITEMS;
+        const requestedViewItems = resourceViewItemLimit(url.searchParams.get('view_items'), defaultViewItems);
+        if (projectViews && activeView && !hasTemporaryConfig) {
+          evaluation = evaluateResourceViewPages({
+            projectViews,
+            activeView,
+            projectId: entry.project.id,
+            config: activeView.config,
+            requestedItems: requestedViewItems,
+          });
+        } else if (projectViews && (mode !== 'files' || activeView || hasTemporaryConfig)) {
+          evaluation = evaluateResourceViewPages({
+            projectViews,
+            projectId: entry.project.id,
+            config: temporaryConfig,
+            requestedItems: requestedViewItems,
+          });
+        }
+        if (evaluation?.continuation && requestedViewItems < MAX_RESOURCE_VIEW_ITEMS) {
+          const moreUrl = new URL(url.href);
+          const pageSize = mode === 'cards' ? RESOURCE_CARD_PAGE_SIZE : RESOURCE_VIEW_PAGE_SIZE;
+          moreUrl.searchParams.set('view_items', String(Math.min(requestedViewItems + pageSize, MAX_RESOURCE_VIEW_ITEMS)));
+          evaluation.more_href = `${moreUrl.pathname}${moreUrl.search}`;
+        }
+        const pinnedViewIds = new Set(projectHome.project(entry.project.id).pinned.filter((item) => item.kind === 'view').map((item) => item.id));
+        resourcesModel.resource_view = {
+          mode,
+          saved_views: savedViews,
+          active_view: activeView ? { ...activeView, scope_path: activeView.config?.scope?.path ?? '', pinned: pinnedViewIds.has(activeView.view_id) } : null,
+          temporary_config: temporaryConfig,
+          evaluation,
+          members: (evaluation?.members ?? []).map((member) => ({
+            ...member,
+            thumbnail_href: RESOURCE_THUMBNAIL_TYPES.has(member.extension)
+              ? `${entry.base}/resources/thumbnail?path=${encodeURIComponent(member.relative_path)}` : null,
+          })),
+          property_definitions: projectViews?.listProperties(entry.project.id) ?? [],
+          save_action: projectViews ? `${entry.base}/resources/views` : null,
+          property_define_action: projectViews ? `${entry.base}/resources/properties/define` : null,
+          property_apply_action: projectViews ? `${entry.base}/resources/properties/apply` : null,
+          property_undo_action: projectViews ? `${entry.base}/resources/properties/undo` : null,
+          property_undo: projectViews?.latestPropertyUndo(entry.project.id) ?? null,
+          property_candidates: projectViews?.listPropertyCandidates(entry.project.id) ?? [],
+          property_candidate_history: projectViews?.recentPropertyDecisions(entry.project.id) ?? [],
+          property_candidate_decision_action: projectViews ? `${entry.base}/resources/properties/candidates/decide` : null,
+        };
+        const workSelection = workSelectionFor(entry.project.id);
+        resourcesModel.work_selection = {
+          resource_ids: [...workSelection.resource_ids],
+          count: workSelection.resource_ids.length,
+          review_href: `${entry.base}/work/review`,
+        };
+        if (mode === 'files' && evaluation) {
+          resourcesModel.tree = filterResourceTree(resourcesModel.tree, new Set(evaluation.members.map((item) => item.relative_path)));
+          resourcesModel.saved_view_empty = evaluation.members.length === 0;
+        }
+        if (activeView) recordContinueSafely(entry.project.id, {
+          kind: 'view', id: activeView.view_id, label: activeView.name, revision: activeView.revision,
+          origin: { kind: 'view', id: activeView.view_id },
         });
         if (url.searchParams.get('fragment') === 'folder-files') {
           sendHtml(response, 200, renderProjectResourceFolderGroup(resourcesModel));
@@ -1336,13 +2008,132 @@ export async function startAtlasUiServer({
         renderProjectResources(response, resourcesModel);
         return;
       }
+      const projectResourceViewSaveMatch = url.pathname.match(/^\/projects\/([^/]+)\/resources\/views$/u);
+      if (projectResourceViewSaveMatch && request.method === 'POST') {
+        const entry = projectEntry(decodeURIComponent(projectResourceViewSaveMatch[1]));
+        const form = await readForm(request);
+        if (!equalSecret(csrfToken, form.get('csrf'))) throw new Error('Atlas UI session token is invalid.');
+        const viewId = String(form.get('view_id') ?? '') || null;
+        const baseRevisionValue = String(form.get('base_revision') ?? '');
+        const saved = requireProjectViews().saveView({
+          projectId: entry.project.id,
+          viewId,
+          name: String(form.get('name') ?? ''),
+          mode: String(form.get('mode') ?? 'files'),
+          config: {
+            scope: {
+              path: String(form.get('scope_path') ?? ''),
+              recursive: true,
+              extensions: String(form.get('extensions') ?? '').split(',').map((item) => item.trim()).filter(Boolean),
+            },
+            filters: [
+              ...(String(form.get('name_contains') ?? '').trim()
+                ? [{ field: 'name', operator: 'contains', value: String(form.get('name_contains')).trim() }] : []),
+              ...(String(form.get('property_filter_id') ?? '').trim()
+                ? [{
+                  field: `property:${String(form.get('property_filter_id')).trim()}`,
+                  operator: String(form.get('property_filter_operator') ?? 'equals'),
+                  value: String(form.get('property_filter_value') ?? ''),
+                }] : []),
+            ],
+            sort: [{
+              field: String(form.get('sort_field') ?? 'relative_path'),
+              direction: String(form.get('sort_direction') ?? 'asc'),
+            }],
+            group_by: String(form.get('group_by') ?? '').trim() || null,
+            visible_fields: String(form.get('visible_fields') ?? '').split(',').map((item) => item.trim()).filter(Boolean),
+          },
+          baseRevision: viewId && baseRevisionValue ? Number(baseRevisionValue) : null,
+        });
+        redirect(response, `${entry.base}/resources?view=${encodeURIComponent(saved.view_id)}`);
+        return;
+      }
+      const projectResourceCandidateDecisionMatch = url.pathname.match(/^\/projects\/([^/]+)\/resources\/properties\/candidates\/decide$/u);
+      if (projectResourceCandidateDecisionMatch && request.method === 'POST') {
+        const entry = projectEntry(decodeURIComponent(projectResourceCandidateDecisionMatch[1]));
+        const form = await readForm(request);
+        if (!equalSecret(csrfToken, form.get('csrf'))) throw new Error('Atlas UI session token is invalid.');
+        const returnTo = String(form.get('return_to') ?? '');
+        const safeReturn = returnTo.startsWith(`${entry.base}/resources`) && !returnTo.startsWith('//') ? returnTo : `${entry.base}/resources?mode=table`;
+        requireProjectViews().decidePropertyCandidate({
+          projectId: entry.project.id,
+          candidateId: String(form.get('candidate_id') ?? ''),
+          action: String(form.get('action') ?? ''),
+          value: String(form.get('value') ?? ''),
+          expectedRevision: Number(form.get('expected_revision')),
+          expectedSourceVersion: String(form.get('expected_source_version') ?? ''),
+          caller: { tool: 'atlas-ui', client_run_id: uiClientRunId },
+        });
+        redirect(response, safeReturn);
+        return;
+      }
+      const projectResourcePropertyMatch = url.pathname.match(/^\/projects\/([^/]+)\/resources\/properties\/(define|apply|undo)$/u);
+      if (projectResourcePropertyMatch && request.method === 'POST') {
+        const entry = projectEntry(decodeURIComponent(projectResourcePropertyMatch[1]));
+        const operation = projectResourcePropertyMatch[2];
+        const form = await readForm(request);
+        if (!equalSecret(csrfToken, form.get('csrf'))) throw new Error('Atlas UI session token is invalid.');
+        const returnTo = String(form.get('return_to') ?? '');
+        const safeReturn = returnTo.startsWith(`${entry.base}/resources`) && !returnTo.startsWith('//')
+          ? returnTo : `${entry.base}/resources?mode=table`;
+        if (operation === 'define') {
+          requireProjectViews().defineProperty({
+            projectId: entry.project.id,
+            name: String(form.get('name') ?? ''),
+            kind: String(form.get('kind') ?? ''),
+            options: String(form.get('options') ?? '').split(',').map((item) => item.trim()).filter(Boolean),
+          });
+        } else if (operation === 'apply') {
+          const propertyId = String(form.get('property_id') ?? '');
+          const expectedMatrix = JSON.parse(String(form.get('expected_versions') ?? '{}'));
+          const resourceIds = form.getAll('resource_id').map(String);
+          const expectedVersions = Object.fromEntries(resourceIds.map((resourceId) => [
+            resourceId,
+            Number(expectedMatrix?.[resourceId]?.[propertyId] ?? 0),
+          ]));
+          const property = requireProjectViews().listProperties(entry.project.id).find((item) => item.property_id === propertyId);
+          const inputValue = String(form.get('value') ?? '');
+          requireProjectViews().applyPropertyBatch({
+            projectId: entry.project.id,
+            resourceIds,
+            propertyId,
+            operation: String(form.get('operation') ?? 'replace'),
+            value: property?.kind === 'multi' ? inputValue.split(',').map((item) => item.trim()).filter(Boolean) : inputValue,
+            expectedVersions,
+          });
+        } else {
+          requireProjectViews().undoPropertyBatch(String(form.get('batch_id') ?? ''), { projectId: entry.project.id });
+        }
+        redirect(response, safeReturn);
+        return;
+      }
+      const projectResourceThumbnailMatch = url.pathname.match(/^\/projects\/([^/]+)\/resources\/thumbnail$/u);
+      if (projectResourceThumbnailMatch && request.method === 'GET') {
+        const entry = projectEntry(decodeURIComponent(projectResourceThumbnailMatch[1]));
+        const relativePath = String(url.searchParams.get('path') ?? '');
+        const filePath = contentFilePath(projectPath(entry.root, relativePath));
+        const contentType = RESOURCE_THUMBNAIL_TYPES.get(path.extname(filePath).toLowerCase());
+        const stat = fs.lstatSync(filePath);
+        if (!contentType || !stat.isFile() || stat.isSymbolicLink()) throw new Error('Preview unavailable for this file type.');
+        if (stat.size > MAX_RESOURCE_THUMBNAIL_BYTES) throw new Error('Preview unavailable because this image is too large.');
+        response.writeHead(200, {
+          'content-type': contentType,
+          'content-length': stat.size,
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+        });
+        fs.createReadStream(filePath).pipe(response);
+        return;
+      }
       const projectResourceOpenMatch = url.pathname.match(/^\/projects\/([^/]+)\/resources\/open$/u);
       if (projectResourceOpenMatch && request.method === 'POST') {
         const entry = projectEntry(decodeURIComponent(projectResourceOpenMatch[1]));
         const form = await readForm(request);
         if (!equalSecret(csrfToken, form.get('csrf'))) throw new Error('Atlas UI session token is invalid.');
         const relativePath = String(form.get('path') ?? '');
-        openLocalFile(contentFilePath(projectPath(entry.root, relativePath)));
+        const filePath = contentFilePath(projectPath(entry.root, relativePath));
+        await openLocalFileFn(filePath);
+        recordFilesContinue(entry, filePath);
         redirect(response, `${entry.base}/resources?path=${encodeURIComponent(relativePath)}`);
         return;
       }
@@ -1365,7 +2156,11 @@ export async function startAtlasUiServer({
           const form = await readForm(request);
           if (!equalSecret(csrfToken, form.get('csrf'))) throw new Error('Atlas UI session token is invalid.');
           const filePath = projectPath(entry.root, form.get('path'));
-          if (operation === 'open') { openLocalFile(contentFilePath(filePath)); redirect(response, `${entry.base}/files?dir=${encodeURIComponent(path.dirname(form.get('path')).replaceAll('\\', '/'))}`); return; }
+          if (operation === 'open') {
+            await openLocalFileFn(contentFilePath(filePath));
+            recordFilesContinue(entry, filePath);
+            redirect(response, `${entry.base}/files?dir=${encodeURIComponent(path.dirname(form.get('path')).replaceAll('\\', '/'))}`); return;
+          }
           try {
             const inspected = await fileWork.inspectAsync({ filePath, purpose: defaultInspectPurpose(filePath), sheet: null, maxCharacters: 4000, project: entry.project });
             redirect(response, `/files/result/${encodeURIComponent(inspected.work.work_id)}?return_to=${encodeURIComponent(`${entry.base}/files`)}`); return;
@@ -1865,7 +2660,7 @@ export async function startAtlasUiServer({
         }
         const resolution = registry.resolvePath(currentPath);
         if (resolution.status === 'resolved' && resolution.project?.id) {
-          redirect(response, `/projects/${encodeURIComponent(resolution.project.id)}/resources`);
+          redirect(response, `/projects/${encodeURIComponent(resolution.project.id)}`);
           return;
         }
         renderProjectsHome(response, {
@@ -1928,8 +2723,8 @@ export async function startAtlasUiServer({
       const projectMatch = url.pathname.match(/^\/projects\/([^/]+)$/u);
       if (projectMatch && request.method === 'GET') {
         const projectId = decodeURIComponent(projectMatch[1]);
-        projectEntry(projectId);
-        redirect(response, `/projects/${encodeURIComponent(projectId)}/resources`);
+        const entry = projectEntry(projectId);
+        renderProjectHome(response, projectHomeModel(entry));
         return;
       }
       if (url.pathname === '/session/stop' && request.method === 'POST') {
@@ -1955,12 +2750,14 @@ export async function startAtlasUiServer({
     clearInterval(selectionExpiry);
     desktopSelections.clear();
     if (ownsResourceControl) resourceControl.dispose();
+    projectViews?.dispose();
     throw error;
   }
   server.once('close', () => {
     clearInterval(selectionExpiry);
     desktopSelections.clear();
     if (ownsResourceControl) resourceControl.dispose();
+    projectViews?.dispose();
     settleClosed();
   });
   const workspaceUrl = `http://${host}:${address.port}/`;
@@ -1980,11 +2777,13 @@ export async function startAtlasUiServer({
     close: () => new Promise((resolve, reject) => {
       if (!server.listening) {
         if (ownsResourceControl) resourceControl.dispose();
+        projectViews?.dispose();
         resolve();
         return;
       }
       server.close((error) => {
         if (ownsResourceControl) resourceControl.dispose();
+        projectViews?.dispose();
         error ? reject(error) : resolve();
       });
     }),

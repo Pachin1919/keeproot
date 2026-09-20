@@ -23,7 +23,7 @@ function renderProjectRow(project) {
     : '';
   const rowContent = `<span class="projects-home-badge" aria-hidden="true">${escapeHtml(projectLetter(name))}</span><span class="projects-home-row-copy"><strong>${escapeHtml(name)}</strong>${project.folder_available ? renderRecentProjectFacts(project) : unavailableDetails}</span><span class="projects-home-state ${project.folder_available ? 'is-available' : 'is-unavailable'}">${project.folder_available ? 'Available' : 'Folder unavailable'}</span>`;
   return project.folder_available
-    ? `<a class="projects-home-row" data-project-search="${escapeHtml(searchText)}" href="/projects/${encodeURIComponent(String(project.id ?? ''))}/resources">${rowContent}</a>`
+    ? `<a class="projects-home-row" data-project-search="${escapeHtml(searchText)}" href="/projects/${encodeURIComponent(String(project.id ?? ''))}">${rowContent}</a>`
     : `<article class="projects-home-row is-unavailable" data-project-search="${escapeHtml(searchText)}">${rowContent}</article>`;
 }
 

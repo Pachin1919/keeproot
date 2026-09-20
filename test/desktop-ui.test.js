@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import {
   doctorDesktopUiComponent,
+  installDesktopUiComponent,
   removeDesktopUiComponent,
   startDesktopUi,
 } from '../src/desktop-ui-component.js';
@@ -22,6 +23,48 @@ function clean(name) {
   return root;
 }
 
+function fakeDesktopInstallProcess({ failInstall = false } = {}) {
+  return (executable, args) => {
+    if (args[0] === '--version') return { status: 0, stdout: 'Python 3.14.4\n', stderr: '' };
+    if (args[0] === '-m' && args[1] === 'venv') {
+      const python = path.join(args[2], 'Scripts', 'python.exe');
+      fs.mkdirSync(path.dirname(python), { recursive: true });
+      fs.writeFileSync(python, 'fake-python', 'utf8');
+      return { status: 0, stdout: '', stderr: '' };
+    }
+    if (args[0] === '-m' && args[1] === 'pip') {
+      return failInstall
+        ? { status: 1, stdout: '', stderr: 'simulated install failure' }
+        : { status: 0, stdout: '', stderr: '' };
+    }
+    if (args[0] === '-c') {
+      return {
+        status: 0,
+        stdout: JSON.stringify({ pywebview: '6.2.1', pandas: '3.0.1', pypdf: '6.14.2' }),
+        stderr: '',
+      };
+    }
+    return { status: 1, stdout: '', stderr: `unexpected command: ${executable} ${args.join(' ')}` };
+  };
+}
+
+function oldDesktopInstallation(name) {
+  const installationRoot = clean(name);
+  const componentRoot = path.join(installationRoot, 'desktop-ui');
+  const python = path.join(componentRoot, 'venv', 'Scripts', 'python.exe');
+  fs.mkdirSync(path.dirname(python), { recursive: true });
+  fs.writeFileSync(python, 'old-python', 'utf8');
+  fs.writeFileSync(path.join(componentRoot, 'component.json'), JSON.stringify({
+    component_format: 'atlas-desktop-ui-component.v1',
+    component_version: '0.1.0',
+  }), 'utf8');
+  fs.mkdirSync(path.join(componentRoot, 'storage'), { recursive: true });
+  fs.writeFileSync(path.join(componentRoot, 'storage', 'window.json'), 'keep', 'utf8');
+  const sourcePython = path.join(installationRoot, 'source-python.exe');
+  fs.writeFileSync(sourcePython, 'source-python', 'utf8');
+  return { installationRoot, componentRoot, python, sourcePython };
+}
+
 test('Desktop UI doctor reports a missing optional component without affecting file governance', () => {
   const installationRoot = clean('doctor-missing');
   const result = doctorDesktopUiComponent({ installationRoot, runtimeRoot: projectRoot });
@@ -30,6 +73,37 @@ test('Desktop UI doctor reports a missing optional component without affecting f
   assert.equal(result.installed, false);
   assert.equal(result.required_for_file_governance, false);
   assert.match(result.next_step, /atlas ui install/u);
+});
+
+test('Desktop UI install upgrades the managed environment with table dependencies and preserves storage', () => {
+  const fixture = oldDesktopInstallation('upgrade-table-dependencies');
+  const result = installDesktopUiComponent({
+    installationRoot: fixture.installationRoot,
+    runtimeRoot: projectRoot,
+    sourcePython: fixture.sourcePython,
+    runProcess: fakeDesktopInstallProcess(),
+  });
+
+  assert.equal(result.status, 'ready');
+  assert.equal(result.component_version, '0.2.0');
+  assert.deepEqual(result.dependencies, { pywebview: '6.2.1', pandas: '3.0.1', pypdf: '6.14.2' });
+  assert.equal(fs.readFileSync(path.join(fixture.componentRoot, 'storage', 'window.json'), 'utf8'), 'keep');
+  assert.equal(fs.readFileSync(fixture.python, 'utf8'), 'fake-python');
+});
+
+test('Desktop UI dependency upgrade restores the prior managed environment when installation fails', () => {
+  const fixture = oldDesktopInstallation('upgrade-table-dependencies-rollback');
+
+  assert.throws(() => installDesktopUiComponent({
+    installationRoot: fixture.installationRoot,
+    runtimeRoot: projectRoot,
+    sourcePython: fixture.sourcePython,
+    runProcess: fakeDesktopInstallProcess({ failInstall: true }),
+  }), /simulated install failure/u);
+
+  assert.equal(fs.readFileSync(fixture.python, 'utf8'), 'old-python');
+  const manifest = JSON.parse(fs.readFileSync(path.join(fixture.componentRoot, 'component.json'), 'utf8'));
+  assert.equal(manifest.component_version, '0.1.0');
 });
 
 test('Desktop UI start stops explicitly when the component is missing', async () => {

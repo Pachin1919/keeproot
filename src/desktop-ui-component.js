@@ -4,8 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export const DESKTOP_UI_COMPONENT_FORMAT = 'atlas-desktop-ui-component.v1';
-export const DESKTOP_UI_COMPONENT_VERSION = '0.1.0';
-export const DESKTOP_UI_REQUIREMENTS = Object.freeze(['pywebview==6.2.1']);
+export const DESKTOP_UI_COMPONENT_VERSION = '0.2.0';
+export const DESKTOP_UI_REQUIREMENTS = Object.freeze([
+  'pywebview==6.2.1',
+  'pandas==3.0.1',
+  'pypdf==6.14.2',
+]);
 const MINIMUM_PYTHON = Object.freeze({ major: 3, minor: 11 });
 
 function componentPaths(installationRootInput) {
@@ -85,8 +89,10 @@ function probeModule(executable, options) {
       'import importlib.metadata as metadata',
       'import json',
       'import atlas_desktop',
+      'import pandas',
+      'import pypdf',
       'import webview',
-      'print(json.dumps({"pywebview": metadata.version("pywebview")}))',
+      'print(json.dumps({"pywebview": metadata.version("pywebview"), "pandas": metadata.version("pandas"), "pypdf": metadata.version("pypdf")}))',
     ].join('; '),
   ], { ...options, timeout: 20_000 });
   if (result.error || result.status !== 0) {
@@ -185,7 +191,8 @@ export function installDesktopUiComponent({
     installationRoot, runtimeRoot, configuredPath: null, runProcess,
   });
   if (current.status === 'ready') return { ...current, status: 'already_installed' };
-  if (fs.existsSync(locations.manifestPath) || fs.existsSync(locations.venvRoot)) {
+  const upgrading = current.status === 'upgrade_required';
+  if (!upgrading && (fs.existsSync(locations.manifestPath) || fs.existsSync(locations.venvRoot))) {
     const error = new Error('Managed Desktop UI exists but is not healthy; remove it before reinstalling.');
     error.code = 'ATLAS_STATE_CONFLICT';
     throw error;
@@ -215,6 +222,10 @@ export function installDesktopUiComponent({
     throw new Error(`Desktop UI component root cannot be a symbolic link: ${locations.componentRoot}`);
   }
   const stageVenv = path.join(locations.componentRoot, `.venv-stage-${crypto.randomUUID()}`);
+  const backupVenv = path.join(locations.componentRoot, `.venv-backup-${crypto.randomUUID()}`);
+  const previousManifest = upgrading ? fs.readFileSync(locations.manifestPath, 'utf8') : null;
+  let previousVenvMoved = false;
+  let stagedVenvInstalled = false;
   try {
     const created = runPython(source, ['-m', 'venv', stageVenv], {
       runtimeRoot, runProcess, timeout: 120_000,
@@ -233,7 +244,12 @@ export function installDesktopUiComponent({
     }
     const verified = probeModule(stagedPython, { runtimeRoot, runProcess });
     if (verified.status !== 'ready') throw new Error(`Desktop UI validation failed: ${verified.message}`);
+    if (upgrading) {
+      fs.renameSync(locations.venvRoot, backupVenv);
+      previousVenvMoved = true;
+    }
     fs.renameSync(stageVenv, locations.venvRoot);
+    stagedVenvInstalled = true;
     const manifest = {
       component_format: DESKTOP_UI_COMPONENT_FORMAT,
       component_version: DESKTOP_UI_COMPONENT_VERSION,
@@ -245,11 +261,21 @@ export function installDesktopUiComponent({
       library_access: false,
     };
     fs.writeFileSync(locations.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    if (previousVenvMoved) removeInside(backupVenv, locations.componentRoot);
     return doctorDesktopUiComponent({
       installationRoot, runtimeRoot, configuredPath: null, runProcess,
     });
   } catch (error) {
     if (fs.existsSync(stageVenv)) removeInside(stageVenv, locations.componentRoot);
+    if (upgrading) {
+      if (stagedVenvInstalled && fs.existsSync(locations.venvRoot)) {
+        removeInside(locations.venvRoot, locations.componentRoot);
+      }
+      if (previousVenvMoved && fs.existsSync(backupVenv)) {
+        fs.renameSync(backupVenv, locations.venvRoot);
+      }
+      if (previousManifest !== null) fs.writeFileSync(locations.manifestPath, previousManifest, 'utf8');
+    }
     if (!fs.existsSync(locations.venvRoot) && !fs.existsSync(locations.manifestPath)) {
       try {
         if (fs.readdirSync(locations.componentRoot).length === 0) fs.rmdirSync(locations.componentRoot);

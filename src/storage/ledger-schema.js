@@ -14,8 +14,19 @@ import {
   applyLegacyContextSelectionRemovalMigration,
   LEGACY_CONTEXT_SELECTION_REMOVAL_SCHEMA_VERSION,
 } from './migrations/v23-retire-legacy-context-selection.js';
+import { applyMultiSourceWorkMigration, MULTI_SOURCE_WORK_SCHEMA_VERSION } from './migrations/v24-multi-source-work.js';
+import {
+  applySavedResourceViewsMigration,
+  SAVED_RESOURCE_VIEWS_SCHEMA_VERSION,
+} from './migrations/v25-saved-resource-views.js';
+import {
+  applyResourcePropertyCandidatesMigration,
+  RESOURCE_PROPERTY_CANDIDATES_SCHEMA_VERSION,
+} from './migrations/v26-resource-property-candidates.js';
 
-export const LATEST_SCHEMA_VERSION = LEGACY_CONTEXT_SELECTION_REMOVAL_SCHEMA_VERSION;
+import { applyWorkOriginMigration, WORK_ORIGIN_SCHEMA_VERSION } from './migrations/v27-work-origin.js';
+
+export const LATEST_SCHEMA_VERSION = WORK_ORIGIN_SCHEMA_VERSION;
 
 function now() {
   return new Date().toISOString();
@@ -570,6 +581,10 @@ export function initializeLedgerSchema(db, transaction) {
       applyResourceControlMigration(db, appliedAt);
       applyLegacyTaskRemovalMigration(db, appliedAt);
       applyLegacyContextSelectionRemovalMigration(db, appliedAt);
+      applyMultiSourceWorkMigration(db, appliedAt);
+      applySavedResourceViewsMigration(db, appliedAt);
+      applyResourcePropertyCandidatesMigration(db, appliedAt);
+      applyWorkOriginMigration(db, appliedAt);
       db.exec(`PRAGMA user_version = ${LATEST_SCHEMA_VERSION};`);
     });
 }

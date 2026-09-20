@@ -42,7 +42,7 @@
   --shadow-soft: 0 12px 34px rgb(62 47 28 / 10%);
   --radius-surface: 12px;
   --radius-control: 8px;
-  --font-sans: Aptos, "Segoe UI Variable", "Segoe UI", sans-serif;
+  --font-sans: "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", sans-serif;
   --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
   --font-size-base: 16px;
   --font-size-work: 14px;

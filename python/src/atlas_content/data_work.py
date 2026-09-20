@@ -19,7 +19,7 @@ from .inspector import (
     normalize_xlsx_target, shared_strings,
 )
 
-PROCESSOR_VERSION = "1.0.3"
+PROCESSOR_VERSION = "1.1.0"
 MAX_FILE_BYTES = 256 * 1024 * 1024
 MAX_ROWS = 200_000
 MAX_COLUMNS = 200
@@ -191,6 +191,30 @@ def _types(frame: pd.DataFrame) -> dict[str, str]:
     return {str(name): infer_column(frame[name], str(name))[0] for name in frame.columns}
 
 
+def _profile(frame: pd.DataFrame) -> dict[str, Any]:
+    columns = []
+    for name in frame.columns:
+        inferred, date_range = infer_column(frame[name], str(name))
+        missing = int(frame[name].map(_empty).sum())
+        item: dict[str, Any] = {
+            "name": str(name),
+            "inferred_type": inferred,
+            "missing_count": missing,
+            "missing_rate": round(missing / len(frame), 6) if len(frame) else None,
+            "distinct_count": int(frame[name].dropna().astype(str).nunique()),
+        }
+        if date_range:
+            item["date_range"] = date_range
+        columns.append(item)
+    return {
+        "rows": len(frame),
+        "columns": len(frame.columns),
+        "fields": columns,
+        "null_cells": sum(item["missing_count"] for item in columns),
+        "duplicate_rows": int(frame.fillna("").astype(str).duplicated().sum()) if len(frame) else 0,
+    }
+
+
 def _empty(value: object) -> bool:
     return value is None or (isinstance(value, float) and math.isnan(value)) or str(value).strip() == ""
 
@@ -240,6 +264,147 @@ def _sample(frame: pd.DataFrame, page: int, page_size: int) -> list[list[Any]]:
     return [[str(value) if value is not None else None for value in row] for row in values]
 
 
+def _cast(frame: pd.DataFrame, column: str, target: str) -> tuple[pd.DataFrame, int]:
+    if column not in frame.columns:
+        raise ValueError(f"Cast field is unavailable: {column}")
+    result = frame.copy()
+    original = result[column]
+    non_empty = ~original.map(_empty)
+    if target == "number":
+        converted = pd.to_numeric(original, errors="coerce")
+    elif target == "date":
+        parsed = pd.to_datetime(original, errors="coerce")
+        converted = parsed.map(lambda value: value.isoformat() if pd.notna(value) else None)
+    elif target == "text":
+        converted = original.map(lambda value: None if _empty(value) else str(value))
+    elif target == "boolean":
+        truth = {"true": True, "1": True, "yes": True, "false": False, "0": False, "no": False}
+        converted = original.map(lambda value: None if _empty(value) else truth.get(str(value).strip().lower()))
+    else:
+        raise ValueError(f"Unsupported cast target: {target}")
+    failures = int((non_empty & pd.isna(converted)).sum())
+    result[column] = converted
+    return result, failures
+
+
+def _multi_work(request: dict[str, Any], action: str, output_path: str | None) -> dict[str, Any]:
+    sources = request.get("sources") or []
+    if not sources:
+        raise ValueError("Multi-source Work needs at least one Source")
+    frames: dict[str, pd.DataFrame] = {}
+    source_results = []
+    for item in sources:
+        source = _source(item.get("path", ""), item.get("sha256", ""))
+        frame, detail = _load(source, item.get("sheet"))
+        frames[item["source_key"]] = frame
+        source_results.append({"source_key": item["source_key"], "sha256": item["sha256"], "rows": len(frame), "columns": len(frame.columns), "detail": detail})
+
+    mapping = request.get("mapping") or []
+    for source_key, frame in list(frames.items()):
+        renames = {item["column"]: item["canonical"] for item in mapping if item.get("source_key") == source_key and item.get("column") in frame.columns}
+        if len(set(renames.values())) != len(renames.values()):
+            raise ValueError(f"Field alignment creates duplicate result fields for {source_key}")
+        frames[source_key] = frame.rename(columns=renames)
+
+    recipe = request.get("recipe") or {}
+    steps = recipe.get("steps") or []
+    source_column = next((item for item in steps if item.get("operation") == "source-column"), None)
+    if source_column:
+        column = source_column.get("column") or "__source"
+        if any(column in frame.columns for frame in frames.values()):
+            raise ValueError("The Source column must use a new field name")
+        for item in sources:
+            frames[item["source_key"]][column] = item.get("name") or item["source_key"]
+
+    combine = recipe.get("combine") or {"operation": "concatenate"}
+    if combine.get("operation") == "concatenate":
+        result = pd.concat([frames[item["source_key"]] for item in sources], ignore_index=True, sort=False)
+    elif combine.get("operation") == "join":
+        if len(sources) != 2:
+            raise ValueError("The first join version requires exactly two Sources")
+        left, right = sources
+        how = combine.get("how", "inner")
+        if how not in {"inner", "left"}:
+            raise ValueError("Join type must be inner or left")
+        left_key, right_key = combine.get("left_key"), combine.get("right_key")
+        if left_key not in frames[left["source_key"]].columns or right_key not in frames[right["source_key"]].columns:
+            raise ValueError("Choose available join keys")
+        result = frames[left["source_key"]].merge(frames[right["source_key"]], left_on=left_key, right_on=right_key, how=how, suffixes=("", "_right"))
+    else:
+        raise ValueError("Recipe combine must be concatenate or join")
+
+    conversion_failures: dict[str, int] = {}
+    for step in steps:
+        operation = step.get("operation")
+        if operation in {"source-column", "validate"}:
+            continue
+        if operation == "rename":
+            old, new = step.get("from"), step.get("to")
+            if old not in result.columns or not new:
+                raise ValueError("Rename needs an available field and one result name")
+            if new != old and new in result.columns:
+                raise ValueError("Rename must use a new result field")
+            result = result.rename(columns={old: new})
+        elif operation == "cast":
+            result, failures = _cast(result, step.get("column", ""), step.get("type", ""))
+            conversion_failures[step["column"]] = failures
+        elif operation == "select":
+            columns = step.get("columns") or []
+            if not columns or any(column not in result.columns for column in columns):
+                raise ValueError("Select contains an unavailable field")
+            result = result.loc[:, columns]
+        elif operation == "filter":
+            result = _apply(result, {"columns": list(result.columns), "filters": [step]})
+        elif operation == "fill-null":
+            column = step.get("column")
+            if column not in result.columns:
+                raise ValueError("Fill-null field is unavailable")
+            result[column] = result[column].map(lambda value: step.get("value") if _empty(value) else value)
+        elif operation == "deduplicate":
+            columns = step.get("columns") or []
+            if not columns or any(column not in result.columns for column in columns):
+                raise ValueError("Deduplicate needs available fields")
+            result = result.drop_duplicates(subset=columns)
+        elif operation == "sort":
+            column = step.get("column")
+            if column not in result.columns:
+                raise ValueError("Sort field is unavailable")
+            result = result.sort_values(column, ascending=step.get("direction") != "desc", kind="stable")
+        else:
+            raise ValueError(f"Unsupported Recipe operation: {operation}")
+
+    for item in sources:
+        if _sha256(Path(item["path"]).resolve()) != item["sha256"]:
+            raise ValueError(f"Source changed while Atlas was executing this Recipe: {item.get('name') or item['source_key']}")
+    null_cells = int(result.isna().sum().sum())
+    duplicate_rows = int(result.fillna("").astype(str).duplicated().sum()) if len(result) else 0
+    validation = {"input_rows": sum(item["rows"] for item in source_results), "output_rows": len(result), "null_cells": null_cells, "duplicate_rows": duplicate_rows, "conversion_failures": conversion_failures}
+    page_size = max(1, min(int(request.get("page_size", 50)), 100))
+    response = {
+        "processor": {"version": PROCESSOR_VERSION},
+        "source": {"sha256": sources[0]["sha256"]},
+        "sources": source_results,
+        "recipe": recipe,
+        "columns": [str(name) for name in result.columns],
+        "rows": _sample(result, 0, page_size),
+        "preview": {"sampled": True, "rows_shown": min(page_size, len(result)), "total_rows": len(result)},
+        "result_summary": {"rows": len(result), "columns": len(result.columns)},
+        "validation": validation,
+    }
+    if action == "export":
+        if not output_path:
+            raise ValueError("Atlas needs a local staging file for this result")
+        output = Path(output_path).resolve(); output.parent.mkdir(parents=True, exist_ok=True)
+        if output.suffix.lower() == ".xlsx":
+            _write_xlsx(result, output, "Result")
+        elif output.suffix.lower() == ".csv":
+            result.to_csv(output, index=False, encoding="utf-8-sig")
+        else:
+            raise ValueError("Work results can be staged only as CSV or XLSX")
+        response["staged"] = {"path": str(output), "sha256": _sha256(output), "bytes": output.stat().st_size}
+    return response
+
+
 def _xlsx_column(index: int) -> str:
     value, result = index + 1, ""
     while value:
@@ -269,7 +434,15 @@ def data_work(file_value: str, *, expected_sha256: str, action: str, sheet: str 
     source = _source(file_value, expected_sha256)
     if action == "describe":
         return {"processor": {"version": PROCESSOR_VERSION}, "source": {"sha256": expected_sha256}, "sheets": _sheets(source) if source.suffix.lower() == ".xlsx" else []}
+    if action == "profile":
+        sheets = _sheets(source) if source.suffix.lower() == ".xlsx" else []
+        if source.suffix.lower() == ".xlsx" and not sheet:
+            return {"processor": {"version": PROCESSOR_VERSION}, "source": {"sha256": expected_sha256}, "status": "sheet_required", "sheets": sheets}
+        frame, detail = _load(source, sheet)
+        return {"processor": {"version": PROCESSOR_VERSION}, "source": {"sha256": expected_sha256}, "status": "ready", "sheet": sheet, "sheets": sheets, "profile": _profile(frame), "detail": detail}
     request = json.loads(Path(request_path).read_text(encoding="utf-8")) if request_path else {}
+    if request.get("sources"):
+        return _multi_work(request, action, output_path)
     frame, detail = _load(source, sheet)
     operations = request.get("operations") or {"columns": list(frame.columns)}
     result = _apply(frame, operations)

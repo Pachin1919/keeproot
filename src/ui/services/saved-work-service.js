@@ -3,6 +3,17 @@ import path from 'node:path';
 import { contentFileFingerprint } from '../../content-inspection.js';
 import { projectPath } from '../project-files.js';
 
+export function savedResultState(result) {
+  if (result.status === 'undone') return 'undone';
+  try {
+    const current = contentFileFingerprint(result.result_path);
+    const expected = result.result_fingerprint?.sha256 ?? result.verification?.sha256;
+    return !expected ? 'unknown' : current.sha256 === expected ? 'verified' : 'changed';
+  } catch (error) {
+    return error.code === 'ATLAS_CONTENT_INPUT_MISSING' ? 'missing_source' : 'unknown';
+  }
+}
+
 function statePath(stateDir) { return path.join(path.resolve(stateDir), 'ui', 'saved-work.json'); }
 function validRecord(value) {
   if (!value) return null;
@@ -19,6 +30,8 @@ function validRecord(value) {
       result_fingerprint: fingerprint,
       source_path: value.source?.path ?? value.candidate?.path ?? value.target.path ?? null,
       source_fingerprint: value.source?.fingerprint ?? value.candidate ?? null,
+      sources: value.source?.sources ?? (value.source ? [value.source] : []),
+      recipe: value.source?.recipe ?? value.parameters?.recipe ?? null,
       created_at: value.executed_at ?? value.created_at,
       parameters: value.parameters ?? {}, result_summary: value.result_summary ?? {},
       write: { target_path: value.target.path ?? null, verified_at: value.verification?.verified_at ?? null, undo_available: value.undo_available === true, redo_available: value.redo_available === true },
@@ -36,12 +49,12 @@ export function readSavedWorkState(stateDir) {
   } catch (error) { return error.code === 'ENOENT' ? { items: [], error: null } : { items: [], error: new Error('Saved Work could not be loaded.') }; }
 }
 function regularDirectory(directory) { const stat = fs.lstatSync(directory); if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Destination folder is unavailable or linked outside this Project.'); }
-function destination(projectRoot, folder, fileName, sourcePath = null, checkExists = true) {
+function destination(projectRoot, folder, fileName, sourcePath = null, checkExists = true, outputExtension = null) {
   const selectedFolder = String(folder ?? '').trim();
   if (!selectedFolder || selectedFolder === '.') throw new Error('Choose an existing destination folder in this Project.');
   let cleanName = String(fileName ?? '').trim();
   if (!cleanName || cleanName !== path.basename(cleanName) || cleanName.includes('\0')) throw new Error('Enter one file name.');
-  const expectedExtension = path.extname(sourcePath ?? '').toLowerCase();
+  const expectedExtension = String(outputExtension ?? path.extname(sourcePath ?? '')).toLowerCase();
   if (['.csv', '.xlsx'].includes(expectedExtension)) {
     const enteredExtension = path.extname(cleanName).toLowerCase();
     if (!enteredExtension) cleanName += expectedExtension;
@@ -82,21 +95,26 @@ export function createSavedWorkService({ stateDir, saveService = null }) {
     resource_href: item.resources_href, resources_href: item.resources_href,
     resource_id: item.resource_id ?? null,
   }));
-  const prepareDestination = ({ projectRoot, folder, fileName, sourcePath }) => destination(projectRoot, folder, fileName, sourcePath);
-  const save = ({ project, projectRoot, root = projectRoot, target: targetInput = null, folder, fileName, stagedPath, expectedCandidateHash = null, sourcePath, sourceFingerprint, sourceResourceId = null, parameters, resultSummary, requestKey = null, caller = {} }) => {
+  const prepareDestination = ({ projectRoot, folder, fileName, sourcePath, outputExtension = null }) => destination(projectRoot, folder, fileName, sourcePath, true, outputExtension);
+  const save = ({ project, projectRoot, root = projectRoot, target: targetInput = null, folder, fileName, stagedPath, expectedCandidateHash = null, sourcePath, sourceFingerprint, sourceResourceId = null, sources = null, recipe = null, outputExtension = null, parameters, resultSummary, requestKey = null, caller = {}, channel = 'work', executionReason = 'User confirmed this Data Work result.' }) => {
     if (!saveService) throw new Error('The Atlas Save Service is unavailable for current saves.');
-    const current = contentFileFingerprint(sourcePath);
-    if (current.sha256 !== sourceFingerprint.sha256) { const error = new Error('The original file changed while this Data Work was open. Review it before saving.'); error.code = 'ATLAS_STATE_CONFLICT'; throw error; }
-    const resolvedTarget = destination(projectRoot, folder, fileName, sourcePath, false);
+    const requestedSources = Array.isArray(sources) && sources.length ? sources : [{ path: sourcePath, fingerprint: sourceFingerprint, ...(sourceResourceId ? { resource_id: sourceResourceId } : {}) }];
+    const currentSources = requestedSources.map((item) => {
+      const current = contentFileFingerprint(item.path);
+      if (current.sha256 !== item.fingerprint?.sha256) { const error = new Error(`Source changed before Save: ${path.basename(item.path)}.`); error.code = 'ATLAS_STATE_CONFLICT'; throw error; }
+      return { ...item, path: current.file_path, fingerprint: current };
+    });
+    const current = currentSources[0].fingerprint;
+    const resolvedTarget = destination(projectRoot, folder, fileName, sourcePath, false, outputExtension);
     const targetPath = path.relative(root, resolvedTarget).replaceAll('\\', '/');
     if (targetInput && String(targetInput).replaceAll('\\', '/') !== targetPath) throw new Error('Destination does not match the selected Project folder.');
     const prepared = saveService.prepare({ root, candidateFile: stagedPath, expectedCandidateHash, projectId: project.id, target: targetPath,
-      inputs: [current.file_path],
-      origin: 'agent_generated', kind: 'intermediate', channel: 'work', requestKey: requestKey ?? `${Date.now()}`,
-      caller, source: { path: current.file_path, fingerprint: sourceFingerprint, ...(sourceResourceId ? { resource_id: sourceResourceId } : {}) }, parameters, resultSummary,
+      inputs: currentSources.map((item) => item.path),
+      origin: 'agent_generated', kind: 'intermediate', channel, requestKey: requestKey ?? `${Date.now()}`,
+      caller, source: { path: current.file_path, fingerprint: current, resource_id: currentSources[0].resource_id ?? null, sources: currentSources, recipe }, parameters: { ...parameters, recipe }, resultSummary,
       intent: 'Save one reviewed Data Work result.' });
-    const result = saveService.execute(prepared.save_id, { reason: 'User confirmed this Data Work result.' });
-    return validRecord(readSavedWorkState(stateDir).items.find((item) => item.save_id === result.save_id) ?? { ...result, source: { path: current.file_path, fingerprint: sourceFingerprint }, parameters, result_summary: resultSummary });
+    const result = saveService.execute(prepared.save_id, { reason: executionReason });
+    return validRecord(readSavedWorkState(stateDir).items.find((item) => item.save_id === result.save_id) ?? { ...result, source: { path: current.file_path, fingerprint: current, sources: currentSources, recipe }, parameters: { ...parameters, recipe }, result_summary: resultSummary });
   };
   const undo = (workId) => {
     if (!saveService) throw new Error('The Atlas Save Service is unavailable for current Undo.');

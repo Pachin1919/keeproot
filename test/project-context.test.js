@@ -5,6 +5,7 @@ import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { LATEST_SCHEMA_VERSION } from '../src/ledger.js';
 import { Registry } from '../src/registry.js';
+import { createResourceControl } from '../src/resource-control.js';
 
 const tempRoot = path.resolve('test', '.tmp');
 
@@ -37,6 +38,8 @@ test('current schema keeps Project context, identity, and Resource tables outsid
   assert.ok(tables.has('resource_locations'));
   assert.ok(tables.has('resource_save_links'));
   assert.ok(tables.has('resource_relationships'));
+  assert.ok(tables.has('work_sessions'));
+  assert.ok(tables.has('work_session_sources'));
   const rootColumns = new Set(
     registry.ledger.db.prepare('PRAGMA table_info(portfolio_roots)').all().map((row) => row.name),
   );
@@ -62,6 +65,30 @@ test('a v20 Ledger reopen backs up and applies the current Resource schema', (t)
     assert.equal(reopened.ledger.db.prepare('PRAGMA user_version').get().user_version, LATEST_SCHEMA_VERSION);
     assert.equal(fs.existsSync(path.join(stateDir, 'backups', `ledger-pre-migration-v20-to-v${LATEST_SCHEMA_VERSION}.sqlite`)), true);
     assert.ok(reopened.ledger.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='resources'`).get());
+  } finally { reopened.dispose(); }
+});
+
+test('a schema 23 upgrade adds Work storage without changing Project, Resource, Relationship, or Save facts', (t) => {
+  const { stateDir, vaultRoot } = setup('project-context-v23-work-upgrade');
+  const registry = new Registry({ stateDir });
+  const adopted = registry.adoptRoot({ rootPath: vaultRoot, rootType: 'project_workspace', contentPolicy: 'bounded_content' });
+  const created = registry.create({ name: 'Career', currentPath: 'Career' });
+  registry.attachRoot(created.project_id, { rootId: adopted.root_id, relativePath: 'Career', reason: 'Bind schema 23 fixture.' });
+  const sourcePath = path.join(vaultRoot, 'Career', 'source.csv'); fs.writeFileSync(sourcePath, 'name,value\nOne,1\n');
+  const control = createResourceControl({ stateDir, ledger: registry.ledger });
+  const resource = control.identify({ filePath: sourcePath, project: { id: created.project_id } });
+  control.submitRelationships({ caller: { tool: 'test', client_run_id: 'schema-23' }, candidates: [{ source_resource_id: resource.resource_id, target: { kind: 'project', id: created.project_id }, type: 'stored_in', evidence: { reason: 'migration fixture' } }] });
+  registry.ledger.resources.linkSave({ saveId: 'SAV-schema-23', resourceId: resource.resource_id, at: '2026-09-17T00:00:00.000Z' });
+  const counts = Object.fromEntries(['projects', 'resources', 'resource_locations', 'resource_relationships', 'resource_save_links'].map((table) => [table, registry.ledger.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count]));
+  control.dispose(); registry.dispose();
+  const databasePath = path.join(stateDir, 'ledger.sqlite'); const old = new DatabaseSync(databasePath);
+  try { old.exec('DROP TABLE work_session_sources; DROP TABLE work_sessions; DELETE FROM schema_migrations WHERE version=24; PRAGMA user_version=23;'); } finally { old.close(); }
+  const reopened = new Registry({ stateDir });
+  try {
+    assert.equal(reopened.ledger.db.prepare('PRAGMA user_version').get().user_version, LATEST_SCHEMA_VERSION);
+    for (const [table, count] of Object.entries(counts)) assert.equal(reopened.ledger.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count, count, table);
+    assert.ok(reopened.ledger.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='work_sessions'").get());
+    assert.equal(fs.existsSync(path.join(stateDir, 'backups', `ledger-pre-migration-v23-to-v${LATEST_SCHEMA_VERSION}.sqlite`)), true);
   } finally { reopened.dispose(); }
 });
 

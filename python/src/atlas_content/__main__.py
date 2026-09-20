@@ -38,7 +38,7 @@ def main() -> int:
     data_work_parser = subparsers.add_parser("data-work")
     data_work_parser.add_argument("--file", required=True)
     data_work_parser.add_argument("--expected-sha256", required=True)
-    data_work_parser.add_argument("--action", choices=("describe", "preview", "export"), required=True)
+    data_work_parser.add_argument("--action", choices=("describe", "profile", "preview", "export"), required=True)
     data_work_parser.add_argument("--sheet")
     data_work_parser.add_argument("--request")
     data_work_parser.add_argument("--output")

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import test from 'node:test';
 
 import { runDataWork } from '../src/content-inspection.js';
@@ -383,6 +384,52 @@ test('Host, Data Work, and Data Workspace share one robust delimited-file readin
   assert.equal(preview.column_types['转化量'], 'integer');
   assert.equal(preview.column_types['是否启用'], 'boolean');
   assert.deepEqual(fs.readFileSync(source), before);
+});
+
+test('multi-source Recipe uses one full execution for Preview and XLSX export', {
+  skip: pythonPath ? false : `No local Python is available on ${os.platform()}.`,
+}, () => {
+  const caseRoot = path.join(tempRoot, 'multi-source-recipe'); fs.rmSync(caseRoot, { recursive: true, force: true }); fs.mkdirSync(caseRoot, { recursive: true });
+  const values = {
+    'a.csv': 'id,date,amount,name\n1,2026-01-01,10,A\n2,2026-01-02,,B\n',
+    'b.csv': 'Identifier,date,amount,name\n2,2026-01-02,20,B\n3,2026-01-03,30,C\n',
+    'c.csv': 'id,date,amount,name\n3,2026-01-03,30,C\n4,2026-01-04,oops,D\n',
+  };
+  const sha = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  const sources = Object.entries(values).map(([name, body], index) => { const file = path.join(caseRoot, name); fs.writeFileSync(file, body); return { source_key: `SRC-${index + 1}`, resource_id: `RES-${index + 1}`, path: file, name, sheet: null, sha256: sha(file) }; });
+  const mapping = sources.flatMap((source) => ['id', 'date', 'amount', 'name'].map((column) => ({ source_key: source.source_key, column: source.name === 'b.csv' && column === 'id' ? 'Identifier' : column, canonical: column })));
+  const recipe = { schema: 'atlas.table-recipe.v1', version: 3, combine: { operation: 'concatenate' }, steps: [{ operation: 'source-column', column: 'origin' }, { operation: 'cast', column: 'amount', type: 'number' }, { operation: 'fill-null', column: 'amount', value: '0' }, { operation: 'deduplicate', columns: ['id'] }, { operation: 'sort', column: 'id', direction: 'asc' }, { operation: 'rename', from: 'name', to: 'label' }, { operation: 'validate' }] };
+  const requestPath = path.join(caseRoot, 'request.json'); fs.writeFileSync(requestPath, JSON.stringify({ sources, mapping, recipe, page_size: 50 }));
+  const base = { projectRoot, installationRoot: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Atlas') : projectRoot, filePath: sources[0].path, expectedSha256: sources[0].sha256, requestPath, pythonPath };
+  const preview = runDataWork({ ...base, action: 'preview' });
+  assert.equal(preview.preview.sampled, true); assert.equal(preview.validation.input_rows, 6); assert.equal(preview.validation.output_rows, 4); assert.equal(preview.validation.conversion_failures.amount, 1); assert.deepEqual(preview.columns, ['id', 'date', 'amount', 'label', 'origin']);
+  const outputPath = path.join(caseRoot, 'result.xlsx'); const exported = runDataWork({ ...base, action: 'export', outputPath });
+  assert.equal(exported.result_summary.rows, preview.result_summary.rows); assert.equal(exported.recipe.version, preview.recipe.version); assert.equal(exported.staged.sha256, sha(outputPath)); assert.equal(fs.existsSync(outputPath), true);
+});
+
+test('multi-source Recipe joins exactly two Sources with inner and left semantics', {
+  skip: pythonPath ? false : `No local Python is available on ${os.platform()}.`,
+}, () => {
+  const caseRoot = path.join(tempRoot, 'multi-source-join'); fs.rmSync(caseRoot, { recursive: true, force: true }); fs.mkdirSync(caseRoot, { recursive: true });
+  const sha = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  const leftPath = path.join(caseRoot, 'left.csv'); const rightPath = path.join(caseRoot, 'right.csv');
+  fs.writeFileSync(leftPath, 'id,left_value\n1,A\n2,B\n3,C\n'); fs.writeFileSync(rightPath, 'id,right_value\n2,X\n3,Y\n4,Z\n');
+  const sources = [leftPath, rightPath].map((file, index) => ({ source_key: `SRC-${index + 1}`, resource_id: `RES-${index + 1}`, path: file, name: path.basename(file), sheet: null, sha256: sha(file) }));
+  const mapping = [
+    { source_key: 'SRC-1', column: 'id', canonical: 'id' }, { source_key: 'SRC-1', column: 'left_value', canonical: 'left_value' },
+    { source_key: 'SRC-2', column: 'id', canonical: 'id' }, { source_key: 'SRC-2', column: 'right_value', canonical: 'right_value' },
+  ];
+  const requestPath = path.join(caseRoot, 'request.json');
+  const run = (how) => {
+    const recipe = { schema: 'atlas.table-recipe.v1', version: how === 'inner' ? 1 : 2, combine: { operation: 'join', how, left_key: 'id', right_key: 'id' }, steps: [{ operation: 'validate' }] };
+    fs.writeFileSync(requestPath, JSON.stringify({ sources, mapping, recipe, page_size: 50 }));
+    return runDataWork({ projectRoot, installationRoot: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Atlas') : projectRoot, filePath: leftPath, expectedSha256: sources[0].sha256, requestPath, pythonPath, action: 'preview' });
+  };
+  const inner = run('inner'); assert.equal(inner.result_summary.rows, 2); assert.deepEqual(inner.columns, ['id', 'left_value', 'right_value']);
+  const left = run('left'); assert.equal(left.result_summary.rows, 3); assert.equal(left.validation.input_rows, 6); assert.equal(left.recipe.combine.how, 'left');
+  const collisionRecipe = { schema: 'atlas.table-recipe.v1', version: 3, combine: { operation: 'concatenate' }, steps: [{ operation: 'source-column', column: 'id' }, { operation: 'validate' }] };
+  fs.writeFileSync(requestPath, JSON.stringify({ sources, mapping, recipe: collisionRecipe, page_size: 50 }));
+  assert.throws(() => runDataWork({ projectRoot, installationRoot: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Atlas') : projectRoot, filePath: leftPath, expectedSha256: sources[0].sha256, requestPath, pythonPath, action: 'preview' }), /Source column must use a new field name/u);
 });
 
 test('content prepare-data creates a cached human-readable local review without changing the source', {

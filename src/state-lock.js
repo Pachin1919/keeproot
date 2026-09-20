@@ -44,7 +44,14 @@ export function withStateLock(stateDir, callback, {
         }
       } catch (inspectionError) {
         if (inspectionError.code === 'ENOENT') continue;
-        const stat = fs.statSync(lockPath);
+        let stat;
+        try {
+          stat = fs.statSync(lockPath);
+        } catch (raceError) {
+          // The owner may release an incomplete lock between read and retry.
+          if (raceError.code === 'ENOENT') continue;
+          throw raceError;
+        }
         if (Date.now() - stat.mtimeMs > staleMs) {
           fs.rmSync(lockPath, { force: true });
           continue;

@@ -322,6 +322,7 @@ export class SaveService {
       return result(mutate(this.stateDir, saveId, () => row, this.writeJournal));
     } catch (error) {
       mutate(this.stateDir, saveId, (row) => ({ ...row, status: 'failed', owner_pid: null, owner_token: null, error: error.message }), this.writeJournal);
+      if (!error.code && /already exists|never overwrites/iu.test(error.message)) throw conflict(error.message);
       throw error;
     }
   }
@@ -332,6 +333,20 @@ export class SaveService {
     if (row.status === 'committing') row = this.reconcileCommitting(saveId, row);
     if (row.status === 'undoing' || row.status === 'redoing') row = this.reconcileTransition(saveId, row);
     return result(row);
+  }
+
+  review(saveId) {
+    const save = this.show(saveId);
+    if (!['.md', '.txt'].includes(path.extname(save.target?.path ?? '').toLowerCase())) return { save, preview: null };
+    const detail = this.intake.show(saveId);
+    const candidate = detail.candidate;
+    if (!candidate?.blob_path || sha256File(candidate.blob_path) !== candidate.content_hash) throw conflict('Stored Save preview is unavailable or changed.');
+    const descriptor = fs.openSync(candidate.blob_path, 'r');
+    try {
+      const bytes = Buffer.alloc(20_000);
+      const length = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
+      return { save, preview: { text: bytes.subarray(0, length).toString('utf8'), truncated: candidate.byte_size > length } };
+    } finally { fs.closeSync(descriptor); }
   }
 
   execute(saveId, { reason } = {}) {

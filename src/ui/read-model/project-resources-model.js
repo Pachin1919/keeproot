@@ -35,11 +35,11 @@ function sourceFingerprintStatus(work, filePath) {
 }
 
 function savedSourceStatus(saved) {
+  const sources = saved.sources?.length ? saved.sources : [{ path: saved.source_path, fingerprint: saved.source_fingerprint }];
   try {
-    const current = contentFileFingerprint(saved.source_path);
-    const recordedHash = saved.source_fingerprint?.sha256;
-    if (!recordedHash) return null;
-    return current.sha256 === recordedHash
+    if (!sources.length || sources.some((item) => !item?.fingerprint?.sha256)) return null;
+    const unchanged = sources.every((item) => contentFileFingerprint(item.path).sha256 === item.fingerprint.sha256);
+    return unchanged
       ? 'Source unchanged since this result was created'
       : 'Source changed since this result was created';
   } catch {
@@ -72,9 +72,10 @@ function resourceRecord(item, root, recentWork, projectId, savedWork = [], curre
   const saved = resourceId
     ? savedWork.find((entry) => entry.resource_id === resourceId) ?? savedWork.find((entry) => !entry.resource_id && samePath(entry.result_path, filePath))
     : savedWork.find((entry) => samePath(entry.result_path, filePath)) ?? null;
-  const createdWork = savedWork.filter((entry) => resourceId
-    ? entry.resource_id === resourceId || (!entry.resource_id && samePath(entry.source_path, filePath))
-    : samePath(entry.source_path, filePath));
+  const createdWork = savedWork.filter((entry) => {
+    const sources = entry.sources?.length ? entry.sources : [{ resource_id: null, path: entry.source_path }];
+    return sources.some((source) => resourceId ? source.resource_id === resourceId || (!source.resource_id && samePath(source.path, filePath)) : samePath(source.path, filePath));
+  });
   const activity = currentResourceActivity(currentActivity, projectId, filePath, work, resourceId);
   return {
     resource_fact: fact,
@@ -108,6 +109,7 @@ function resourceRecord(item, root, recentWork, projectId, savedWork = [], curre
     } : null,
     saved_work: saved ? {
       work_id: saved.work_id, source_path: saved.source_path, parameters: saved.parameters,
+      sources: saved.sources ?? [], recipe: saved.recipe ?? null,
       result_summary: saved.result_summary, created_at: saved.created_at,
       undo_available: saved.write?.undo_available === true,
       source_status: savedSourceStatus(saved),
@@ -145,8 +147,9 @@ function recoveryActions(resource, projectId) {
   const missing = fact.resource.status === 'missing';
   const hasActiveLocation = (fact.locations ?? []).some((location) => location.status === 'active');
   return {
-    keep_record: missing && !hasActiveLocation,
-    relink: missing && !hasActiveLocation,
+    archive_record: Boolean(missing && !hasActiveLocation && !fact.missing_record_archived),
+    restore_record: Boolean(missing && !hasActiveLocation && fact.missing_record_archived),
+    relink: Boolean(missing && !hasActiveLocation && !fact.missing_record_archived),
     relationships: (fact.relationships ?? [])
       .filter((relationship) => relationship.status === 'active' && relationship.target_kind === 'project' && relationship.target_id === projectId)
       .map((relationship) => ({
@@ -267,7 +270,7 @@ function representationFor(resource, stateDir) {
   }
 }
 
-export function buildProjectResourcesModel({ project, root, base, recentWork, savedWork = [], currentActivity = [], resourceFacts = [], savedWorkError = false, focusedPath = null, focusedResourceId = null, selectedFolderPath = null, stateDir = null, activityReturnHref = null }) {
+export function buildProjectResourcesModel({ project, root, base, recentWork, savedWork = [], currentActivity = [], resourceFacts = [], savedWorkError = false, focusedPath = null, focusedResourceId = null, selectedFolderPath = null, stateDir = null, activityReturnHref = null, workSession = null }) {
   const listed = searchProjectFiles(root, '');
   const requestedFolder = typeof selectedFolderPath === 'string' ? selectedFolderPath.replaceAll('\\', '/').replace(/^\/+|\/+$/gu, '') : null;
   const folders = listProjectFolders(root);
@@ -332,8 +335,10 @@ export function buildProjectResourcesModel({ project, root, base, recentWork, sa
     selected_folder_loaded: !listed.truncated || (requestedFolderExists && requestedFolder === selected_folder_path),
     focus_error: (explicitFocus || focusedResourceId) && !focused ? 'The requested Resource is unavailable. It may have moved or been removed.' : null,
     external_references: resourceFacts.filter((item) => item.relationship_to_project === 'used_by' && !item.locations?.some((location) => location.project_id === project.id && location.status === 'active')),
-    missing_resources: resourceFacts.filter((item) => item.resource?.status === 'missing' || item.last_known_location?.status === 'missing'),
+    missing_resources: resourceFacts.filter((item) => !item.missing_record_archived && (item.resource?.status === 'missing' || item.last_known_location?.status === 'missing')),
+    archived_missing_resources: resourceFacts.filter((item) => item.missing_record_archived && (item.resource?.status === 'missing' || item.last_known_location?.status === 'missing')),
     activity_return_href: activityReturnHref,
+    work_session: workSession,
     missing_sources: missingSources(savedWork),
     saved_work_error: savedWorkError,
     truncated: listed.truncated,
