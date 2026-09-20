@@ -413,6 +413,7 @@ test('workbench typography uses shared control metrics and collapses inactive hi
   assert.match(css, /\.data-work-page \[data-project-folders\]\[hidden\] \{ display: none; \}/u);
   assert.match(css, /\.project-home-secondary-target > span:first-child \{ display: grid; gap: 4px/u);
   assert.match(css, /\.topbar-project-link strong \{[^}]*text-overflow: ellipsis/u);
+  assert.match(css, /\.topbar-project-link \{[^}]*min-width: 0/u);
 });
 
 test('V18-04 client draft guard tracks protected forms and beforeunload only while dirty', () => {

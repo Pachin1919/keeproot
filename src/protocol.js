@@ -1,4 +1,4 @@
-export const ATLAS_VERSION = '1.5.2-rc.1';
+export const ATLAS_VERSION = '1.8.0-rc.1';
 export const PROTOCOL_VERSION = 'atlas-cli.v1';
 
 export const CAPABILITIES = Object.freeze({

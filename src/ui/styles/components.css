@@ -440,7 +440,7 @@ body .topbar {
   color: var(--topbar-text);
 }
 body .topbar .label { color: var(--topbar-muted); }
-.topbar-project-link { color: inherit; text-decoration: none; }
+.topbar-project-link { min-width: 0; color: inherit; text-decoration: none; }
 .topbar-project-link strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .topbar-project-link:hover, .topbar-project-link:focus-visible { text-decoration: underline; text-underline-offset: 3px; }
 body .surface { background: var(--surface); }

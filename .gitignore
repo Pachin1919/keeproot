@@ -5,6 +5,7 @@
 /test/.tmp/
 /coverage/
 /test-results/
+/.playwright-cli/
 /tmp/
 /temp/
 
