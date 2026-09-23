@@ -1,4 +1,4 @@
-export const ATLAS_VERSION = '1.8.0-rc.1';
+export const ATLAS_VERSION = '1.9.0-rc.1';
 export const PROTOCOL_VERSION = 'atlas-cli.v1';
 
 export const CAPABILITIES = Object.freeze({
@@ -24,7 +24,9 @@ export const CAPABILITIES = Object.freeze({
     derived: ['recommend', 'prepare', 'preview', 'approve', 'reject', 'revise', 'execute', 'promote', 'rollback'],
     intake: ['prepare', 'show', 'correct', 'batch-plan', 'corrections'],
     save: ['prepare', 'show', 'execute', 'undo', 'redo'],
-    table_work: ['start', 'show', 'add-source', 'remove-source', 'prepare', 'sheet', 'align', 'recipe', 'preview', 'save', 'list'],
+    table_work: ['start', 'show', 'reuse', 'reconcile', 'reconcile-batch', 'add-source', 'remove-source', 'prepare', 'sheet', 'align', 'recipe', 'preview', 'save', 'list'],
+    board: ['list', 'create', 'show', 'save', 'export'],
+    round: ['list', 'show', 'protect', 'extend', 'checkpoint', 'restore', 'return', 'resume'],
     resource_views: ['list', 'evaluate', 'files', 'candidates-submit', 'properties', 'candidates-show', 'save'],
     resource_facts: ['show'],
     evolution: [
@@ -51,8 +53,9 @@ export const CAPABILITIES = Object.freeze({
       commands: [
         'ui', 'ui install', 'ui doctor', 'ui remove',
         'save prepare', 'save show', 'save execute', 'save undo', 'save redo',
-        'table-work start', 'table-work show', 'table-work add-source', 'table-work remove-source',
+        'table-work start', 'table-work show', 'table-work reuse', 'table-work reconcile', 'table-work reconcile-batch', 'table-work add-source', 'table-work remove-source',
         'table-work prepare', 'table-work sheet', 'table-work align', 'table-work recipe', 'table-work preview', 'table-work save', 'table-work list',
+        'board list', 'board create', 'board show', 'board save', 'board export',
         'view list', 'view evaluate', 'view files', 'view properties', 'view candidates submit', 'view candidates show', 'view save',
         'content localize-conversation',
         'resource show',
@@ -79,12 +82,55 @@ export const CAPABILITIES = Object.freeze({
     },
   },
   legacy_fallback: false,
+  round_recovery: {
+    status: 'experimental',
+    scope: [
+      'declared_regular_files_not_registered_as_resources',
+      'explicit_active_single_location_resources_with_declared_paths',
+      'explicit_open_work_sessions_with_declared_resource_sources',
+      'existing_boards_with_text_and_explicit_material_references',
+      'explicit_executed_save_files_sources_work_and_result_preview_boards',
+      'new_save_outputs_in_predeclared_absent_slots_with_identity_and_receipt_retention',
+    ],
+    protect_request: {
+      paths: '0_to_64_exact_project_relative_files_at_least_one_file_or_board',
+      resourceIds: 'optional_up_to_64_active_same_project_single_location_resources; each active file path must be declared in paths',
+      workIds: 'optional_up_to_20_open_same_project_work_sessions; every Work Source Resource must be in resourceIds',
+      saveIds: 'optional_up_to_64_executed_same_project_saves; output, inputs, Source Resources, Work and consuming Boards must be explicitly selected; receipt remains unchanged',
+      saveTargets: 'optional_exact_absent_paths_also_in_paths; declare_before_any_Save_for_the_path; completed_Save_identity_is_read_from_existing_receipt',
+    },
+    work_restore: {
+        restores: ['source_configuration', 'mapping', 'recipe', 'latest_save_pointer'],
+      revision: 'advances',
+      preview: 'cleared',
+    },
+    resource_restore: {
+      restores: 'accepted_baseline',
+      audit: 'appends_round_restore_without_deleting_original_action',
+    },
+    unsupported: [
+      'cross_project_recovery', 'moved_or_multi_location_or_missing_resources',
+        'save_undo_redo_status_transition_during_round', 'new_save_without_predeclared_output_slot', 'undeclared_material_reference',
+      'conversation', 'unsaved_editor_buffers',
+    ],
+    mutation_basis: ['baseRevision', 'expectedDigest_from_fresh_show'],
+    extension: 'explicit_additions_before_modification; old_nodes_keep_original_state; added_objects_use_their_first_protected_baseline',
+    restore_creates_insurance: true,
+    return_target: 'specific_restore_id',
+    ui_available: true,
+  },
   table_work: {
     session: 'persistent_project_work_session',
     source_formats: ['csv', 'xlsx'],
     semantic_authority: 'user_or_host_proposal',
     deterministic_execution: 'atlas_local_processor',
     save_service_required: true,
+  },
+  board: {
+    block_types: ['material_reference', 'text', 'result_preview'],
+    version_policies: ['follow_latest', 'pinned_version'],
+    portable_delivery: 'self_contained_html_via_save_service',
+    semantic_authority: 'user_or_host_proposal',
   },
   resource_views: {
     modes: ['files', 'table', 'cards'],

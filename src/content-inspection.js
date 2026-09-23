@@ -15,7 +15,7 @@ export const CONTENT_RELATIONSHIP_SCHEMA = 'atlas.content-relationship.v1';
 export const CONTENT_RELATIONSHIP_PROCESSOR_VERSION = '0.2.0';
 export const CHAT_BRANCH_SET_SCHEMA = 'atlas.chat-branch-set.v1';
 export const CHAT_BRANCH_PROCESSOR_VERSION = '0.1.0';
-export const DATA_WORK_PROCESSOR_VERSION = '1.1.0';
+export const DATA_WORK_PROCESSOR_VERSION = '1.2.0';
 const CONTENT_COMPARISON_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.json', '.jsonl', '.csv', '.tsv', '.log']);
 const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 

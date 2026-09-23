@@ -6,6 +6,7 @@ import { Intake } from './intake.js';
 import { withStateLock } from './state-lock.js';
 import { createResourceControl } from './resource-control.js';
 import { projectResourceHref } from './resource-links.js';
+import { assertRecoveryWritable } from './storage/recovery-write-guard.js';
 
 const journalPath = (stateDir) => path.join(path.resolve(stateDir), 'ui', 'saved-work.json');
 const now = () => new Date().toISOString();
@@ -145,6 +146,27 @@ export class SaveService {
     this.writeJournal = writeJournalFn;
     this.resourceControl = resourceControl;
   }
+  #assertRecoveryWritable(projectId, source = null, inputs = [], root = null) {
+    if (!fs.existsSync(path.join(this.stateDir, 'ledger.sqlite'))) return;
+    this.resourceControl ??= createResourceControl({ stateDir: this.stateDir });
+    const ledger = this.resourceControl.ledger;
+    assertRecoveryWritable(ledger.db, { projectId });
+    for (const item of [source, ...(source?.sources ?? [])].filter(Boolean)) {
+      const resourceId = item.resource_id ?? (item.path ? ledger.resources.byPath(path.resolve(item.path))?.id : null);
+      if (resourceId) assertRecoveryWritable(ledger.db, { resourceId });
+    }
+    for (const input of inputs) {
+      const file = typeof input === 'string' ? input : input.relative_path;
+      if (!file || (!root && !path.isAbsolute(file))) continue;
+      const resourceId = ledger.resources.byPath(path.resolve(root ?? '.', file))?.id;
+      if (resourceId) assertRecoveryWritable(ledger.db, { resourceId });
+    }
+  }
+  #assertRowWritable(row) {
+    if (!row) return;
+    this.#assertRecoveryWritable(row.project?.id ?? row.prepare_request?.project_id, row.source,
+      row.inputs ?? row.prepare_request?.inputs ?? [], row.prepare_request?.root);
+  }
   #recordResource(saveId, row) {
     if (!fs.existsSync(row.target.path)) return null;
     return withStateLock(this.stateDir, () => {
@@ -168,6 +190,7 @@ export class SaveService {
   reconcileCommitting(saveId, row = null) {
     const current = row ?? readJournal(this.stateDir).find((item) => item.save_id === saveId);
     if (current?.status !== 'committing') return current;
+    this.#assertRowWritable(current);
     if (typeof this.intake.show !== 'function') return current;
     const detail = this.intake.show(saveId);
     const receipt = detail?.execution_receipt;
@@ -194,6 +217,7 @@ export class SaveService {
 
   reconcileTransition(saveId, row) {
     if (row?.status !== 'undoing' && row?.status !== 'redoing') return row;
+    this.#assertRowWritable(row);
     const detail = this.intake.show(saveId);
     const rolledBack = detail?.run?.status === 'rolled_back';
     const executed = detail?.run?.status === 'executed' && detail?.execution_receipt?.verified;
@@ -255,6 +279,7 @@ export class SaveService {
   }
 
   prepare(options) {
+    this.#assertRecoveryWritable(options.projectId, options.source, options.inputs, options.root);
     const channel = options.channel ?? 'host';
     const caller = options.caller ?? {};
     const request_key = scopedKey({ channel, caller, requestKey: options.requestKey });
@@ -274,6 +299,7 @@ export class SaveService {
     const hash = requestHash(normalized);
     const saveId = `SAV-${crypto.randomUUID()}`;
     const reservation = withStateLock(this.stateDir, () => {
+      this.#assertRecoveryWritable(options.projectId, options.source, options.inputs, options.root);
       const items = readJournal(this.stateDir);
       const existing = items.find((item) => item.request_key === request_key) ?? null;
       if (existing) return existing;
@@ -332,7 +358,27 @@ export class SaveService {
     if (!row) throw new Error('Save result is unavailable.');
     if (row.status === 'committing') row = this.reconcileCommitting(saveId, row);
     if (row.status === 'undoing' || row.status === 'redoing') row = this.reconcileTransition(saveId, row);
-    return result(row);
+    const shown = result(row);
+    if (row.status === 'executed') {
+      // A Save receipt records a past verification, not proof that today's bytes exist.
+      shown.verified = false;
+      shown.current_output = 'unavailable';
+      try {
+        const target = path.resolve(row.target.path);
+        let cursor = path.parse(target).root;
+        for (const part of target.slice(cursor.length).split(path.sep).filter(Boolean)) {
+          cursor = path.join(cursor, part);
+          if (fs.lstatSync(cursor).isSymbolicLink()) throw new Error('Linked result is unavailable.');
+        }
+        if (!fs.lstatSync(target).isFile()) throw new Error('Result is not a regular file.');
+        shown.verified = sha256File(target) === row.verification?.sha256;
+        shown.current_output = shown.verified ? 'verified' : 'changed';
+      } catch (error) {
+        shown.current_output = error.code === 'ENOENT' ? 'missing' : 'unavailable';
+        shown.undo_available = false;
+      }
+    }
+    return shown;
   }
 
   review(saveId) {
@@ -349,7 +395,17 @@ export class SaveService {
     } finally { fs.closeSync(descriptor); }
   }
 
+  candidateSnapshot(saveId) {
+    const detail = this.intake.show(saveId);
+    const candidate = detail?.candidate;
+    if (!candidate?.blob_path || !fs.existsSync(candidate.blob_path) || sha256File(candidate.blob_path) !== candidate.content_hash) {
+      throw conflict('Stored Save candidate is unavailable or changed.');
+    }
+    return { path: candidate.blob_path, sha256: candidate.content_hash, bytes: candidate.byte_size };
+  }
+
   execute(saveId, { reason } = {}) {
+    this.#assertRowWritable(readJournal(this.stateDir).find((row) => row.save_id === saveId));
     const before = this.show(saveId);
     if (before.status === 'executed') return before;
     if (before.status !== 'prepared' && before.status !== 'committing') throw conflict(`Save cannot execute from ${before.status}.`);
@@ -373,6 +429,7 @@ export class SaveService {
   }
 
   undo(saveId) {
+    this.#assertRowWritable(readJournal(this.stateDir).find((row) => row.save_id === saveId));
     const before = this.show(saveId);
     if (!before.undo_available) throw conflict('Undo is not available for this save.');
     const claimed = mutate(this.stateDir, saveId, (row) => {
@@ -401,6 +458,7 @@ export class SaveService {
   }
 
   redo(saveId) {
+    this.#assertRowWritable(readJournal(this.stateDir).find((row) => row.save_id === saveId));
     const before = this.show(saveId);
     if (!before.redo_available || before.status !== 'undone') throw conflict('Redo is not available for this save.');
     const claimed = mutate(this.stateDir, saveId, (row) => {

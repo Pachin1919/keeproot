@@ -1,3 +1,6 @@
+
+import { translateUi } from './i18n.js';
+
 export function escapeHtml(value) {
   return String(value ?? '')
     .replaceAll('&', '&amp;')
@@ -64,16 +67,17 @@ export function renderStatus(status, label = null) {
   return `<span class="status ${statusClass(status)}" title="${escapeHtml(presentation.meaning)}">${escapeHtml(label ?? presentation.label)}</span>`;
 }
 
-export function renderStatusGuide() {
+export function renderStatusGuide(locale = 'en', languageCatalog = null) {
+  const t = (key) => translateUi(locale, `nav.${key}`, languageCatalog);
   const groups = [
-    ['safe', 'Normal', 'Ready · Active · Completed · Verified · Restored', 'Atlas has a usable, verified, or restored state. No warning is being raised.'],
-    ['progress', 'In progress', 'Running · In progress', 'Atlas is still working. This state is not a completed result.'],
-    ['warn', 'Waiting or attention', 'Awaiting review · Input needed · Not checked · Partial', 'Work needs a decision, a check, or attention before Atlas can claim a complete result.'],
-    ['danger', 'Atlas stopped', 'Blocked · Conflict · Out of date · Rejected', 'Atlas did not continue. Inspect the recorded reason before trying again.'],
-    ['neutral', 'Information incomplete', 'Unavailable · Unknown', 'Atlas does not have enough local fact to claim a result.'],
-    ['neutral', 'Ended', 'Cancelled', 'The work ended without continuing.'],
+    ['safe', 'status_safe'],
+    ['progress', 'status_progress'],
+    ['warn', 'status_warn'],
+    ['danger', 'status_danger'],
+    ['neutral', 'status_neutral'],
+    ['neutral', 'status_ended'],
   ];
-  return `<div class="status-guide"><button type="button" class="status-guide-toggle" data-status-guide-toggle aria-expanded="false">Status guide</button><div class="status-guide-panel" popover="manual" data-status-guide-panel><button type="button" class="status-guide-close" data-status-guide-close aria-label="Close status guide">×</button><strong>How to read Atlas states</strong><p class="status-guide-intro">Color shows whether Atlas completed the work, needs a decision, or stopped. Open the related work or resource to see what happened and what you can do next.</p><div class="status-guide-list">${groups.map(([tone, label, states, meaning]) => `<section class="status-guide-item"><span class="status status-${escapeHtml(tone)}">${escapeHtml(label)}</span><div><strong>${escapeHtml(states)}</strong><p>${escapeHtml(meaning)}</p></div></section>`).join('')}</div></div></div>`;
+  return `<div class="status-guide"><button type="button" class="status-guide-toggle" data-status-guide-toggle aria-expanded="false">${escapeHtml(t('status_guide'))}</button><div class="status-guide-panel" popover="manual" data-status-guide-panel><button type="button" class="status-guide-close" data-status-guide-close aria-label="${escapeHtml(t('status_guide_close'))}">×</button><strong>${escapeHtml(t('status_guide_title'))}</strong><p class="status-guide-intro">${escapeHtml(t('status_guide_intro'))}</p><div class="status-guide-list">${groups.map(([tone, key]) => `<section class="status-guide-item"><span class="status status-${escapeHtml(tone)}">${escapeHtml(t(key))}</span><div><strong>${escapeHtml(t(`${key}_examples`))}</strong><p>${escapeHtml(t(`${key}_meaning`))}</p></div></section>`).join('')}</div></div></div>`;
 }
 
 export function renderUiClientScript(interactive) {
@@ -92,24 +96,25 @@ function renderNavIcon(name) {
   return NAV_ICON_SVG[name] ?? NAV_ICON_SVG.activity;
 }
 
-export function renderTopbar({ section, project = null, resource = null, status = 'On this device' } = {}) {
+export function renderTopbar({ section, project = null, resource = null, status = null, locale = 'en', languageCatalog = null } = {}) {
+  const t = (key) => translateUi(locale, key, languageCatalog);
   const projectName = project?.name ?? project;
   const projectLabel = project?.id
-    ? `<a class="topbar-project-link" href="${escapeHtml(`/projects/${encodeURIComponent(project.id)}`)}"><strong>${escapeHtml(projectName)}</strong></a>`
+    ? `<a class="topbar-project-link" href="${escapeHtml(`/projects/${encodeURIComponent(project.id)}`)}" title="${escapeHtml(projectName)}"><strong>${escapeHtml(projectName)}</strong></a>`
     : `<strong>${escapeHtml(projectName)}</strong>`;
   const context = project
     ? `<span class="topbar-context">${projectLabel}${resource ? `<small>${escapeHtml(resource)}</small>` : ''}</span>`
     : `<span class="topbar-context"><strong>${escapeHtml(section ?? 'Atlas')}</strong></span>`;
   return `<header class="topbar" data-current-project-id="${escapeHtml(project?.id ?? '')}" data-current-resource-path="${escapeHtml(resource ?? '')}">
     <div class="topbar-identity"><span class="label">Atlas Desktop</span>${context}</div>
-    <button class="topbar-search" type="button" data-overlay-open="atlas-search" aria-haspopup="dialog"><span class="nav-icon" aria-hidden="true">&#xE721;</span><span>Search Projects and Resources</span><kbd>Ctrl K</kbd></button>
-    <span class="status status-safe topbar-status">${escapeHtml(status)}</span>
+    <button class="topbar-search" type="button" data-overlay-open="atlas-search" aria-haspopup="dialog" aria-label="${escapeHtml(t('topbar.search'))}"><span class="nav-icon" aria-hidden="true">&#xE721;</span><span>${escapeHtml(t('topbar.search'))}</span><kbd>Ctrl K</kbd></button>
+    <span class="status status-safe topbar-status">${escapeHtml(status ?? t('topbar.on_device'))}</span>
   </header>
   <dialog class="atlas-overlay search-overlay" id="atlas-search" data-atlas-overlay aria-labelledby="atlas-search-title">
     <div class="overlay-card">
-      <div class="overlay-heading"><div><span class="label">Find local work</span><h2 id="atlas-search-title">Search Projects and Resources</h2></div><button class="overlay-close" type="button" data-overlay-close aria-label="Close search">×</button></div>
-      <form class="search-form" method="get" action="/search"><label for="atlas-search-query">Project name, file name, extension, or path</label><div><input id="atlas-search-query" name="q" type="search" autocomplete="off" required data-overlay-initial-focus><button class="action-button" type="submit">Search</button></div></form>
-      <p class="muted">Atlas searches registered local Projects. It does not read file contents or guess meaning.</p>
+      <div class="overlay-heading"><div><span class="label">${escapeHtml(t('topbar.find_local_work'))}</span><h2 id="atlas-search-title">${escapeHtml(t('topbar.search'))}</h2></div><button class="overlay-close" type="button" data-overlay-close aria-label="${escapeHtml(t('topbar.close_search'))}">×</button></div>
+      <form class="search-form" method="get" action="/search"><label for="atlas-search-query">${escapeHtml(t('topbar.search_label'))}</label><div><input id="atlas-search-query" name="q" type="search" autocomplete="off" required data-overlay-initial-focus><button class="action-button" type="submit">${escapeHtml(t('topbar.search_action'))}</button></div></form>
+      <p class="muted">${escapeHtml(t('topbar.search_lede'))}</p>
     </div>
   </dialog>`;
 }
@@ -120,40 +125,45 @@ export function renderNav(current, {
   resourcesHref = null,
   importHref = '/files',
   settingsHref = null,
+  locale = 'en',
+  languageCatalog = null,
 } = {}) {
+  const t = (key) => translateUi(locale, key, languageCatalog);
   const projectsHref = workspaceHref || '/projects';
   const items = interactive
     ? [
-        { label: 'Projects', icon: 'projects', href: projectsHref },
+        { current: 'Projects', label: t('nav.projects'), icon: 'projects', href: projectsHref },
         {
-          label: 'Resources',
+          current: 'Resources', label: t('nav.resources'),
           icon: 'resources',
           href: resourcesHref ?? projectsHref,
-          title: resourcesHref ? 'Resources' : 'Choose a Project to view its resources',
+          title: resourcesHref ? t('nav.resources') : t('nav.resources_choose_project'),
         },
-        { label: 'Activity', icon: 'activity', href: '/activity' },
-        { label: 'Import', icon: 'import', href: importHref },
-        ...(settingsHref ? [{ label: 'Settings', icon: 'settings', href: settingsHref }] : []),
+        { current: 'Activity', label: t('nav.activity'), icon: 'activity', href: '/activity' },
+        { current: 'Import', label: t('nav.import'), icon: 'import', href: importHref },
+        ...(settingsHref ? [{ current: 'Settings', label: t('nav.settings'), icon: 'settings', href: settingsHref }] : []),
       ]
-    : [{ label: 'Snapshot', icon: 'activity', href: null }];
-  return `<aside class="sidebar" id="atlas-primary-nav" data-atlas-primary-nav>
+    : [{ current: 'Snapshot', label: t('nav.snapshot'), icon: 'activity', href: null }];
+  const clientMessages = Object.fromEntries(['resources_title', 'sort_ascending', 'sort_descending', 'close_settings_confirm', 'choose_folder', 'project', 'file', 'working', 'processing']
+    .map((key) => [key, t(`client.${key}`)]));
+  return `<aside class="sidebar" id="atlas-primary-nav" data-atlas-primary-nav data-ui-client-messages="${escapeHtml(JSON.stringify(clientMessages))}">
     <div class="brand"><span class="brand-mark">A</span><span class="brand-copy">Atlas<small>Workspace</small></span></div>
-    <nav aria-label="Primary">
+    <nav aria-label="${escapeHtml(t('nav.primary'))}">
       <ul class="nav-list">
         ${items.map((item) => (
-    `<li class="nav-item"${item.label === current ? ' aria-current="page"' : ''}>${item.href
-      ? `<a href="${escapeHtml(item.href)}" title="${escapeHtml(item.title ?? item.label)}"${item.label === 'Resources' ? ' data-resources-nav' : ''}><span class="nav-icon" aria-hidden="true">${renderNavIcon(item.icon)}</span><span class="nav-label">${escapeHtml(item.label)}</span></a>`
-      : `<span class="nav-link nav-link-disabled"${item.label === 'Resources' ? ' data-resources-nav' : ''} aria-disabled="true" title="${escapeHtml(item.label === 'Resources' ? 'Choose a Project to view its resources' : item.label)}"><span class="nav-icon" aria-hidden="true">${renderNavIcon(item.icon)}</span><span class="nav-label">${escapeHtml(item.label)}</span></span>`}</li>`
+    `<li class="nav-item"${item.current === current ? ' aria-current="page"' : ''}>${item.href
+      ? `<a href="${escapeHtml(item.href)}" title="${escapeHtml(item.title ?? item.label)}"${item.current === 'Resources' ? ' data-resources-nav' : ''}><span class="nav-icon" aria-hidden="true">${renderNavIcon(item.icon)}</span><span class="nav-label">${escapeHtml(item.label)}</span></a>`
+      : `<span class="nav-link nav-link-disabled"${item.current === 'Resources' ? ' data-resources-nav' : ''} aria-disabled="true" title="${escapeHtml(item.current === 'Resources' ? t('nav.resources_choose_project') : item.label)}"><span class="nav-icon" aria-hidden="true">${renderNavIcon(item.icon)}</span><span class="nav-label">${escapeHtml(item.label)}</span></span>`}</li>`
   )).join('')}
       </ul>
     </nav>
-    ${interactive ? '<button class="rail-toggle" type="button" data-toggle-rail aria-label="Collapse navigation" aria-expanded="true"><span aria-hidden="true">‹</span></button>' : ''}
+    ${interactive ? `<button class="rail-toggle" type="button" data-toggle-rail data-collapse-label="${escapeHtml(t('nav.collapse'))}" data-expand-label="${escapeHtml(t('nav.expand'))}" aria-label="${escapeHtml(t('nav.collapse'))}" aria-expanded="true"><span aria-hidden="true">‹</span></button>` : ''}
     <div class="sidebar-signature" aria-label="Pachin Studio · Local Workspace">
       <div class="signature-art" aria-hidden="true"><img class="signature-calligraphy" src="/ui/pachin-calligraphy.png" alt=""><img class="signature-seal" src="/ui/pachin-seal.png" alt=""></div>
       <div class="signature-copy"><strong>PACHIN STUDIO</strong><span>LOCAL WORKSPACE</span></div>
     </div>
-    <div class="sidebar-foot">${interactive ? renderStatusGuide() : ''}<span class="device-state"><span class="status-dot"></span><span class="device-state-copy">On this device</span></span></div>
-  </aside>${interactive ? '<div class="rail-resizer app-rail-resizer" role="separator" aria-label="Resize navigation" aria-orientation="vertical" aria-valuemin="68" aria-valuemax="360" tabindex="0" data-rail="app"></div>' : ''}`;
+    <div class="sidebar-foot">${interactive ? renderStatusGuide(locale, languageCatalog) : ''}<span class="device-state"><span class="status-dot"></span><span class="device-state-copy">${escapeHtml(t('nav.on_device'))}</span></span></div>
+  </aside>${interactive ? `<div class="rail-resizer app-rail-resizer" role="separator" aria-label="${escapeHtml(t('nav.resize'))}" aria-orientation="vertical" aria-valuemin="68" aria-valuemax="360" tabindex="0" data-rail="app"></div>` : ''}`;
 }
 
 export function renderFacts(rows) {

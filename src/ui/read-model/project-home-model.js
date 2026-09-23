@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { contentFilePath } from '../../content-inspection.js';
 import { projectPath } from '../project-files.js';
-import { savedResultState } from '../services/saved-work-service.js';
+import { savedResultFreshness, savedResultState, sourceVersionPolicy } from '../services/saved-work-service.js';
 
 function resultStateDetail(status) {
   return {
@@ -22,12 +22,25 @@ function displayTime(value) {
 
 function workPosition(work) {
   if (!work.sources?.length) return 'Choose Sources';
-  if (work.sources.some((item) => ['missing', 'changed', 'unsupported', 'failed'].includes(item.status))) return 'Resolve a Source issue';
+  if (work.sources.some((item) => ['missing', 'changed', 'moved', 'unsupported', 'failed'].includes(item.status) && item.version_policy !== 'pinned_version')) return 'Resolve a Source issue';
   if (work.sources.some((item) => item.status !== 'ready')) return 'Prepare Sources';
   if (!work.mapping_complete) return 'Confirm field alignment';
   if (!work.preview || work.preview_revision !== work.revision) return 'Review Recipe and preview';
   if (work.latest_save_id) return 'Saved result ready';
   return 'Review preview and save';
+}
+
+function workSummary(work, resultById, getResultState) {
+  const result = work.latest_save_id ? resultById.get(work.latest_save_id) ?? null : null;
+  const resultState = result ? getResultState(result) : null;
+  const resultFreshness = result ? savedResultFreshness(result, { sourceFreshness: work.freshness, versionPolicy: sourceVersionPolicy(work.sources, result.version_policy) }) : null;
+  return {
+    revision: work.revision,
+    recipe_label: work.mapping_complete ? `v${work.recipe?.version ?? 1} ready` : `v${work.recipe?.version ?? 1} · mapping incomplete`,
+    result_label: result ? `${path.basename(result.result_path ?? work.latest_save_id)} · ${resultFreshness?.label ?? resultState}` : 'No saved Result',
+    freshness_label: work.freshness?.label ?? 'Not checked',
+    reuse_action: `/work/${encodeURIComponent(work.session_id)}/reuse`,
+  };
 }
 
 function inside(root, filePath) {
@@ -99,8 +112,9 @@ function resolveReference({ project, root, base, reference, resourceFacts, workB
     const work = workById.get(reference.id);
     if (!work) return fallbackItem(base, reference, 'This Work is no longer available.');
     return {
-      kind: 'work', title: reference.label ?? 'Continue data Work', detail: `${work.sources.length} Source${work.sources.length === 1 ? '' : 's'} · revision ${work.revision}`,
+      kind: 'work', title: reference.label && reference.label !== 'Continue data Work' ? reference.label : work.intent ?? 'Continue data Work', detail: `${work.sources.length} Source${work.sources.length === 1 ? '' : 's'} · revision ${work.revision}`,
       position: workPosition(work), href: `/work/${encodeURIComponent(work.session_id)}`, updated_at: displayTime(reference.updated_at ?? work.updated_at), notice: null,
+      ...workSummary(work, resultById, getResultState),
     };
   }
   if (reference.kind === 'resource') {
@@ -233,7 +247,7 @@ export function buildProjectHomeModel({ project, root, base, homeState, resource
         : { state: 'not_checked', checked_at: null, scope_label: 'Tracked Project Resources', items: [] };
   const otherWork = workSessions
     .filter((item) => !homeState.continue || homeState.continue.kind !== 'work' || item.session_id !== homeState.continue.id)
-    .map((item) => ({ id: item.session_id, title: 'Open data Work', detail: `${item.sources.length} Source${item.sources.length === 1 ? '' : 's'} · revision ${item.revision}`, position: workPosition(item), href: `/work/${encodeURIComponent(item.session_id)}`, updated_at: displayTime(item.updated_at) }));
+    .map((item) => ({ id: item.session_id, title: item.intent ?? 'Open data Work', detail: `${item.sources.length} Source${item.sources.length === 1 ? '' : 's'} · revision ${item.revision}`, position: workPosition(item), href: `/work/${encodeURIComponent(item.session_id)}`, updated_at: displayTime(item.updated_at), ...workSummary(item, resultById, getResultState) }));
   return {
     project, base, continue_item: continueItem, other_work: otherWork, pinned, changes, recent_results: recentResults,
     missing_records: {

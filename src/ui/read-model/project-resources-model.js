@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { contentFileFingerprint, contentFilePath, readCachedContentInspection } from '../../content-inspection.js';
 import { browseProjectFiles, listProjectFolders, projectPath, searchProjectFiles } from '../project-files.js';
+import { savedResultFreshness, sourceVersionPolicy } from '../services/saved-work-service.js';
+import { buildResourceImpactLanes } from '../services/resource-impact-service.js';
 
 function samePath(left, right) {
   return process.platform === 'win32'
@@ -40,10 +42,10 @@ function savedSourceStatus(saved) {
     if (!sources.length || sources.some((item) => !item?.fingerprint?.sha256)) return null;
     const unchanged = sources.every((item) => contentFileFingerprint(item.path).sha256 === item.fingerprint.sha256);
     return unchanged
-      ? 'Source unchanged since this result was created'
-      : 'Source changed since this result was created';
+      ? saved.version_policy === 'pinned_version' ? 'Pinned to recorded Source version' : 'Follow latest Source unchanged since this result was created'
+      : saved.version_policy === 'pinned_version' ? 'Pinned result; current Source changed' : 'Follow latest Source changed since this result was created';
   } catch {
-    return 'Source file is no longer available';
+    return saved.version_policy === 'pinned_version' ? 'Pinned result; current Source unavailable' : 'Follow latest Source unavailable';
   }
 }
 
@@ -110,11 +112,12 @@ function resourceRecord(item, root, recentWork, projectId, savedWork = [], curre
     saved_work: saved ? {
       work_id: saved.work_id, source_path: saved.source_path, parameters: saved.parameters,
       sources: saved.sources ?? [], recipe: saved.recipe ?? null,
+      version_policy: saved.version_policy ?? 'pinned_version',
       result_summary: saved.result_summary, created_at: saved.created_at,
       undo_available: saved.write?.undo_available === true,
       source_status: savedSourceStatus(saved),
     } : null,
-    created_work: createdWork.map((savedItem) => ({ work_id: savedItem.work_id, name: path.basename(savedItem.result_path), result_path: savedItem.result_path, relative_path: path.relative(root, savedItem.result_path).replaceAll('\\', '/'), created_at: savedItem.created_at })),
+    created_work: createdWork.map((savedItem) => ({ work_id: savedItem.work_id, name: path.basename(savedItem.result_path), result_path: savedItem.result_path, relative_path: path.relative(root, savedItem.result_path).replaceAll('\\', '/'), created_at: savedItem.created_at, version_policy: savedItem.version_policy ?? 'pinned_version' })),
     activity: activity ? {
       status: activity.status,
       updated_at: activity.updated_at,
@@ -270,7 +273,7 @@ function representationFor(resource, stateDir) {
   }
 }
 
-export function buildProjectResourcesModel({ project, root, base, recentWork, savedWork = [], currentActivity = [], resourceFacts = [], savedWorkError = false, focusedPath = null, focusedResourceId = null, selectedFolderPath = null, stateDir = null, activityReturnHref = null, workSession = null }) {
+export function buildProjectResourcesModel({ project, root, base, recentWork, savedWork = [], currentActivity = [], resourceFacts = [], savedWorkError = false, focusedPath = null, focusedResourceId = null, selectedFolderPath = null, stateDir = null, activityReturnHref = null, workSession = null, workSessions = [] }) {
   const listed = searchProjectFiles(root, '');
   const requestedFolder = typeof selectedFolderPath === 'string' ? selectedFolderPath.replaceAll('\\', '/').replace(/^\/+|\/+$/gu, '') : null;
   const folders = listProjectFolders(root);
@@ -312,6 +315,24 @@ export function buildProjectResourcesModel({ project, root, base, recentWork, sa
       ?? focusedRecord(root, focusedPath, recentWork, project.id, savedWork, currentActivity, resourceFacts)
     : null;
   const focused = focused_resource ? { ...focused_resource, redo_save: redoSave ? { save_id: redoSave.save_id ?? redoSave.work_id } : null, actions: recoveryActions(focused_resource, project.id), representation: representationFor(focused_resource, stateDir) } : null;
+  const resultWorkId = focused?.saved_work?.parameters?.work_session_id ?? null;
+  const relatedWork = focused ? workSessions.filter((work) => work.session_id === resultWorkId || work.sources?.some((source) => source.resource_id === focused.resource_id)).map((work) => {
+    const result = work.latest_save_id ? savedWork.find((item) => item.work_id === work.latest_save_id || item.save_id === work.latest_save_id) ?? null : null;
+    const resultFreshness = result ? savedResultFreshness(result, { sourceFreshness: work.freshness, versionPolicy: sourceVersionPolicy(work.sources, result.version_policy) }) : null;
+    return {
+      session_id: work.session_id,
+      intent: work.intent ?? null,
+      revision: work.revision,
+      recipe_label: `Recipe v${work.recipe?.version ?? 1}`,
+      result_label: result ? `${path.basename(result.result_path)} · ${resultFreshness.label}` : 'No saved Result',
+      result_freshness: resultFreshness,
+      freshness_label: work.freshness?.label ?? 'Not checked',
+      updated_at: work.updated_at,
+      href: `/work/${encodeURIComponent(work.session_id)}`,
+      reuse_action: `/work/${encodeURIComponent(work.session_id)}/reuse`,
+    };
+  }) : [];
+  const impactLanes = focused ? buildResourceImpactLanes({ resource: focused, workSessions, savedWork }) : [];
   const treeRecords = focused?.relative_path && !records.some((item) => item.relative_path === focused.relative_path)
     ? [...records, focused]
     : records;
@@ -329,7 +350,7 @@ export function buildProjectResourcesModel({ project, root, base, recentWork, sa
     current_output: null,
     other_files,
     tree,
-    focused_resource: focused,
+    focused_resource: focused ? { ...focused, related_work: relatedWork, impact_lanes: impactLanes } : focused,
     selected_folder_path,
     selected_folder_explicit: explicitFocus || requestedFolder !== null,
     selected_folder_loaded: !listed.truncated || (requestedFolderExists && requestedFolder === selected_folder_path),

@@ -19,7 +19,7 @@ from .inspector import (
     normalize_xlsx_target, shared_strings,
 )
 
-PROCESSOR_VERSION = "1.1.0"
+PROCESSOR_VERSION = "1.2.0"
 MAX_FILE_BYTES = 256 * 1024 * 1024
 MAX_ROWS = 200_000
 MAX_COLUMNS = 200
@@ -212,6 +212,10 @@ def _profile(frame: pd.DataFrame) -> dict[str, Any]:
         "fields": columns,
         "null_cells": sum(item["missing_count"] for item in columns),
         "duplicate_rows": int(frame.fillna("").astype(str).duplicated().sum()) if len(frame) else 0,
+        "sample": {
+            "columns": [str(name) for name in frame.columns],
+            "rows": _sample(frame, 0, 5),
+        },
     }
 
 

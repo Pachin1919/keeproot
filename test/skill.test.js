@@ -199,7 +199,7 @@ test('Skill command sequence completes Agent Bootstrap, Derived, Tracked Direct,
   assert.ok(capabilities.workflows.bootstrap.includes('contract'));
   assert.ok(capabilities.workflows.bootstrap.includes('adopt'));
   assert.deepEqual(capabilities.workflows.save, ['prepare', 'show', 'execute', 'undo', 'redo']);
-  assert.deepEqual(capabilities.workflows.table_work, ['start', 'show', 'add-source', 'remove-source', 'prepare', 'sheet', 'align', 'recipe', 'preview', 'save', 'list']);
+  assert.deepEqual(capabilities.workflows.table_work, ['start', 'show', 'reuse', 'reconcile', 'reconcile-batch', 'add-source', 'remove-source', 'prepare', 'sheet', 'align', 'recipe', 'preview', 'save', 'list']);
   assert.equal(capabilities.workflows.intake.includes('execute'), false);
   assert.deepEqual(capabilities.workflows.capture, ['fetch', 'localize', 'sample']);
   assert.equal(capabilities.browser_capture.maximum_sample_characters, 4000);

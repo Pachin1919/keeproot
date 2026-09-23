@@ -14,6 +14,30 @@ export function savedResultState(result) {
   }
 }
 
+export function sourceVersionPolicy(sources, fallback = 'follow_latest') {
+  if (!Array.isArray(sources) || !sources.length) return fallback;
+  const pinned = sources.filter((item) => item.version_policy === 'pinned_version').length;
+  return pinned === sources.length ? 'pinned_version' : pinned > 0 ? 'mixed' : 'follow_latest';
+}
+
+export function savedResultFreshness(result, { sourceFreshness = null, versionPolicy = null } = {}) {
+  const outputStatus = savedResultState(result);
+  versionPolicy ??= result.version_policy ?? result.source?.version_policy ?? result.parameters?.version_policy ?? 'pinned_version';
+  if (outputStatus === 'missing_source') return { status: 'missing', label: 'Result missing', version_policy: versionPolicy, output_status: outputStatus, reason: 'The saved output is not at its recorded location.' };
+  if (outputStatus === 'changed') return { status: 'needs_review', label: 'Result changed', version_policy: versionPolicy, output_status: outputStatus, reason: 'The saved output was edited outside Atlas after verification.' };
+  if (outputStatus === 'undone') return { status: 'undone', label: 'Save undone', version_policy: versionPolicy, output_status: outputStatus, reason: 'The output was removed by Atlas Undo.' };
+  if (outputStatus !== 'verified') return { status: 'not_checked', label: 'Result not checked', version_policy: versionPolicy, output_status: outputStatus, reason: 'Atlas does not have a current verification result for this output.' };
+  if (versionPolicy === 'follow_latest' && sourceFreshness?.status === 'needs_review') {
+    return { status: 'needs_review', label: 'Sources need review', version_policy: versionPolicy, output_status: outputStatus, reason: 'The saved output still matches its verified bytes, but one or more followed Sources changed.' };
+  }
+  if (versionPolicy === 'mixed' && sourceFreshness?.status === 'needs_review') {
+    return { status: 'needs_review', label: 'Sources need review', version_policy: versionPolicy, output_status: outputStatus, reason: 'The saved output still matches its verified bytes, but one or more followed Sources changed.' };
+  }
+  if (versionPolicy === 'pinned_version') return { status: 'pinned', label: 'Pinned result', version_policy: versionPolicy, output_status: outputStatus, reason: 'This result remains bound to the recorded Source versions.' };
+  if (versionPolicy === 'mixed') return { status: 'fresh', label: 'Mixed source policy', version_policy: versionPolicy, output_status: outputStatus, reason: 'The output is verified; each Source keeps its recorded pin or follow policy.' };
+  return { status: 'fresh', label: 'Fresh', version_policy: versionPolicy, output_status: outputStatus, reason: 'The output is verified and followed Sources match their recorded versions.' };
+}
+
 function statePath(stateDir) { return path.join(path.resolve(stateDir), 'ui', 'saved-work.json'); }
 function validRecord(value) {
   if (!value) return null;
@@ -25,6 +49,7 @@ function validRecord(value) {
     } : null;
     return {
       ...value,
+      version_policy: value.version_policy ?? value.source?.version_policy ?? value.parameters?.version_policy ?? 'pinned_version',
       work_id: value.save_id,
       result_path: value.target.path ?? null,
       result_fingerprint: fingerprint,
@@ -38,7 +63,7 @@ function validRecord(value) {
     };
   }
   if (!/^SWR-[a-f0-9-]{36}$/u.test(value.work_id ?? '') || typeof value.result_path !== 'string' || typeof value.source_path !== 'string') return null;
-  return value;
+  return { ...value, version_policy: value.version_policy ?? 'pinned_version' };
 }
 export function readSavedWorkState(stateDir) {
   try {
@@ -96,7 +121,7 @@ export function createSavedWorkService({ stateDir, saveService = null }) {
     resource_id: item.resource_id ?? null,
   }));
   const prepareDestination = ({ projectRoot, folder, fileName, sourcePath, outputExtension = null }) => destination(projectRoot, folder, fileName, sourcePath, true, outputExtension);
-  const save = ({ project, projectRoot, root = projectRoot, target: targetInput = null, folder, fileName, stagedPath, expectedCandidateHash = null, sourcePath, sourceFingerprint, sourceResourceId = null, sources = null, recipe = null, outputExtension = null, parameters, resultSummary, requestKey = null, caller = {}, channel = 'work', executionReason = 'User confirmed this Data Work result.' }) => {
+  const save = ({ project, projectRoot, root = projectRoot, target: targetInput = null, folder, fileName, stagedPath, expectedCandidateHash = null, sourcePath, sourceFingerprint, sourceResourceId = null, sources = null, recipe = null, versionPolicy = 'pinned_version', outputExtension = null, parameters, resultSummary, requestKey = null, caller = {}, channel = 'work', executionReason = 'User confirmed this Data Work result.' }) => {
     if (!saveService) throw new Error('The Atlas Save Service is unavailable for current saves.');
     const requestedSources = Array.isArray(sources) && sources.length ? sources : [{ path: sourcePath, fingerprint: sourceFingerprint, ...(sourceResourceId ? { resource_id: sourceResourceId } : {}) }];
     const currentSources = requestedSources.map((item) => {
@@ -111,10 +136,10 @@ export function createSavedWorkService({ stateDir, saveService = null }) {
     const prepared = saveService.prepare({ root, candidateFile: stagedPath, expectedCandidateHash, projectId: project.id, target: targetPath,
       inputs: currentSources.map((item) => item.path),
       origin: 'agent_generated', kind: 'intermediate', channel, requestKey: requestKey ?? `${Date.now()}`,
-      caller, source: { path: current.file_path, fingerprint: current, resource_id: currentSources[0].resource_id ?? null, sources: currentSources, recipe }, parameters: { ...parameters, recipe }, resultSummary,
+      caller, source: { path: current.file_path, fingerprint: current, resource_id: currentSources[0].resource_id ?? null, sources: currentSources, recipe, version_policy: versionPolicy }, parameters: { ...parameters, recipe, version_policy: versionPolicy }, resultSummary,
       intent: 'Save one reviewed Data Work result.' });
     const result = saveService.execute(prepared.save_id, { reason: executionReason });
-    return validRecord(readSavedWorkState(stateDir).items.find((item) => item.save_id === result.save_id) ?? { ...result, source: { path: current.file_path, fingerprint: current, sources: currentSources, recipe }, parameters: { ...parameters, recipe }, result_summary: resultSummary });
+    return validRecord(readSavedWorkState(stateDir).items.find((item) => item.save_id === result.save_id) ?? { ...result, source: { path: current.file_path, fingerprint: current, sources: currentSources, recipe, version_policy: versionPolicy }, parameters: { ...parameters, recipe, version_policy: versionPolicy }, result_summary: resultSummary });
   };
   const undo = (workId) => {
     if (!saveService) throw new Error('The Atlas Save Service is unavailable for current Undo.');

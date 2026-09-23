@@ -26,6 +26,11 @@ function storageRemove(kind, key) {
   try { window[kind]?.removeItem(key); } catch {}
 }
 
+const clientMessages = (() => {
+  try { return JSON.parse(document.querySelector('[data-ui-client-messages]')?.dataset.uiClientMessages ?? '{}'); } catch { return {}; }
+})();
+const clientText = (key, fallback, values = {}) => String(clientMessages[key] ?? fallback)
+  .replace(/\{([a-z]+)\}/gu, (_, name) => String(values[name] ?? ''));
 const topbar = document.querySelector('.topbar[data-current-project-id]');
 const currentProjectId = topbar?.dataset.currentProjectId;
 const currentResourcePath = topbar?.dataset.currentResourcePath;
@@ -40,13 +45,13 @@ document.querySelectorAll('[data-resources-nav]').forEach((item) => {
   if (!rememberedProjectHref) return;
   if (item instanceof HTMLAnchorElement) {
     item.href = rememberedProjectHref;
-    item.title = 'Resources';
+    item.title = clientText('resources_title', 'Resources');
     return;
   }
   const link = document.createElement('a');
   link.href = rememberedProjectHref;
   link.dataset.resourcesNav = '';
-  link.title = 'Resources';
+  link.title = clientText('resources_title', 'Resources');
   link.innerHTML = item.innerHTML;
   item.replaceWith(link);
 });
@@ -157,8 +162,14 @@ document.querySelectorAll('[data-project-filter]').forEach((input) => {
   }));
 });
 
+const resourceMessages = (() => {
+  try { return JSON.parse(document.body.dataset.resourceMessages ?? '{}'); } catch { return {}; }
+})();
+const resourceText = (key, values = {}) => String(resourceMessages[key] ?? key).replace(/\{([a-z]+)\}/gu, (_, name) => String(values[name] ?? ''));
+const resourceHtml = (key, values = {}) => resourceText(key, values).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+
 const updateTemporaryWorkSelection = (payload) => {
-  document.querySelectorAll('[data-work-source-count]').forEach((item) => { item.textContent = `Selected ${payload.count ?? 0} files`; });
+  document.querySelectorAll('[data-work-source-count]').forEach((item) => { item.textContent = resourceText('resources.selected_files', { count: payload.count ?? 0 }); });
   document.querySelectorAll('[data-work-open]').forEach((item) => {
     const active = Number(payload.count ?? 0) > 0 && payload.href;
     item.href = active ? payload.href : '#';
@@ -174,7 +185,7 @@ const bindTemporaryWorkSources = (root, context) => {
     checkbox.addEventListener('change', async () => {
       const notice = document.querySelector('[data-work-source-notice]');
       checkbox.disabled = true;
-      if (notice) notice.textContent = 'Updating selection…';
+      if (notice) notice.textContent = resourceText('resources.updating_selection');
       try {
         const response = await fetch(`${context.projectBase}/work/selection`, {
           method: 'POST',
@@ -190,7 +201,7 @@ const bindTemporaryWorkSources = (root, context) => {
           }),
         });
         const result = await response.json();
-        if (!response.ok || result.ok !== true) throw new Error(result.error || 'Selection could not be updated.');
+        if (!response.ok || result.ok !== true) throw new Error(result.error || resourceText('resources.selection_update_failed'));
         document.querySelectorAll(`[data-work-source][data-resource-id="${CSS.escape(result.resource_id ?? '')}"]`).forEach((item) => { item.checked = result.selected === true; });
         updateTemporaryWorkSelection(result);
         if (notice) notice.textContent = '';
@@ -320,7 +331,7 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
       group.append(...rows);
       button.dataset.sortDirection = direction;
       button.textContent = direction === 'asc' ? 'Name ↑' : 'Name ↓';
-      button.setAttribute('aria-label', `Sort files by name ${direction === 'asc' ? 'descending' : 'ascending'}`);
+      button.setAttribute('aria-label', clientText(direction === 'asc' ? 'sort_descending' : 'sort_ascending', `Sort files by name ${direction === 'asc' ? 'descending' : 'ascending'}`));
     });
     bindTemporaryWorkSources(group, {
       projectBase,
@@ -372,7 +383,7 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
     if (folderLoadRequests.has(folderPath)) return folderLoadRequests.get(folderPath);
     group.setAttribute('aria-busy', 'true');
     group.querySelector('[data-folder-loading]')?.remove();
-    group.insertAdjacentHTML('beforeend', '<p class="workspace-empty" data-folder-loading>Loading this folder…</p>');
+    group.insertAdjacentHTML('beforeend', `<p class="workspace-empty" data-folder-loading>${resourceHtml('resources.loading_folder')}</p>`);
     const query = new URLSearchParams({ folder: folderPath, fragment: 'folder-files' });
     const request = fetch(`${projectBase}/resources?${query}`, { headers: { accept: 'text/html' } })
       .then(async (response) => {
@@ -391,7 +402,7 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
         group.removeAttribute('aria-busy');
         group.querySelector('[data-folder-loading]')?.remove();
         if (!group.querySelector('[data-folder-load-error]')) {
-          group.insertAdjacentHTML('beforeend', '<p class="callout warn" data-folder-load-error>This folder could not be loaded. Select it again to retry.</p>');
+          group.insertAdjacentHTML('beforeend', `<p class="callout warn" data-folder-load-error>${resourceHtml('resources.folder_load_failed')}</p>`);
         }
         return group;
       })
@@ -422,7 +433,7 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
         link.href = `${target.pathname}${target.search}`;
       });
       document.querySelectorAll('[data-resource-view-scope-label]').forEach((label) => {
-        label.textContent = selectedPath || 'Project root';
+        label.textContent = selectedPath || resourceText('resources.project_root');
       });
       document.querySelectorAll('[data-resource-view-scope-input], .resource-view-save input[name="scope_path"]').forEach((input) => {
         input.value = selectedPath;
@@ -438,7 +449,7 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
     }
     if (clearResource) {
       const inspector = workspace.querySelector('[data-resource-inspector]');
-      if (inspector) inspector.innerHTML = '<span class="workspace-kicker">Selected resource</span><h2>Choose a resource</h2><p>Select a file from the current folder to see its known local facts and open it with its default app.</p>';
+      if (inspector) inspector.innerHTML = `<span class="workspace-kicker">${resourceHtml('resources.selected_resource')}</span><h2>${resourceHtml('resources.choose_resource')}</h2><p>${resourceHtml('resources.choose_resource_help')}</p>`;
       focusedRow?.classList.remove('is-focused');
       focusedRow?.removeAttribute('data-focused-resource');
       focusedRow?.removeAttribute('tabindex');
@@ -504,8 +515,8 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
     workspace.classList.toggle('is-file-list-collapsed', !expanded);
     listToggle.setAttribute('aria-expanded', String(expanded));
     listToggle.textContent = compactResourceWorkspace()
-      ? (expanded ? 'Show resource details' : 'Back to file list')
-      : (expanded ? 'Hide file list' : 'Show file list');
+      ? (expanded ? resourceText('resources.show_resource_details') : resourceText('resources.back_to_file_list'))
+      : (expanded ? resourceText('resources.hide_file_list') : resourceText('resources.show_file_list'));
     if (persist) storageSet('localStorage', resourceListKey, expanded ? 'expanded' : 'collapsed');
     if (!expanded && fileList.contains(document.activeElement)) listToggle.focus();
     window.requestAnimationFrame(reflowPaneWidths);
@@ -590,7 +601,12 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
 
   if (focusedRow) window.requestAnimationFrame(() => {
     focusedRow.focus({ preventScroll: true });
-    focusedRow.scrollIntoView({ block: 'center' });
+    const scrollContainer = focusedRow.closest('.workspace-resource-list-scroll');
+    if (scrollContainer) {
+      const rowTop = focusedRow.offsetTop;
+      const centered = rowTop - ((scrollContainer.clientHeight - focusedRow.offsetHeight) / 2);
+      scrollContainer.scrollTop = Math.max(0, centered);
+    }
   });
 });
 
@@ -669,11 +685,11 @@ if (activityRegion) {
       try { await refreshActivity(); } catch {}
       const status = activityRegion.querySelector('.activity-manager-connection');
       if (fallbackCount >= 12) {
-        if (status) status.textContent = 'Live updates are unavailable. Reopen Activity to retry.';
+        if (status) status.textContent = activityRegion.dataset.connectionLost || 'Live updates are unavailable. Reopen Activity to retry.';
         fallbackTimer = null;
         return;
       }
-      if (status) status.textContent = 'Live connection unavailable. Checking periodically.';
+      if (status) status.textContent = activityRegion.dataset.connectionPoll || 'Live connection unavailable. Checking periodically.';
       fallbackTimer = window.setTimeout(() => { fallbackTimer = null; nextPoll(); }, 5000);
     };
     nextPoll();
@@ -682,12 +698,12 @@ if (activityRegion) {
     const events = new EventSource(activityRegion.dataset.eventsHref);
     events.addEventListener('ready', () => {
       const status = activityRegion.querySelector('.activity-manager-connection');
-      if (status) status.textContent = 'Local activity is updating live.';
+      if (status) status.textContent = activityRegion.dataset.connectionLive || 'Local activity is updating live.';
     });
     events.addEventListener('change', () => refreshActivity().catch(fallback));
     events.addEventListener('error', () => { events.close(); fallback(); });
   } else {
-    if (connection) connection.textContent = 'Live updates are unavailable. Checking periodically.';
+    if (connection) connection.textContent = activityRegion.dataset.connectionPoll || 'Live updates are unavailable. Checking periodically.';
     fallback();
   }
   if (activityRegion.dataset.importStatusHref) {
@@ -718,7 +734,7 @@ function focusAtlasOverlay(dialog) {
 function closeAtlasOverlay(dialog) {
   if (!(dialog instanceof HTMLDialogElement) || !dialog.open) return;
   if (dialog.dataset.overlayDirty === 'true' && dialog.hasAttribute('data-overlay-dirty-protect')
-    && !window.confirm('Close Settings and discard unsaved display changes?')) return;
+    && !window.confirm(clientText('close_settings_confirm', 'Close Settings and discard unsaved display changes?'))) return;
   dialog.close();
   const returnHref = dialog.dataset.overlayReturnHref;
   if (returnHref) {
@@ -795,7 +811,7 @@ function applyRailWidth(shell, handle, configuration, value) {
     const toggle = shell.querySelector('[data-toggle-rail]');
     if (toggle) {
       toggle.setAttribute('aria-expanded', String(!compact));
-      toggle.setAttribute('aria-label', compact ? 'Expand navigation' : 'Collapse navigation');
+      toggle.setAttribute('aria-label', compact ? toggle.dataset.expandLabel : toggle.dataset.collapseLabel);
       const symbol = toggle.querySelector('[aria-hidden="true"]');
       if (symbol) symbol.textContent = compact ? '›' : '‹';
     }
@@ -959,6 +975,10 @@ if (resourceContextCard && typeof resourceContextCard.addEventListener === 'func
 
 const importFiles = document.querySelector('[data-import-files]');
 const pickerNotice = document.querySelector('[data-file-picker-notice]');
+const importMessages = (() => {
+  try { return JSON.parse(document.body.dataset.importMessages ?? '{}'); } catch { return {}; }
+})();
+const importText = (key, fallback) => String(importMessages[key] ?? fallback);
 
 async function desktopPickerMethod(method) {
   const deadline = Date.now() + 15_000;
@@ -979,7 +999,7 @@ async function activateDesktopPickerControls() {
     try { ready = (await readyMethod())?.ready === true; } catch { ready = false; }
   }
   controls.forEach((control) => { control.disabled = !ready || control.dataset.importRunning === 'true'; });
-  if (pickerNotice) pickerNotice.textContent = ready ? '' : 'The Desktop file picker did not become ready. You can retry after reopening Atlas.';
+  if (pickerNotice) pickerNotice.textContent = ready ? '' : importText('picker_unavailable', 'The Desktop file picker did not become ready. You can retry after reopening Atlas.');
 }
 
 activateDesktopPickerControls();
@@ -987,7 +1007,7 @@ activateDesktopPickerControls();
 async function chooseDesktopFile(button, method = 'pick_file') {
   const picker = await desktopPickerMethod(method);
   if (!picker) {
-    if (pickerNotice) pickerNotice.textContent = 'The desktop file picker is not ready. Try again.';
+    if (pickerNotice) pickerNotice.textContent = importText('picker_retry', 'The desktop file picker is not ready. Try again.');
     return { status: 'unavailable' };
   }
   button.disabled = true;
@@ -1001,7 +1021,7 @@ async function chooseDesktopFile(button, method = 'pick_file') {
 importFiles?.addEventListener('click', async () => {
   const selection = await chooseDesktopFile(importFiles, 'pick_import_files');
   if (selection?.queue_id) window.location.assign(`/files/queue/${encodeURIComponent(selection.queue_id)}`);
-  else if (!['cancelled', 'unavailable'].includes(selection?.status) && pickerNotice) pickerNotice.textContent = selection?.message ?? 'Atlas could not register the selected files. Try again.';
+  else if (!['cancelled', 'unavailable'].includes(selection?.status) && pickerNotice) pickerNotice.textContent = selection?.message ?? importText('register_failed', 'Atlas could not register the selected files. Try again.');
 });
 
 document.querySelectorAll('[data-import-add-files], [data-import-add-folder]').forEach((button) => {
@@ -1009,14 +1029,14 @@ document.querySelectorAll('[data-import-add-files], [data-import-add-folder]').f
     const method = button.hasAttribute('data-import-add-folder') ? 'pick_import_folder' : 'pick_import_files';
     const picker = await desktopPickerMethod(method);
     if (!picker) {
-      if (pickerNotice) pickerNotice.textContent = 'The desktop picker is not ready. Try again.';
+      if (pickerNotice) pickerNotice.textContent = importText('picker_add_retry', 'The desktop picker is not ready. Try again.');
       return;
     }
     button.disabled = true;
     try {
       const selection = await picker(button.dataset.importQueue || null);
       if (selection?.queue_id) window.location.assign(`/files/queue/${encodeURIComponent(selection.queue_id)}`);
-      else if (selection?.status !== 'cancelled' && pickerNotice) pickerNotice.textContent = selection?.message ?? 'Atlas could not add this selection.';
+      else if (selection?.status !== 'cancelled' && pickerNotice) pickerNotice.textContent = selection?.message ?? importText('add_failed', 'Atlas could not add this selection.');
     } finally {
       button.disabled = false;
     }
@@ -1028,7 +1048,7 @@ document.querySelectorAll('[data-pick-folder]').forEach((button) => {
     const picker = await desktopPickerMethod('pick_folder');
     if (!picker) {
       const notice = document.querySelector('[data-folder-picker-notice]');
-      if (notice) notice.textContent = 'The desktop folder picker is not ready. Try again.';
+      if (notice) notice.textContent = notice.dataset.pickerNotReady ?? 'The desktop folder picker is not ready. Try again.';
       return;
     }
     button.disabled = true;
@@ -1037,7 +1057,7 @@ document.querySelectorAll('[data-pick-folder]').forEach((button) => {
       if (!selection?.selection_id) {
         if (selection?.status !== 'cancelled') {
           const notice = document.querySelector('[data-folder-picker-notice]');
-          if (notice) notice.textContent = selection?.message ?? 'Atlas could not register the selected folder. Try again.';
+          if (notice) notice.textContent = selection?.message ?? notice.dataset.registerFailed ?? 'Atlas could not register the selected folder. Try again.';
         }
         return;
       }
@@ -1045,7 +1065,7 @@ document.querySelectorAll('[data-pick-folder]').forEach((button) => {
       const target = form?.querySelector('input[name="folder_selection_id"]');
       if (target) target.value = selection.selection_id;
       const label = form?.querySelector('[data-folder-selection-name]');
-      if (label) label.textContent = selection.name ?? 'Folder selected';
+      if (label) label.textContent = selection.name ?? label.dataset.selectedLabel ?? 'Folder selected';
     } finally {
       button.disabled = false;
     }
@@ -1070,7 +1090,7 @@ document.querySelectorAll('[data-resource-relink-picker]').forEach((button) => {
     if (!selection?.selection_id) {
       if (!['cancelled', 'unavailable'].includes(selection?.status)) {
         const notice = form?.querySelector('[data-resource-relink-notice]');
-        if (notice) notice.textContent = selection?.message ?? 'Atlas could not register the selected file. Try again.';
+        if (notice) notice.textContent = selection?.message ?? notice.dataset.registerFailed ?? 'Atlas could not register the selected file. Try again.';
       }
       return;
     }
@@ -1079,7 +1099,7 @@ document.querySelectorAll('[data-resource-relink-picker]').forEach((button) => {
     const confirm = form?.querySelector('[data-resource-relink-confirm]');
     const notice = form?.querySelector('[data-resource-relink-notice]');
     if (target) target.value = selection.selection_id;
-    if (name) name.textContent = selection.name ?? 'File selected';
+    if (name) name.textContent = selection.name ?? name.dataset.selectedLabel ?? 'File selected';
     if (confirm) confirm.disabled = false;
     if (notice) notice.textContent = '';
   });
@@ -1100,10 +1120,10 @@ document.querySelectorAll('[data-project-folder-form]').forEach((form) => {
     const hasActionableItems = Number.parseInt(form.dataset.importActionableCount ?? '1', 10) > 0;
     if (submit) submit.disabled = importRunning || !hasActionableItems || !selected;
     if (pathLabel) {
-      const projectName = projectPicker?.selectedOptions[0]?.textContent?.replace(/ — unavailable$/u, '') ?? 'Project';
+      const projectName = projectPicker?.selectedOptions[0]?.textContent?.replace(/ — (?:unavailable|不可用)$/u, '') ?? clientText('project', 'Project');
       pathLabel.textContent = selected
-        ? `${projectName} / ${selected.dataset.folderPath} / ${fileNameInput?.value || form.dataset.fileName || 'file'}`
-        : 'Choose an existing folder.';
+        ? `${projectName} / ${selected.dataset.folderPath} / ${fileNameInput?.value || form.dataset.fileName || clientText('file', 'file')}`
+        : clientText('choose_folder', 'Choose an existing folder.');
     }
   };
 
@@ -1167,8 +1187,8 @@ document.addEventListener('submit', (event) => {
   status.className = 'atlas-processing-status';
   status.setAttribute('role', 'status');
   status.setAttribute('aria-live', 'polite');
-  const action = event.submitter?.textContent?.trim() || 'Working';
-  status.textContent = `${action}… Atlas is working locally. Keep this window open.`;
+  const action = event.submitter?.textContent?.trim() || clientText('working', 'Working');
+  status.textContent = clientText('processing', '{action}… Atlas is working locally. Keep this window open.', { action });
   document.body.append(status);
 }, true);
 

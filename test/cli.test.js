@@ -8,6 +8,7 @@ import { Bootstrap } from '../src/bootstrap.js';
 import { Registry } from '../src/registry.js';
 import { Tracker } from '../src/tracker.js';
 import { createResourceControl } from '../src/resource-control.js';
+import { contentFileFingerprint } from '../src/content-inspection.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cliPath = process.env.ATLAS_TEST_CLI_PATH
@@ -95,7 +96,9 @@ test('installed product help and capabilities hide direct internal write engines
   assert.equal(capabilityResult.status, 0, capabilityResult.stderr);
   const capabilities = JSON.parse(capabilityResult.stdout).data;
   assert.match(help, /atlas table-work start/u);
-  assert.deepEqual(capabilities.workflows.table_work, ['start', 'show', 'add-source', 'remove-source', 'prepare', 'sheet', 'align', 'recipe', 'preview', 'save', 'list']);
+  assert.match(help, /atlas table-work reuse/u);
+  assert.match(help, /atlas table-work reconcile/u);
+  assert.deepEqual(capabilities.workflows.table_work, ['start', 'show', 'reuse', 'reconcile', 'reconcile-batch', 'add-source', 'remove-source', 'prepare', 'sheet', 'align', 'recipe', 'preview', 'save', 'list']);
   assert.deepEqual(capabilities.workflows.resource_views, ['list', 'evaluate', 'files', 'candidates-submit', 'properties', 'candidates-show', 'save']);
   assert.deepEqual(capabilities.workflows.resource_facts, ['show']);
   assert.deepEqual(capabilities.resource_views, {
@@ -270,6 +273,61 @@ test('CLI Host Table Work rejects a Source outside the selected Project without 
   const result = cli(stateDir, ['table-work', 'start', '--project', first.project_id, '--source', foreign, '--tool', 'atlas-cli-test', '--client-run-id', 'boundary', '--json']);
   assert.notEqual(result.status, 0); assert.match(JSON.parse(result.stdout).error.message, /inside the selected Project/u);
   const reopened = new Registry({ stateDir }); assert.equal(reopened.ledger.workSessions.latestOpenForProject(first.project_id), null); reopened.dispose();
+});
+
+test('V19-02 table-work reconcile validates the decision and caller contract', () => {
+  const { caseRoot, stateDir } = setup('cli-host-table-work-reconcile');
+  const workspace = path.join(caseRoot, 'workspace'); const projectRoot = path.join(workspace, 'Project'); const source = path.join(projectRoot, 'Data', 'input.csv');
+  fs.mkdirSync(path.dirname(source), { recursive: true }); fs.writeFileSync(source, 'name,value\nOne,1\n', 'utf8');
+  const registry = new Registry({ stateDir }); const root = registry.adoptRoot({ rootPath: workspace, rootType: 'project_workspace', contentPolicy: 'bounded_content' }); const project = registry.create({ name: 'Project', currentPath: 'Project' }); registry.attachRoot(project.project_id, { rootId: root.root_id, relativePath: 'Project', reason: 'V19-02 reconcile fixture.' }); registry.dispose();
+  const started = cli(stateDir, ['table-work', 'start', '--project', project.project_id, '--source', 'Data/input.csv', '--tool', 'test', '--client-run-id', 'v19-02-start', '--json']); assert.equal(started.status, 0, started.stderr); const session = JSON.parse(started.stdout).data;
+  const result = cli(stateDir, ['table-work', 'reconcile', session.session_id, '--source-key', session.sources[0].source_key, '--decision', 'not-a-decision', '--base-revision', String(session.revision), '--tool', 'test', '--client-run-id', 'v19-02-reconcile', '--json']);
+  assert.notEqual(result.status, 0); const envelope = JSON.parse(result.stdout); assert.equal(envelope.error.code, 'ATLAS_INVALID_ARGUMENT'); assert.match(envelope.error.message, /decision|use-current|pin-recorded|follow-latest|stop-using/u);
+});
+
+test('V19-02 table-work reconcile success reads back policy and revision', () => {
+  const { caseRoot, stateDir } = setup('cli-host-table-work-reconcile-success');
+  const workspace = path.join(caseRoot, 'workspace'); const projectRoot = path.join(workspace, 'Project'); const source = path.join(projectRoot, 'Data', 'input.csv');
+  fs.mkdirSync(path.dirname(source), { recursive: true }); fs.writeFileSync(source, 'name,value\nOne,1\n', 'utf8');
+  const registry = new Registry({ stateDir }); const root = registry.adoptRoot({ rootPath: workspace, rootType: 'project_workspace', contentPolicy: 'bounded_content' }); const project = registry.create({ name: 'Project', currentPath: 'Project' }); registry.attachRoot(project.project_id, { rootId: root.root_id, relativePath: 'Project', reason: 'V19-02 reconcile success fixture.' }); registry.dispose();
+  const started = cli(stateDir, ['table-work', 'start', '--project', project.project_id, '--source', 'Data/input.csv', '--tool', 'test', '--client-run-id', 'v19-02-start-success', '--json']); assert.equal(started.status, 0, started.stderr); const session = JSON.parse(started.stdout).data;
+  const recorded = contentFileFingerprint(source); const ledgerRegistry = new Registry({ stateDir }); ledgerRegistry.ledger.workSessions.updateSource(session.session_id, session.sources[0].source_key, { fingerprint: recorded, profile: { profile: { fields: [{ name: 'name' }] } }, processorVersion: 'test', status: 'ready' }, new Date().toISOString()); ledgerRegistry.dispose();
+  fs.appendFileSync(source, 'Two,2\n', 'utf8');
+  const result = cli(stateDir, ['table-work', 'reconcile', session.session_id, '--source-key', session.sources[0].source_key, '--decision', 'pin-recorded', '--base-revision', String(session.revision), '--tool', 'test', '--client-run-id', 'v19-02-reconcile-success', '--json']);
+  assert.equal(result.status, 0, result.stderr || result.stdout); const envelope = JSON.parse(result.stdout); assert.equal(envelope.ok, true); assert.equal(envelope.data.revision, session.revision + 1); assert.equal(envelope.data.sources[0].version_policy, 'pinned_version');
+  assert.notEqual(contentFileFingerprint(source).sha256, session.sources[0].fingerprint?.sha256);
+});
+
+test('V19-02 table-work reconcile-batch applies one decision to selected Sources in one revision', () => {
+  const { caseRoot, stateDir } = setup('cli-host-table-work-reconcile-batch');
+  const workspace = path.join(caseRoot, 'workspace'); const projectRoot = path.join(workspace, 'Project'); const dataRoot = path.join(projectRoot, 'Data');
+  fs.mkdirSync(dataRoot, { recursive: true }); const sources = ['one.csv', 'two.csv'].map((name) => path.join(dataRoot, name));
+  for (const source of sources) fs.writeFileSync(source, 'name,value\nOne,1\n', 'utf8');
+  const registry = new Registry({ stateDir }); const root = registry.adoptRoot({ rootPath: workspace, rootType: 'project_workspace', contentPolicy: 'bounded_content' }); const project = registry.create({ name: 'Project', currentPath: 'Project' }); registry.attachRoot(project.project_id, { rootId: root.root_id, relativePath: 'Project', reason: 'V19-02 batch reconcile fixture.' }); registry.dispose();
+  const started = cli(stateDir, ['table-work', 'start', '--project', project.project_id, '--source', 'Data/one.csv', '--source', 'Data/two.csv', '--tool', 'test', '--client-run-id', 'v19-02-batch-start', '--json']); assert.equal(started.status, 0, started.stderr); const session = JSON.parse(started.stdout).data;
+  const ledgerRegistry = new Registry({ stateDir }); session.sources.forEach((item, index) => ledgerRegistry.ledger.workSessions.updateSource(session.session_id, item.source_key, { fingerprint: contentFileFingerprint(sources[index]), profile: { profile: { fields: [{ name: 'name' }, { name: 'value' }] } }, processorVersion: 'test', status: 'ready' }, new Date().toISOString())); ledgerRegistry.dispose();
+  sources.forEach((source, index) => fs.appendFileSync(source, `Changed ${index + 1},${index + 2}\n`, 'utf8'));
+  const requestFile = path.join(caseRoot, 'source-keys.json'); fs.writeFileSync(requestFile, JSON.stringify({ source_keys: session.sources.map((item) => item.source_key) }));
+  const result = cli(stateDir, ['table-work', 'reconcile-batch', session.session_id, '--request-file', requestFile, '--decision', 'pin-recorded', '--base-revision', String(session.revision), '--tool', 'test', '--client-run-id', 'v19-02-batch-pin', '--json']);
+  assert.equal(result.status, 0, result.stderr || result.stdout); const data = JSON.parse(result.stdout).data; assert.equal(data.revision, session.revision + 1); assert.equal(data.sources.every((item) => item.version_policy === 'pinned_version'), true);
+});
+
+test('V19-03 resource show returns only the selected Project impact lanes', () => {
+  const { caseRoot, stateDir } = setup('cli-resource-show-impact-lanes'); const workspace = path.join(caseRoot, 'workspace'); const projectARoot = path.join(workspace, 'Project A'); const projectBRoot = path.join(workspace, 'Project B');
+  const sourceA = path.join(projectARoot, 'Data', 'source-a.csv'); const sourceB = path.join(projectBRoot, 'Data', 'source-b.csv'); fs.mkdirSync(path.dirname(sourceA), { recursive: true }); fs.mkdirSync(path.dirname(sourceB), { recursive: true }); fs.writeFileSync(sourceA, 'name\nA\n', 'utf8'); fs.writeFileSync(sourceB, 'name\nB\n', 'utf8');
+  const registry = new Registry({ stateDir }); const root = registry.adoptRoot({ rootPath: workspace, rootType: 'project_workspace', contentPolicy: 'bounded_content' }); const projectA = registry.create({ name: 'Project A', currentPath: 'Project A' }); const projectB = registry.create({ name: 'Project B', currentPath: 'Project B' }); registry.attachRoot(projectA.project_id, { rootId: root.root_id, relativePath: 'Project A', reason: 'V19-03 boundary fixture.' }); registry.attachRoot(projectB.project_id, { rootId: root.root_id, relativePath: 'Project B', reason: 'V19-03 boundary fixture.' }); registry.dispose();
+  const startedA = cli(stateDir, ['table-work', 'start', '--project', projectA.project_id, '--source', 'Data/source-a.csv', '--tool', 'test', '--client-run-id', 'v19-03-a', '--json']); const startedB = cli(stateDir, ['table-work', 'start', '--project', projectB.project_id, '--source', 'Data/source-b.csv', '--tool', 'test', '--client-run-id', 'v19-03-b', '--json']); assert.equal(startedA.status, 0, startedA.stderr); assert.equal(startedB.status, 0, startedB.stderr); const workA = JSON.parse(startedA.stdout).data; const workB = JSON.parse(startedB.stdout).data;
+  const shown = cli(stateDir, ['resource', 'show', workA.sources[0].resource_id, '--project', projectA.project_id, '--json']); assert.equal(shown.status, 0, shown.stderr); const envelope = JSON.parse(shown.stdout); assert.equal(envelope.ok, true); assert.ok(Array.isArray(envelope.data.impact_lanes), 'resource show must return impact lanes'); assert.ok(envelope.data.impact_lanes.some((lane) => lane.work?.session_id === workA.session_id)); assert.equal(envelope.data.impact_lanes.some((lane) => lane.work?.session_id === workB.session_id), false);
+});
+
+test('V19-04 CLI Board create save show export keeps board identity and rejects stale revision', () => {
+  const { caseRoot, stateDir } = setup('cli-board-delivery'); const workspace = path.join(caseRoot, 'workspace'); const projectRoot = path.join(workspace, 'Project'); const source = path.join(projectRoot, 'Data', 'study.csv'); fs.mkdirSync(path.dirname(source), { recursive: true }); fs.mkdirSync(path.join(projectRoot, 'Results'), { recursive: true }); fs.writeFileSync(source, 'name\nA\n', 'utf8');
+  const registry = new Registry({ stateDir }); const root = registry.adoptRoot({ rootPath: workspace, rootType: 'project_workspace', contentPolicy: 'bounded_content' }); const project = registry.create({ name: 'Project', currentPath: 'Project' }); registry.attachRoot(project.project_id, { rootId: root.root_id, relativePath: 'Project', reason: 'V19-04 CLI Board fixture.' }); const control = createResourceControl({ stateDir, ledger: registry.ledger }); const resource = control.identify({ filePath: source, project: { id: project.project_id } }); control.dispose(); registry.dispose();
+  const created = cli(stateDir, ['board', 'create', '--project', project.project_id, '--title', 'CLI Board', '--json']); assert.equal(created.status, 0, created.stderr); const createdData = JSON.parse(created.stdout).data; const requestFile = path.join(caseRoot, 'board.json'); fs.writeFileSync(requestFile, JSON.stringify({ title: 'CLI Board saved', blocks: [{ type: 'text', text: 'CLI text' }, { type: 'material_reference', resource_id: resource.resource_id, version_policy: 'pinned_version' }] }));
+  const saved = cli(stateDir, ['board', 'save', createdData.board_id, '--project', project.project_id, '--base-revision', String(createdData.revision), '--request-file', requestFile, '--json']); assert.equal(saved.status, 0, saved.stderr); const savedData = JSON.parse(saved.stdout).data; assert.equal(savedData.board_id, createdData.board_id); assert.equal(savedData.revision, createdData.revision + 1);
+  const stale = cli(stateDir, ['board', 'save', createdData.board_id, '--project', project.project_id, '--base-revision', String(createdData.revision), '--request-file', requestFile, '--json']); assert.notEqual(stale.status, 0); assert.equal(JSON.parse(stale.stdout).error.code, 'ATLAS_STATE_CONFLICT');
+  const shown = cli(stateDir, ['board', 'show', savedData.board_id, '--project', project.project_id, '--json']); assert.equal(shown.status, 0, shown.stderr); const shownData = JSON.parse(shown.stdout).data; assert.equal(shownData.board_id, savedData.board_id); assert.equal(shownData.revision, savedData.revision);
+  const exported = cli(stateDir, ['board', 'export', savedData.board_id, '--project', project.project_id, '--base-revision', String(savedData.revision), '--target', 'Results/cli-board.html', '--request-key', 'v19-04-cli-export', '--tool', 'test', '--client-run-id', 'v19-04-cli-export', '--json']); assert.equal(exported.status, 0, exported.stderr); const exportData = JSON.parse(exported.stdout).data; assert.equal(exportData.board_id, savedData.board_id); assert.equal(exportData.status, 'prepared'); assert.ok(exportData.save_id); assert.equal(Object.hasOwn(exportData, 'candidate'), false); assert.ok(exported.stdout.length < 100_000, 'Board export receipt must not inline the portable document');
 });
 
 test('CLI resource relationships submit persists a structured Host batch', () => {
@@ -456,8 +514,9 @@ test('Agent JSON protocol exposes version, capabilities, doctor, and structured 
       assert.deepEqual(envelope.data.product_entrypoints.current_product.commands, [
         'ui', 'ui install', 'ui doctor', 'ui remove',
         'save prepare', 'save show', 'save execute', 'save undo', 'save redo',
-        'table-work start', 'table-work show', 'table-work add-source', 'table-work remove-source',
+        'table-work start', 'table-work show', 'table-work reuse', 'table-work reconcile', 'table-work reconcile-batch', 'table-work add-source', 'table-work remove-source',
         'table-work prepare', 'table-work sheet', 'table-work align', 'table-work recipe', 'table-work preview', 'table-work save', 'table-work list',
+        'board list', 'board create', 'board show', 'board save', 'board export',
         'view list', 'view evaluate', 'view files', 'view properties', 'view candidates submit', 'view candidates show', 'view save',
         'content localize-conversation',
         'resource show',

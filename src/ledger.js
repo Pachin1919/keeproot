@@ -15,6 +15,7 @@ import { EvolutionRepository } from './storage/repositories/evolution-repository
 import { ResourceRepository } from './storage/repositories/resource-repository.js';
 import { WorkSessionRepository } from './storage/repositories/work-session-repository.js';
 import { ProjectViewRepository } from './storage/repositories/project-view-repository.js';
+import { BoardRepository } from './storage/repositories/board-repository.js';
 import {
   LEGACY_TASK_REMOVAL_SCHEMA_VERSION,
   removeLegacyTaskStorage,
@@ -149,6 +150,7 @@ export class Ledger {
       this.resources = new ResourceRepository({ db: this.db, transaction: (callback) => this.transaction(callback) });
       this.workSessions = new WorkSessionRepository({ db: this.db, transaction: (callback) => this.transaction(callback) });
       this.projectViews = new ProjectViewRepository({ db: this.db, transaction: (callback) => this.transaction(callback) });
+      this.boards = new BoardRepository({ db: this.db, transaction: (callback) => this.transaction(callback) });
     } catch (error) {
       this.db.close();
       throw error;

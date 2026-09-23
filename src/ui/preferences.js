@@ -1,8 +1,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { DEFAULT_UI_LOCALE, normalizeUiLocale } from './i18n.js';
 
 export const UI_PREFERENCE_DEFAULTS = Object.freeze({
+  locale: DEFAULT_UI_LOCALE,
   theme: 'slate',
   accent: 'green',
   contrast: 'high',
@@ -34,6 +36,7 @@ export function normalizeUiPreferences(input = {}) {
   const defaults = UI_PREFERENCE_DEFAULTS;
   const accent = input.accent === 'blue' ? 'vermilion' : input.accent;
   return {
+    locale: normalizeUiLocale(input.locale),
     theme: ALLOWED.theme.has(input.theme) ? input.theme : defaults.theme,
     accent: ALLOWED.accent.has(accent) ? accent : defaults.accent,
     contrast: ALLOWED.contrast.has(input.contrast) ? input.contrast : defaults.contrast,
@@ -83,6 +86,7 @@ export function preferenceHtmlAttributes(preferences) {
   const value = normalizeUiPreferences(preferences);
   const contextDelay = { fast: 250, normal: 650, deliberate: 1200 }[value.context_card_delay];
   return [
+    `data-locale="${value.locale}"`,
     `data-theme="${value.theme}"`,
     `data-accent="${value.accent}"`,
     `data-contrast="${value.contrast}"`,

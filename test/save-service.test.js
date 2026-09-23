@@ -265,9 +265,10 @@ test('Save Service finalizes an executed Intake receipt from a stale reservation
 
 test('Save Service restores visible Undo facts when rollback is protectively rejected', (t) => {
   const root = temporary(t); const stateDir = path.join(root, 'state'); const candidate = path.join(root, 'candidate.md'); fs.writeFileSync(candidate, 'candidate\n');
+  const target = path.join(root, 'Projects/One/result.md'); fs.mkdirSync(path.dirname(target), { recursive: true });
   const intake = {
     prepare: (options) => ({ status: 'prepared', run_id: options.runId, target: 'Projects/One/result.md', project: { id: 'PRJ-1', name: 'One', path: 'Projects/One' } }),
-    execute: () => ({ verified: true, rollback_ready: true, after_sha256: 'c'.repeat(64) }),
+    execute: () => { fs.copyFileSync(candidate, target); return { verified: true, rollback_ready: true, after_sha256: createHash('sha256').update(fs.readFileSync(target)).digest('hex') }; },
     rollback: () => { throw new Error('target changed externally'); }, dispose() {},
   };
   const save = createSaveService({ stateDir, intake });
@@ -282,9 +283,10 @@ test('Save Service restores visible Undo facts when rollback is protectively rej
 
 test('a late execute receipt cannot revive an undone Save', (t) => {
   const root = temporary(t); const stateDir = path.join(root, 'state'); const candidate = path.join(root, 'candidate.md'); fs.writeFileSync(candidate, 'candidate\n');
+  const target = path.join(root, 'Projects/One/result.md'); fs.mkdirSync(path.dirname(target), { recursive: true });
   const prepare = (options) => ({ status: 'prepared', run_id: options.runId, target: 'Projects/One/result.md', project: { id: 'PRJ-1', name: 'One', path: 'Projects/One' } });
   const receipt = { verified: true, rollback_ready: true, after_sha256: 'd'.repeat(64) };
-  const intakeB = { prepare, execute: () => receipt, rollback: () => ({ status: 'rolled_back' }), dispose() {} };
+  const intakeB = { prepare, execute: () => { fs.copyFileSync(candidate, target); return receipt; }, rollback: () => ({ status: 'rolled_back' }), dispose() {} };
   const serviceB = createSaveService({ stateDir, intake: intakeB });
   let saveId;
   const intakeA = { prepare, execute: () => { serviceB.execute(saveId); serviceB.undo(saveId); return receipt; }, rollback: () => ({ status: 'rolled_back' }), dispose() {} };

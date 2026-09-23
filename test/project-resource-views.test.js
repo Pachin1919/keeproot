@@ -112,6 +112,13 @@ test('Resource property batch keeps a recoverable resource checkbox focus candid
   assert.match(client, /nextElementSibling|previousElementSibling/u);
 });
 
+test('Focused Project Resource scroll stays inside the file list', () => {
+  const client = fs.readFileSync(path.resolve('src', 'ui', 'client.js'), 'utf8');
+  assert.match(client, /closest\('\.workspace-resource-list-scroll'\)/u);
+  assert.match(client, /scrollContainer\.scrollTop/u);
+  assert.doesNotMatch(client, /focusedRow\.scrollIntoView/u);
+});
+
 test('Undoing a first property assignment removes the value record', (t) => {
   const f = fixture(t); const resource = f.service.listProjectFiles({ projectId: f.a.project_id, scope: { path: 'Data' }, limit: 1 }).members[0]; const property = f.service.defineProperty({ projectId: f.a.project_id, name: 'First value', kind: 'text' }); const batch = f.service.applyPropertyBatch({ projectId: f.a.project_id, resourceIds: [resource.resource_id], propertyId: property.property_id, value: 'temporary' }); assert.equal(f.service.undoPropertyBatch(batch.batch_id).status, 'undone'); const row = f.registry.ledger.db.prepare('SELECT property_id, resource_id FROM resource_property_values WHERE property_id=? AND resource_id=?').get(property.property_id, resource.resource_id); assert.equal(row, undefined);
 });
@@ -271,10 +278,53 @@ test('Partial Resource View receipts show counts with a folded finite issue samp
   assert.doesNotMatch(html, /folder-11/u); assert.doesNotMatch(html, /failed-7/u);
 });
 
+test('Resources keeps Project Home and concise resource context ahead of folded details', () => {
+  const html = renderProjectResourcesView({
+    mode: 'list', project: { id: 'P-1', name: 'Project' }, base: '/projects/P-1', selected_folder_path: 'Data', tree: { folders: [], files: [] }, work_selection: { count: 0, review_href: '#' }, boards: [],
+    focused_resource: { resource_id: 'RES-1', name: 'input.csv', type: 'CSV', relative_path: 'Data/input.csv', state: 'unchanged', related_work: [{ session_id: 'DWT-1', href: '/work/DWT-1', recipe_label: 'Recipe 1' }], board_references: [] },
+    resource_view: { mode: 'files', saved_views: [], active_view: null, temporary_config: { scope: { path: 'Data', extensions: [] }, filters: [], sort: [] }, members: [], property_definitions: [] },
+  }, { csrfToken: 'csrf' });
+  assert.match(html, /href="\/projects\/P-1">Project Home<\/a>/u); assert.match(html, /<details class="resource-view-settings"><summary>View settings/u); assert.match(html, /No files selected for Work/u); assert.match(html, /<h2>input\.csv<\/h2>[\s\S]*?Current/u); assert.match(html, /Work with data/u); assert.match(html, /Related Work/u); assert.match(html, /Referenced by Boards/u); assert.match(html, /<details class="workspace-focus-details"><summary>Project and file details/u);
+});
+
 test('Files view gives a current scope summary and a directory-selection guide', async (t) => {
   const f = fixture(t); const control = createResourceControl({ stateDir: f.stateDir, ledger: f.registry.ledger }); const server = await startAtlasUiServer({ stateDir: f.stateDir, registry: f.registry, rules: {}, runtime: {}, projectRoot: f.root, installationRoot: f.root, resourceControl: control });
   t.after(async () => { await server.close(); control.dispose(); }); const html = await (await fetch(`${server.workspace_url}projects/${f.a.project_id}/resources?mode=files&scope_path=Data`)).text();
   assert.match(html, /Current scope/u); assert.match(html, /Choose a folder|Select a folder|directory/u); assert.match(html, /Data/u);
+});
+
+test('Resources retains compact directory links when the full folder tree is hidden', () => {
+  const html = renderProjectResourcesView({
+    mode: 'explorer', project: { id: 'P-1', name: 'Project' }, base: '/projects/P-1', selected_folder_path: '', selected_folder_loaded: true,
+    tree: { files: [], folders: [{ name: 'Results', relative_path: 'Results', files: [], folders: [{ name: 'Archive', relative_path: 'Results/Archive', files: [], folders: [] }] }] },
+    work_selection: { count: 0, review_href: '#' }, boards: [], resource_view: { mode: 'files', saved_views: [], active_view: null, temporary_config: { scope: { path: '', extensions: [] }, filters: [], sort: [] }, members: [], property_definitions: [] },
+  }, { csrfToken: 'csrf' });
+  assert.match(html, /workspace-compact-folder-nav/u);
+  assert.match(html, /href="\/projects\/P-1\/resources\?folder="[^>]*>Project root/u);
+  assert.match(html, /href="\/projects\/P-1\/resources\?folder=Results"[^>]*>Results/u);
+  assert.match(html, /href="\/projects\/P-1\/resources\?folder=Results%2FArchive"[^>]*>Results \/ Archive/u);
+});
+
+test('Related Work keeps one status and folds its recipe and result metadata', () => {
+  const html = renderProjectResourcesView({
+    mode: 'explorer', project: { id: 'P-1', name: 'Project' }, base: '/projects/P-1', selected_folder_path: '', selected_folder_loaded: true,
+    tree: { files: [], folders: [] }, work_selection: { count: 0, review_href: '#' }, boards: [],
+    focused_resource: { name: 'input.csv', type: 'CSV', relative_path: 'input.csv', state: 'unchanged', related_work: [{ intent: 'Prepare report', freshness_label: 'Fresh', recipe_label: 'Recipe v2', result_label: 'report.csv · Fresh', revision: 4, updated_at: '2026-09-22T00:00:00.000Z', session_id: 'DWT-1', href: '/work/DWT-1', reuse_action: '/work/DWT-1/reuse' }], board_references: [] },
+    resource_view: { mode: 'files', saved_views: [], active_view: null, temporary_config: { scope: { path: '', extensions: [] }, filters: [], sort: [] }, members: [], property_definitions: [] },
+  }, { csrfToken: 'csrf', locale: 'zh-CN' });
+  assert.match(html, /相关工作/u); assert.match(html, /状态: 当前/u); assert.match(html, /打开/u); assert.match(html, /复用/u);
+  assert.match(html, /<details><summary>工作详情<\/summary>[\s\S]*?Recipe v2/u);
+  assert.doesNotMatch(html, /Freshness:/u);
+});
+
+test('Related Work keeps an abnormal saved Result visible before folded metadata', () => {
+  const html = renderProjectResourcesView({
+    mode: 'explorer', project: { id: 'P-1', name: 'Project' }, base: '/projects/P-1', selected_folder_path: '', selected_folder_loaded: true,
+    tree: { files: [], folders: [] }, work_selection: { count: 0, review_href: '#' }, boards: [],
+    focused_resource: { name: 'input.csv', type: 'CSV', relative_path: 'input.csv', state: 'unchanged', related_work: [{ intent: 'Prepare report', freshness_label: 'Fresh', result_freshness: 'Result missing', recipe_label: 'Recipe v2', result_label: 'report.csv', revision: 4, session_id: 'DWT-1', href: '/work/DWT-1' }], board_references: [] },
+    resource_view: { mode: 'files', saved_views: [], active_view: null, temporary_config: { scope: { path: '', extensions: [] }, filters: [], sort: [] }, members: [], property_definitions: [] },
+  }, { csrfToken: 'csrf', locale: 'zh-CN' });
+  assert.match(html, /状态: 结果缺失[\s\S]*?<details><summary>工作详情<\/summary>[\s\S]*?report\.csv/u);
 });
 
 test('Temporary Resource View property actions retain scope, extension, and filter in return_to', async (t) => {

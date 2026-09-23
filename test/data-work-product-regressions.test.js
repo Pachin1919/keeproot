@@ -20,7 +20,7 @@ import { readRecentWorkState, removeRecentWork, upsertRecentWork } from '../src/
 import {
   beginCurrentActivity, failCurrentActivity, finishCurrentActivity, readCurrentActivityState,
 } from '../src/ui/current-activity.js';
-import { createSavedWorkService, readSavedWorkState } from '../src/ui/services/saved-work-service.js';
+import { createSavedWorkService, readSavedWorkState, savedResultFreshness, sourceVersionPolicy } from '../src/ui/services/saved-work-service.js';
 import { createDataWorkService } from '../src/ui/services/data-work-service.js';
 import { createProjectImportService, saveProjectImport } from '../src/ui/services/project-import-service.js';
 import { createSaveService } from '../src/save-service.js';
@@ -388,10 +388,10 @@ test('V18-04 source cards keep headings, facts, and field tables in explicit res
       recipe: { version: 1, combine: { operation: 'concatenate' }, steps: [{ operation: 'validate' }] },
     },
   }, {});
-  assert.match(html, /class="surface work-source-card"/u);
-  assert.match(html, /class="work-source-card-header"/u);
-  assert.match(html, /3 rows · 1 fields · 0 empty cells · 0 duplicate rows/u);
-  assert.match(html, /<details class="work-profile-details"><summary>Inspect fields and data quality/u);
+  assert.match(html, /class="surface work-source-card(?: work-source-card-compact)?"/u);
+  assert.match(html, /class="work-source-compact-line"><strong>orders-a\.csv<\/strong>/u);
+  assert.match(html, /3 rows · 1 fields · 0 empty · 0 duplicates/u);
+  assert.match(html, /<details class="work-profile-details"><summary>Source details/u);
   assert.match(html, /class="work-source-profile">[\s\S]*?class="facts"[\s\S]*?class="data-work-table-wrap"/u);
   assert.match(html, /\.work-source-profile \{[^}]*grid-template-columns: minmax\(210px, \.38fr\) minmax\(0, 1fr\)/u);
   assert.match(html, /@media \(max-width: 820px\) \{[\s\S]*?\.work-source-card-header, \.work-source-profile \{ grid-template-columns: 1fr; \}/u);
@@ -412,7 +412,7 @@ test('workbench typography uses shared control metrics and collapses inactive hi
   assert.match(css, /\.data-work-page \[data-project-folder-form\] \{[^}]*display: grid;[^}]*gap: 16px/u);
   assert.match(css, /\.data-work-page \[data-project-folders\]\[hidden\] \{ display: none; \}/u);
   assert.match(css, /\.project-home-secondary-target > span:first-child \{ display: grid; gap: 4px/u);
-  assert.match(css, /\.topbar-project-link strong \{[^}]*text-overflow: ellipsis/u);
+  assert.match(css, /\.topbar-project-link strong \{[^}]*overflow-wrap: anywhere;[^}]*white-space: normal/u);
   assert.match(css, /\.topbar-project-link \{[^}]*min-width: 0/u);
 });
 
@@ -612,6 +612,245 @@ test('V18-04 Step 3 Host starts distinct Works and binds mutation revisions', (t
   assert.deepEqual(current.sources.map((item) => item.resource_id), firstSnapshot.sources);
 });
 
+test('V19-01 service reuses a Work snapshot without mutating the source', (t) => {
+  const f = explicitWorkFixture(t);
+  const caller = { actor: 'agent', agent: 'Codex', model: 'gpt-5', tool: 'test', client_run_id: 'v19-01-service' };
+  let source = f.service.createProjectSession(f.project, {}, [], { intent: 'Normalize campaign data', caller });
+  source = f.service.addSource(source.session_id, f.first.resource_id, { baseRevision: source.revision });
+  const sourcePath = path.join(f.root, 'workspace', 'Project One', 'Data', 'first.csv');
+  const fingerprint = contentFileFingerprint(sourcePath);
+  f.registry.ledger.workSessions.updateSource(source.session_id, source.sources[0].source_key, {
+    fingerprint,
+    profile: { profile: { fields: [{ name: 'name', inferred_type: 'text' }] } },
+    processorVersion: 'test', status: 'ready',
+  }, new Date().toISOString());
+  source = f.service.confirmMapping(source.session_id, [{ source_key: source.sources[0].source_key, column: 'name', canonical: 'name' }], { baseRevision: source.revision });
+  source = f.service.updateRecipe(source.session_id, { combine: 'concatenate', steps: [{ operation: 'validate' }, { operation: 'select', columns: ['name'] }] }, { baseRevision: source.revision });
+  f.registry.ledger.workSessions.setPreview(source.session_id, { marker: 'source-preview' }, source.revision, new Date().toISOString());
+  f.registry.ledger.workSessions.setLatestSave(source.session_id, 'SAV-source', new Date().toISOString());
+  const before = f.registry.ledger.workSessions.byId(source.session_id);
+
+  const reused = f.service.reuseProjectSession(source.session_id, {
+    baseRevision: before.revision, intent: 'Reuse for campaign review', caller,
+  });
+  assert.notEqual(reused.session_id, source.session_id);
+  assert.equal(reused.project_id, before.project_id);
+  assert.equal(reused.reused_from_session_id, source.session_id);
+  assert.equal(reused.revision, 1);
+  assert.equal(reused.preview, null);
+  assert.equal(reused.preview_revision, null);
+  assert.equal(reused.latest_save_id, null);
+  assert.deepEqual(reused.sources.map(({ source_key, ordinal, resource_id, sheet, fingerprint, profile, profile_processor_version, status, error_message }) => ({ source_key, ordinal, resource_id, sheet, fingerprint, profile, profile_processor_version, status, error_message })), before.sources.map(({ source_key, ordinal, resource_id, sheet, fingerprint, profile, profile_processor_version, status, error_message }) => ({ source_key, ordinal, resource_id, sheet, fingerprint, profile, profile_processor_version, status, error_message })));
+  assert.deepEqual(reused.mapping, before.mapping);
+  assert.deepEqual(reused.recipe, before.recipe);
+  assert.deepEqual(f.registry.ledger.workSessions.byId(source.session_id), before);
+
+  assert.throws(() => f.service.reuseProjectSession(source.session_id, {
+    baseRevision: before.revision - 1, intent: 'stale reuse', caller,
+  }), (error) => error?.code === 'ATLAS_STATE_CONFLICT');
+  assert.equal(f.registry.ledger.workSessions.listForProject(f.project.id).total, 2);
+});
+
+test('V19-01 Host reuse creates a distinct Work and rejects stale base revision', (t) => {
+  const f = explicitWorkFixture(t);
+  let source = f.service.createProjectSession(f.project);
+  source = f.service.addSource(source.session_id, f.first.resource_id, { baseRevision: source.revision });
+  const before = f.registry.ledger.workSessions.byId(source.session_id);
+  const runHost = (args) => spawnSync(process.execPath, [path.resolve('bin', 'atlas.js'), ...args, '--json'], {
+    cwd: path.resolve('.'), encoding: 'utf8', windowsHide: true,
+    env: { ...process.env, ATLAS_STATE_DIR: f.stateDir },
+  });
+  const baseArgs = ['table-work', 'reuse', source.session_id, '--base-revision', String(before.revision), '--tool', 'test', '--client-run-id', 'v19-01-host', '--intent', 'Reuse from Host'];
+  const reused = runHost(baseArgs);
+  assert.equal(reused.status, 0, reused.stderr || reused.stdout);
+  const envelope = JSON.parse(reused.stdout);
+  assert.equal(envelope.ok, true);
+  assert.notEqual(envelope.data.session_id, source.session_id);
+  assert.equal(envelope.data.reused_from_session_id, source.session_id);
+  assert.equal(envelope.data.revision, 1);
+  assert.equal(f.registry.ledger.workSessions.listForProject(f.project.id).total, 2);
+
+  const stale = runHost(['table-work', 'reuse', source.session_id, '--base-revision', String(before.revision - 1), '--tool', 'test', '--client-run-id', 'v19-01-host-stale']);
+  assert.notEqual(stale.status, 0);
+  assert.equal(JSON.parse(stale.stdout).error?.code, 'ATLAS_STATE_CONFLICT');
+  assert.equal(f.registry.ledger.workSessions.listForProject(f.project.id).total, 2);
+});
+
+test('V19-01 UI keeps Work identity and Reuse shared across Work, Resources, and Project Home', async (t) => {
+  const f = explicitWorkFixture(t);
+  let source = f.service.createProjectSession(f.project, {}, [], { intent: 'Review source freshness' });
+  source = f.service.addSource(source.session_id, f.first.resource_id, { baseRevision: source.revision });
+  const sourcePath = path.join(f.root, 'workspace', 'Project One', 'Data', 'first.csv');
+  f.registry.ledger.workSessions.updateSource(source.session_id, source.sources[0].source_key, {
+    fingerprint: contentFileFingerprint(sourcePath),
+    profile: { profile: { fields: [{ name: 'name', inferred_type: 'text' }] } },
+    processorVersion: 'test', status: 'ready',
+  }, new Date().toISOString());
+  source = f.service.confirmMapping(source.session_id, [{ source_key: source.sources[0].source_key, column: 'name', canonical: 'name' }], { baseRevision: source.revision });
+  source = f.service.updateRecipe(source.session_id, { combine: 'concatenate' }, { baseRevision: source.revision });
+  const before = structuredClone(f.registry.ledger.workSessions.byId(source.session_id));
+  const server = await startAtlasUiServer({ stateDir: f.stateDir, registry: f.registry, resourceControl: f.control, projectRoot: f.root, installationRoot: f.root, rules: {}, runtime: {} });
+  t.after(async () => { await server.close(); });
+  const workUrl = `${server.workspace_url}work/${source.session_id}`;
+  const workHtml = await (await fetch(workUrl)).text();
+  const csrf = workHtml.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1];
+  assert.ok(csrf);
+  assert.match(workHtml, new RegExp(source.session_id, 'u'));
+  assert.match(workHtml, new RegExp(`revision[^<]*${source.revision}|value="${source.revision}"`, 'iu'));
+  assert.match(workHtml, /Recipe|Freshness/u);
+  assert.match(workHtml, new RegExp(`/work/${source.session_id}/reuse`, 'u'));
+
+  const reusedResponse = await fetch(`${workUrl}/reuse`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'manual',
+    body: new URLSearchParams({ csrf, base_revision: String(source.revision) }),
+  });
+  assert.equal(reusedResponse.status, 303);
+  const reusedId = new URL(reusedResponse.headers.get('location'), server.workspace_url).pathname.split('/').at(-1);
+  assert.notEqual(reusedId, source.session_id);
+  const reused = f.registry.ledger.workSessions.byId(reusedId);
+  assert.equal(reused.reused_from_session_id, source.session_id);
+  assert.equal(reused.revision, 1);
+  assert.deepEqual(f.registry.ledger.workSessions.byId(source.session_id), before);
+
+  const resourceHtml = await (await fetch(`${server.workspace_url}projects/${f.project.id}/resources?resource_id=${f.first.resource_id}`)).text();
+  assert.match(resourceHtml, /Related Work/u);
+  assert.match(resourceHtml, /Review source freshness/u);
+  assert.match(resourceHtml, new RegExp(`<dt>Revision</dt><dd>${source.revision}</dd>`, 'u'));
+  assert.match(resourceHtml, /Recipe|Freshness/u);
+  assert.match(resourceHtml, new RegExp(`/work/${source.session_id}/reuse`, 'u'));
+  const homeHtml = await (await fetch(`${server.workspace_url}projects/${f.project.id}`)).text();
+  assert.match(homeHtml, new RegExp(source.session_id, 'u'));
+  assert.match(homeHtml, new RegExp(`name="base_revision" value="${source.revision}"`, 'u'));
+  assert.match(homeHtml, /Recipe|Freshness/u);
+  assert.match(homeHtml, new RegExp(`/work/${source.session_id}/reuse`, 'u'));
+
+  const stale = await fetch(`${workUrl}/reuse`, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'manual',
+    body: new URLSearchParams({ csrf, base_revision: String(source.revision - 1) }),
+  });
+  assert.equal(stale.status, 303);
+  assert.equal(new URL(stale.headers.get('location'), server.workspace_url).pathname, `/work/${source.session_id}`);
+  assert.equal(f.registry.ledger.workSessions.listForProject(f.project.id).total, 2);
+  const staleHtml = await (await fetch(workUrl)).text();
+  assert.match(staleHtml, /No action was performed|changed|revision/u);
+});
+
+test('V19-02 changed Source requires explicit reconciliation before prepare adopts current facts', async (t) => {
+  const f = explicitWorkFixture(t);
+  let session = f.service.createProjectSession(f.project);
+  session = f.service.addSource(session.session_id, f.first.resource_id, { baseRevision: session.revision });
+  const sourcePath = path.join(f.root, 'workspace', 'Project One', 'Data', 'first.csv');
+  f.registry.ledger.workSessions.updateSource(session.session_id, session.sources[0].source_key, {
+    fingerprint: contentFileFingerprint(sourcePath), profile: { profile: { fields: [{ name: 'name', inferred_type: 'text' }] } }, processorVersion: 'test', status: 'ready',
+  }, new Date().toISOString());
+  session = f.service.confirmMapping(session.session_id, [{ source_key: session.sources[0].source_key, column: 'name', canonical: 'name' }], { baseRevision: session.revision });
+  session = f.service.updateRecipe(session.session_id, { combine: 'concatenate' }, { baseRevision: session.revision });
+  f.registry.ledger.workSessions.setLatestSave(session.session_id, 'SAVE-before-reconcile', new Date().toISOString());
+  fs.appendFileSync(sourcePath, 'Two,2\n');
+  const checked = await f.service.validateSources(session.session_id);
+  assert.equal(checked.sources[0].status, 'changed');
+  assert.ok(checked.sources[0].reconciliation);
+  await assert.rejects(f.service.prepareSources(session.session_id, { baseRevision: checked.revision }), /reconcile|changed|decision|current/u);
+});
+
+test('V19-02 pin-recorded is revision-bound, preserves Work semantics, and is copied by reuse', async (t) => {
+  const f = explicitWorkFixture(t); let session = f.service.createProjectSession(f.project); session = f.service.addSource(session.session_id, f.first.resource_id, { baseRevision: session.revision });
+  const sourcePath = path.join(f.root, 'workspace', 'Project One', 'Data', 'first.csv'); const sourceKey = session.sources[0].source_key;
+  f.registry.ledger.workSessions.updateSource(session.session_id, sourceKey, { fingerprint: contentFileFingerprint(sourcePath), profile: { profile: { fields: [{ name: 'name', inferred_type: 'text' }] } }, processorVersion: 'test', status: 'ready' }, new Date().toISOString());
+  session = f.service.confirmMapping(session.session_id, [{ source_key: sourceKey, column: 'name', canonical: 'name' }], { baseRevision: session.revision }); session = f.service.updateRecipe(session.session_id, { combine: 'concatenate' }, { baseRevision: session.revision }); f.registry.ledger.workSessions.setLatestSave(session.session_id, 'SAVE-pin', new Date().toISOString());
+  const recordedRevision = session.revision; const recordedMapping = structuredClone(session.mapping); const recordedRecipe = structuredClone(session.recipe); fs.appendFileSync(sourcePath, 'Two,2\n'); const checked = await f.service.validateSources(session.session_id);
+  const pinned = await f.service.reconcileSource(session.session_id, sourceKey, 'pin-recorded', { baseRevision: checked.revision });
+  assert.equal(pinned.sources[0].version_policy, 'pinned_version'); assert.equal(pinned.revision, checked.revision + 1); assert.deepEqual(pinned.mapping, recordedMapping); assert.deepEqual(pinned.recipe, recordedRecipe); assert.equal(pinned.latest_save_id, 'SAVE-pin'); assert.match(pinned.freshness.label, /pinned/i);
+  await assert.rejects(f.service.reconcileSource(session.session_id, sourceKey, 'pin-recorded', { baseRevision: recordedRevision }), (error) => error?.code === 'ATLAS_STATE_CONFLICT');
+  const reused = f.service.reuseProjectSession(session.session_id, { baseRevision: pinned.revision, intent: 'reuse pinned', caller: { actor: 'agent', tool: 'test', client_run_id: 'v19-02-reuse' } }); assert.equal(reused.sources[0].version_policy, 'pinned_version');
+});
+
+test('V19-02 use-current adopts a compatible current Source and rebinds its mapping basis', async (t) => {
+  const f = explicitWorkFixture(t); const service = createDataWorkService({ stateDir: f.stateDir, projectRoot: f.root, installationRoot: f.root, resourceControl: f.control, fingerprintFn: async (filePath) => contentFileFingerprint(filePath), runDataWorkFn: async () => ({ status: 'ready', profile: { fields: [{ name: 'name', inferred_type: 'text' }] }, processor: { version: 'test' } }) }); let session = service.createProjectSession(f.project); session = service.addSource(session.session_id, f.first.resource_id, { baseRevision: session.revision }); const sourcePath = path.join(f.root, 'workspace', 'Project One', 'Data', 'first.csv'); const sourceKey = session.sources[0].source_key;
+  f.registry.ledger.workSessions.updateSource(session.session_id, sourceKey, { fingerprint: contentFileFingerprint(sourcePath), profile: { profile: { fields: [{ name: 'name', inferred_type: 'text' }] } }, processorVersion: 'test', status: 'ready' }, new Date().toISOString()); session = service.confirmMapping(session.session_id, [{ source_key: sourceKey, column: 'name', canonical: 'name' }], { baseRevision: session.revision }); session = service.updateRecipe(session.session_id, { combine: 'concatenate' }, { baseRevision: session.revision }); const recipe = structuredClone(session.recipe); const resourceId = session.sources[0].resource_id; fs.appendFileSync(sourcePath, 'Two,2\n'); const checked = await service.validateSources(session.session_id);
+  const adopted = await service.reconcileSource(session.session_id, sourceKey, 'use-current', { baseRevision: checked.revision });
+  assert.equal(adopted.sources[0].resource_id, resourceId); assert.equal(adopted.sources[0].status, 'ready'); assert.notEqual(adopted.sources[0].fingerprint.sha256, session.sources[0].fingerprint.sha256); assert.deepEqual(adopted.recipe, recipe);
+  assert.deepEqual(adopted.mapping.map(({ source_sha256: _sourceHash, source_sheet: _sourceSheet, ...item }) => item), [{ source_key: sourceKey, column: 'name', canonical: 'name' }]);
+  assert.ok(adopted.mapping.every((item) => item.source_sha256 === adopted.sources[0].fingerprint.sha256 && item.source_sheet == null)); assert.equal(adopted.mapping_complete, true); assert.equal(adopted.preview, null); assert.equal(adopted.preview_revision, null);
+  await assert.rejects(service.reconcileSource(session.session_id, sourceKey, 'use-current', { baseRevision: checked.revision }), (error) => error?.code === 'ATLAS_STATE_CONFLICT');
+});
+
+test('V19-02 relinked Resource reports moved reconciliation and can use-current', async (t) => {
+  const f = explicitWorkFixture(t); const service = createDataWorkService({ stateDir: f.stateDir, projectRoot: f.root, installationRoot: f.root, resourceControl: f.control, fingerprintFn: async (filePath) => contentFileFingerprint(filePath), runDataWorkFn: async () => ({ status: 'ready', profile: { fields: [{ name: 'name', inferred_type: 'text' }] }, processor: { version: 'test' } }) }); let session = service.createProjectSession(f.project); session = service.addSource(session.session_id, f.first.resource_id, { baseRevision: session.revision }); const sourcePath = path.join(f.root, 'workspace', 'Project One', 'Data', 'first.csv'); const sourceKey = session.sources[0].source_key; const recorded = contentFileFingerprint(sourcePath);
+  f.registry.ledger.workSessions.updateSource(session.session_id, sourceKey, { fingerprint: recorded, profile: { profile: { fields: [{ name: 'name', inferred_type: 'text' }] } }, processorVersion: 'test', status: 'ready' }, new Date().toISOString()); fs.rmSync(sourcePath); const missing = await service.validateSources(session.session_id); assert.equal(missing.sources[0].status, 'missing');
+  const movedPath = write(path.join(f.root, 'workspace', 'Project One', 'Data', 'renamed.csv'), 'name,value\nOne,1\n'); f.control.projectResources(f.project.id, { refresh: true }); f.control.relink({ resourceId: f.first.resource_id, filePath: movedPath, caller: { actor: 'user', tool: 'test', client_run_id: 'v19-02-relink' } }); const moved = await service.validateSources(session.session_id); assert.equal(moved.sources[0].reconciliation.kind, 'moved'); assert.equal(moved.sources[0].reconciliation.recorded.path, sourcePath); assert.equal(moved.sources[0].reconciliation.current.path, movedPath);
+  const adopted = await service.reconcileSource(session.session_id, sourceKey, 'use-current', { baseRevision: moved.revision }); assert.equal(adopted.sources[0].file_path, movedPath); assert.equal(adopted.sources[0].resource_id, f.first.resource_id);
+});
+
+test('V19-02 saved result freshness distinguishes pinned and followed Source policy', (t) => {
+  const root = temporaryDirectory(t); const resultPath = write(path.join(root, 'Results', 'output.csv'), 'name\nresult\n'); const fingerprint = contentFileFingerprint(resultPath);
+  const base = { result_path: resultPath, result_fingerprint: { sha256: fingerprint.sha256 }, output_status: 'verified' };
+  const pinned = savedResultFreshness({ ...base, version_policy: 'pinned_version' }, { sourceFreshness: { status: 'needs_review' } });
+  assert.equal(pinned.label, 'Pinned result'); assert.equal(pinned.status, 'pinned'); assert.equal(pinned.version_policy, 'pinned_version');
+  const followed = savedResultFreshness({ ...base, version_policy: 'follow_latest' }, { sourceFreshness: { status: 'needs_review' } });
+  assert.equal(followed.label, 'Sources need review'); assert.equal(followed.status, 'needs_review'); assert.equal(followed.version_policy, 'follow_latest');
+  assert.equal(sourceVersionPolicy([{ version_policy: 'pinned_version' }, { version_policy: 'follow_latest' }]), 'mixed');
+  const mixed = savedResultFreshness(base, { sourceFreshness: { status: 'fresh' }, versionPolicy: 'mixed' });
+  assert.equal(mixed.label, 'Mixed source policy'); assert.equal(mixed.status, 'fresh'); assert.equal(mixed.version_policy, 'mixed');
+});
+
+test('V19-02 UI exposes Changed Source reconciliation facts, actions, CSRF, and revision binding', async (t) => {
+  const f = explicitWorkFixture(t); let session = f.service.createProjectSession(f.project); session = f.service.addSource(session.session_id, f.first.resource_id, { baseRevision: session.revision }); const sourcePath = path.join(f.root, 'workspace', 'Project One', 'Data', 'first.csv'); const sourceKey = session.sources[0].source_key; f.registry.ledger.workSessions.updateSource(session.session_id, sourceKey, { fingerprint: contentFileFingerprint(sourcePath), profile: { profile: { fields: [{ name: 'name' }] } }, processorVersion: 'test', status: 'ready' }, new Date().toISOString()); fs.appendFileSync(sourcePath, 'Two,2\n'); const checked = await f.service.validateSources(session.session_id);
+  const server = await startAtlasUiServer({ stateDir: f.stateDir, registry: f.registry, resourceControl: f.control, projectRoot: f.root, installationRoot: f.root, rules: {}, runtime: {} }); t.after(async () => { await server.close(); }); const url = `${server.workspace_url}work/${session.session_id}`; const html = await (await fetch(url)).text(); const csrf = html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1]; assert.match(html, /Source changes[\s\S]*Hash identifies a version; it is not a backup copy/iu); assert.match(html, /recorded|current|Changed|Pin|Use current|Stop using|Relink/iu); assert.match(html, new RegExp(`name="base_revision" value="${checked.revision}"`, 'u')); assert.match(html, /action" value="reconcile_sources"/u);
+  const response = await fetch(`${url}/action`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, redirect: 'manual', body: new URLSearchParams({ csrf, action: 'reconcile_sources', source_key: sourceKey, decision: 'pin-recorded', base_revision: String(checked.revision) }) }); assert.equal(response.status, 303);
+  const containedHtml = await (await fetch(url)).text(); assert.match(containedHtml, /Pinned version · Contained/u); assert.match(containedHtml, /current file differs, but this Work keeps its recorded version/u); assert.match(containedHtml, /Recorded[ -￿]*Current/u); assert.doesNotMatch(containedHtml, /Review .*before continuing/u);
+});
+
+test('V19-04 UI creates a Board, adds three Block types by revision, and routes export to Save review', async (t) => {
+  const f = explicitWorkFixture(t); const sourcePath = path.join(f.root, 'workspace', 'Project One', 'Data', 'first.csv'); fs.mkdirSync(path.join(f.root, 'workspace', 'Project One', 'Results'), { recursive: true }); const intake = new Intake({ stateDir: f.stateDir }); const save = createSaveService({ stateDir: f.stateDir, intake, resourceControl: f.control }); t.after(() => intake.dispose());
+  const candidate = write(path.join(f.root, 'board-ui-candidate.csv'), 'name\nresult\n'); const preparedSave = save.prepare({ root: path.join(f.root, 'workspace'), candidateFile: candidate, projectId: f.project.id, target: 'Project One/Results/board-ui-result.csv', inputs: [sourcePath], origin: 'agent_generated', kind: 'intermediate', channel: 'host', requestKey: 'v19-04-ui-result', caller: { actor: 'agent', tool: 'test', client_run_id: 'v19-04-ui-result' }, source: { path: sourcePath, resource_id: f.first.resource_id, sources: [{ path: sourcePath, resource_id: f.first.resource_id }] }, parameters: {}, resultSummary: { rows: 1, columns: 1 }, intent: 'Create Board UI fixture.' }); const result = save.execute(preparedSave.save_id, { reason: 'Board UI fixture.' });
+  const server = await startAtlasUiServer({ stateDir: f.stateDir, registry: f.registry, resourceControl: f.control, intake, projectRoot: f.root, installationRoot: f.root, rules: {}, runtime: {} }); t.after(async () => { await server.close(); }); const base = `${server.workspace_url}projects/${f.project.id}`; let page = await (await fetch(`${base}/boards`)).text(); let csrf = page.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1]; assert.ok(csrf, page.slice(0, 500)); const created = await fetch(`${base}/boards/create`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, title: 'UI Board' }), redirect: 'manual' }); assert.equal(created.status, 303, await created.text()); const boardUrl = new URL(created.headers.get('location'), server.workspace_url).toString();
+  const postBlock = async (values) => { page = await (await fetch(boardUrl)).text(); csrf = page.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1]; const revision = page.match(/name="base_revision" value="(\d+)"/u)?.[1]; const response = await fetch(`${boardUrl}/blocks/add`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, base_revision: revision, ...values }), redirect: 'manual' }); assert.equal(response.status, 303); };
+  await postBlock({ block_type: 'text', text: 'UI text block' }); await postBlock({ block_type: 'material_reference', resource_id: f.first.resource_id, version_policy: 'follow_latest' }); await postBlock({ block_type: 'result_preview', save_id: result.save_id, version_policy: 'pinned_version' }); page = await (await fetch(boardUrl)).text(); assert.match(page, /UI text block/u); assert.match(page, /Material Reference|first\.csv/u); assert.match(page, /Result Preview|board-ui-result\.csv/u); assert.match(page, /BOARD \/ REVISION 4/iu);
+  csrf = page.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1]; const revision = page.match(/name="base_revision" value="(\d+)"/u)?.[1]; const exported = await fetch(`${boardUrl}/export`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, base_revision: revision, folder: 'Results', file_name: 'ui-board.html' }), redirect: 'manual' }); assert.equal(exported.status, 303); assert.match(exported.headers.get('location'), /^\/saves\/SAV-/u);
+});
+
+test('V19-04 Board UI serves image Block content, edits and moves by one revision, and exposes Resource back-links', async (t) => {
+  const f = explicitWorkFixture(t); const sourcePath = path.join(f.root, 'workspace', 'Project One', 'Data', 'first.csv');
+  const imagePath = path.join(f.root, 'workspace', 'Project One', 'Data', 'board-image.png'); fs.writeFileSync(imagePath, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]));
+  const image = f.control.identify({ filePath: imagePath, project: { id: f.project.id } }); fs.mkdirSync(path.join(f.root, 'workspace', 'Project One', 'Results'), { recursive: true }); const intake = new Intake({ stateDir: f.stateDir }); const save = createSaveService({ stateDir: f.stateDir, intake, resourceControl: f.control }); t.after(() => intake.dispose());
+  const candidate = write(path.join(f.root, 'board-ui-candidate.csv'), 'name,value\nresult,1\n'); const preparedSave = save.prepare({ root: path.join(f.root, 'workspace'), candidateFile: candidate, projectId: f.project.id, target: 'Project One/Results/board-ui-result.csv', inputs: [sourcePath], origin: 'agent_generated', kind: 'intermediate', channel: 'host', requestKey: 'v19-04-ui-result-2', caller: { actor: 'agent', tool: 'test', client_run_id: 'v19-04-ui-result-2' }, source: { path: sourcePath, resource_id: f.first.resource_id, sources: [{ path: sourcePath, resource_id: f.first.resource_id }] }, parameters: {}, resultSummary: { rows: 1, columns: 2 }, intent: 'Create Board UI fixture.' }); const result = save.execute(preparedSave.save_id, { reason: 'Board UI fixture.' });
+  const server = await startAtlasUiServer({ stateDir: f.stateDir, registry: f.registry, resourceControl: f.control, intake, projectRoot: f.root, installationRoot: f.root, rules: {}, runtime: {} }); t.after(async () => { await server.close(); }); const base = `${server.workspace_url}projects/${f.project.id}`; let page = await (await fetch(`${base}/boards`)).text(); let csrf = page.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1];
+  const created = await fetch(`${base}/boards/create`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, title: 'UI Readable Board' }), redirect: 'manual' }); assert.equal(created.status, 303); const boardUrl = new URL(created.headers.get('location'), server.workspace_url).toString();
+  const postBlock = async (values) => { page = await (await fetch(boardUrl)).text(); csrf = page.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1]; const revision = page.match(/name="base_revision" value="(\d+)"/u)?.[1]; const response = await fetch(`${boardUrl}/blocks/add`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, base_revision: revision, ...values }), redirect: 'manual' }); assert.equal(response.status, 303); };
+  await postBlock({ block_type: 'text', text: 'UI text block' }); await postBlock({ block_type: 'material_reference', resource_id: f.first.resource_id, version_policy: 'follow_latest' }); await postBlock({ block_type: 'result_preview', save_id: result.save_id, version_policy: 'pinned_version' }); await postBlock({ block_type: 'material_reference', resource_id: image.resource_id, version_policy: 'pinned_version' });
+  page = await (await fetch(boardUrl)).text(); assert.match(page, /UI text block/u); assert.match(page, /<table[\s>][\s\S]*name[\s\S]*result/u); assert.match(page, /Edit text/u); assert.match(page, /Move up/u); assert.match(page, /Move down/u); assert.match(page, /BOARD \/ REVISION 5/iu);
+  const blockIds = [...new Set([...page.matchAll(/name="block_id" value="([^"]+)"/gu)].map((match) => match[1]))]; assert.equal(blockIds.length, 4); const textBlockId = blockIds[0];
+  csrf = page.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1]; let revision = Number(page.match(/BOARD \/ REVISION (\d+)/iu)?.[1]);
+  const edited = await fetch(`${boardUrl}/blocks/update`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, base_revision: String(revision), block_id: textBlockId, action: 'edit-text', text: 'Edited UI text' }), redirect: 'manual' }); assert.equal(edited.status, 303); page = await (await fetch(boardUrl)).text(); assert.match(page, /Edited UI text/u); assert.match(page, new RegExp(`BOARD \/ REVISION ${revision + 1}`, 'iu')); revision += 1;
+  csrf = page.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1]; const moved = await fetch(`${boardUrl}/blocks/update`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, base_revision: String(revision), block_id: textBlockId, action: 'move-down' }), redirect: 'manual' }); assert.equal(moved.status, 303); page = await (await fetch(boardUrl)).text(); assert.match(page, new RegExp(`BOARD \/ REVISION ${revision + 1}`, 'iu')); assert.match(page, new RegExp(`name="block_id" value="${textBlockId}"`, 'u'));
+  const imageBlockId = page.match(/<img src="\/projects\/[^/]+\/boards\/[^/]+\/blocks\/([^/]+)\/content"/u)?.[1]; assert.ok(imageBlockId, page.match(/<img[^>]+/u)?.[0]); const content = await fetch(`${boardUrl}/blocks/${imageBlockId}/content`); assert.equal(content.status, 200); assert.match(content.headers.get('content-type') ?? '', /^image\/png/u); assert.deepEqual(Buffer.from(await content.arrayBuffer()), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3])); const badContent = await fetch(`${boardUrl}/blocks/not-a-real-block/content`); assert.notEqual(badContent.status, 200); assert.doesNotMatch(badContent.headers.get('content-type') ?? '', /^image\/png/u);
+  const resourceHtml = await (await fetch(`${base}/resources?resource_id=${image.resource_id}`)).text(); assert.match(resourceHtml, /Referenced by Boards/u); assert.match(resourceHtml, /UI Readable Board/u); assert.match(resourceHtml, /Add this Resource to a Board/u);
+});
+
+test('R3 Data Work saved view exposes Board add form with exact identity and revision', () => {
+  const html = renderDataWorkView({ mode: 'saved', csrf: 'csrf-r3-board', session: { session_id: 'DWT-r3-board', sources: [{ path: 'source.csv' }] }, record: { save_id: 'SAV-r3-board', project: { id: 'PRJ-r3-board', name: 'R3 Board Project' }, result_path: 'Results/result.csv', result_summary: { rows: 1, columns: 2 }, output_status: 'verified', sources: [{ path: 'source.csv' }], recipe: { version: 2 }, result_freshness: { version_policy: 'pinned_version', label: 'Pinned result', reason: 'Verified.' } }, boards: [{ board_id: 'BRD-r3-board', title: 'Research Board', revision: 7 }] });
+  assert.match(html, /Add to a Board/u); assert.match(html, /board_id|BRD-r3-board/u); assert.match(html, /name="base_revision" value="7"/u); assert.match(html, /name="save_id" value="SAV-r3-board"/u);
+});
+
+test('V19-03 Resource model exposes bounded Changed Source to Work to Result impact lanes', (t) => {
+  const root = temporaryDirectory(t); const sourcePath = write(path.join(root, 'Data', 'source.csv'), 'name\nchanged\n'); const resultPath = write(path.join(root, 'Results', 'result.csv'), 'name\nresult\n');
+  const recorded = contentFileFingerprint(sourcePath); const resultFingerprint = contentFileFingerprint(resultPath); const project = { id: 'project-v19-03', name: 'V19-03 Project' }; const resourceId = 'RES-v19-03-source';
+  const model = buildProjectResourcesModel({ project, root, base: `/projects/${project.id}`, recentWork: [], savedWork: [{ save_id: 'SAVE-v19-03', work_id: 'SAVE-v19-03', project, project_id: project.id, resource_id: 'RES-v19-03-result', result_path: resultPath, result_fingerprint: resultFingerprint, status: 'executed', version_policy: 'follow_latest', sources: [{ resource_id: resourceId, path: sourcePath, fingerprint: recorded }], recipe: { version: 4 }, created_at: '2026-09-21T00:00:00.000Z', write: { undo_available: true } }, { save_id: 'SAVE-v19-03-pinned', work_id: 'SAVE-v19-03-pinned', project, project_id: project.id, resource_id: 'RES-v19-03-result', result_path: resultPath, result_fingerprint: resultFingerprint, status: 'executed', version_policy: 'pinned_version', sources: [{ resource_id: resourceId, path: sourcePath, fingerprint: recorded }], recipe: { version: 4 }, created_at: '2026-09-21T00:00:01.000Z', write: { undo_available: true } }], resourceFacts: [{ resource_id: resourceId, path: sourcePath, resource: { id: resourceId, display_name: 'source.csv', kind: 'CSV', status: 'active' }, locations: [{ path: sourcePath, status: 'active' }] }], focusedPath: 'Data/source.csv', workSessions: [{ session_id: 'WORK-v19-03', project_id: project.id, revision: 3, recipe: { version: 4 }, freshness: { status: 'needs_review', label: 'Needs review', reason: 'Source changed' }, latest_save_id: 'SAVE-v19-03', sources: [{ resource_id: resourceId, status: 'changed', version_policy: 'follow_latest' }] }, { session_id: 'WORK-v19-03-pinned', project_id: project.id, revision: 2, recipe: { version: 4 }, freshness: { status: 'needs_review', label: 'Needs review', reason: 'Source changed' }, latest_save_id: 'SAVE-v19-03-pinned', sources: [{ resource_id: resourceId, status: 'changed', version_policy: 'pinned_version' }] }] });
+  assert.ok(Array.isArray(model.focused_resource?.impact_lanes), 'Resource model must expose impact lanes');
+  const [lane] = model.focused_resource.impact_lanes; assert.equal(lane.source.resource_id, resourceId); assert.equal(lane.source.change_state, 'changed'); assert.equal(lane.work.session_id, 'WORK-v19-03'); assert.equal(lane.work.revision, 3); assert.equal(lane.results[0].save_id, 'SAVE-v19-03'); assert.equal(lane.impact.status, 'needs_review'); assert.match(lane.impact.reason, /changed/u); assert.match(lane.actions.open_work, /WORK-v19-03/u); assert.match(lane.actions.open_result, /SAVE-v19-03/u);
+  const pinned = model.focused_resource.impact_lanes.find((item) => item.work.session_id === 'WORK-v19-03-pinned'); assert.equal(pinned.impact.status, 'contained'); assert.match(pinned.impact.reason, /pinned/u); assert.equal(pinned.results[0].freshness.status, 'pinned');
+  const html = renderProjectResourcesView(model, { csrfToken: 'csrf-v19-03' }); assert.match(html, /Open Work/u); assert.match(html, /Open Result/u); assert.match(html, /Needs review/u);
+});
+
+test('V19-03 impact lanes prioritize Result damage, match Resource identity, and render freshness labels', (t) => {
+  const root = temporaryDirectory(t); const sourcePath = write(path.join(root, 'Data', 'source.csv'), 'name\ncurrent\n'); const resultPath = write(path.join(root, 'Results', 'result.csv'), 'name\nverified\n'); const recordedSource = { ...contentFileFingerprint(sourcePath), sha256: '0'.repeat(64) }; const recordedResult = contentFileFingerprint(resultPath); fs.appendFileSync(resultPath, 'edited\n');
+  const project = { id: 'project-v19-03-boundary', name: 'V19-03 Boundary' }; const resourceId = 'RES-v19-03-boundary'; const foreignResourceId = 'RES-v19-03-other'; const makeModel = () => buildProjectResourcesModel({ project, root, base: `/projects/${project.id}`, recentWork: [], savedWork: [{ save_id: 'SAVE-v19-03-damaged', work_id: 'SAVE-v19-03-damaged', project, project_id: project.id, resource_id: 'RES-v19-03-result', result_path: resultPath, result_fingerprint: recordedResult, status: 'executed', version_policy: 'pinned_version', sources: [{ resource_id: resourceId, path: sourcePath, fingerprint: recordedSource }], recipe: { version: 5 }, created_at: '2026-09-21T00:00:00.000Z', write: { undo_available: true } }], resourceFacts: [{ resource_id: resourceId, path: sourcePath, resource: { id: resourceId, display_name: 'source.csv', kind: 'CSV', status: 'active' } }], focusedPath: 'Data/source.csv', workSessions: [{ session_id: 'WORK-v19-03-damaged', project_id: project.id, revision: 4, recipe: { version: 5 }, freshness: { status: 'needs_review', label: 'Needs review', reason: 'Source changed' }, latest_save_id: 'SAVE-v19-03-damaged', sources: [{ resource_id: resourceId, status: 'changed', version_policy: 'pinned_version' }] }, { session_id: 'WORK-v19-03-foreign', project_id: project.id, revision: 2, recipe: { version: 1 }, freshness: { status: 'needs_review', label: 'Needs review', reason: 'Foreign identity' }, latest_save_id: null, sources: [{ resource_id: foreignResourceId, path: sourcePath, status: 'changed', version_policy: 'follow_latest' }] }] });
+  let model = makeModel(); assert.ok(Array.isArray(model.focused_resource?.impact_lanes), 'Resource model must expose impact lanes'); const lane = model.focused_resource.impact_lanes.find((item) => item.work.session_id === 'WORK-v19-03-damaged'); assert.equal(lane.impact.status, 'needs_review'); assert.match(lane.impact.reason, /result|output|changed/u); assert.equal(model.focused_resource.impact_lanes.some((item) => item.work.session_id === 'WORK-v19-03-foreign'), false);
+  fs.rmSync(resultPath); model = makeModel(); const missingLane = model.focused_resource.impact_lanes.find((item) => item.work.session_id === 'WORK-v19-03-damaged'); assert.equal(missingLane.impact.status, 'needs_review'); assert.match(missingLane.impact.reason, /missing|result|output/u);
+  const html = renderProjectResourcesView(model, { csrfToken: 'csrf-v19-03' }); assert.match(html, /Needs review|Result changed/u); assert.doesNotMatch(html, /\[object Object\]/u);
+});
+
 test('V18-04 Step 4 binds Desktop Prepare and Preview to the current revision', async (t) => {
   const f = explicitWorkFixture(t);
   let session = f.service.createProjectSession(f.project);
@@ -773,7 +1012,7 @@ test('Resources keeps a temporary multi-source selection out of Work and clears 
   const resourcesUrl = `${server.workspace_url}projects/${created.project_id}/resources?folder=Data`;
   let html = await (await fetch(resourcesUrl)).text();
   const csrf = html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1] ?? html.match(/data-csrf="([a-f0-9]+)"/u)?.[1];
-  assert.match(html, /Selected 0 files/u);
+  assert.match(html, /No files selected for Work/u);
   assert.equal((html.match(/data-resource-row data-resource-name="(?:first|second)\.csv"/gu) ?? []).length, 2);
   const select = async (...resourceIds) => {
     const payload = new URLSearchParams({ csrf }); resourceIds.forEach((id) => payload.append('resource_id', id));
@@ -789,7 +1028,7 @@ test('Resources keeps a temporary multi-source selection out of Work and clears 
   assert.equal(registry.ledger.workSessions.listOpenForProject(created.project_id).length, 0);
   await server.close(); server = await start();
   const restartedResourcesUrl = `${server.workspace_url}projects/${created.project_id}/resources?folder=Data`;
-  html = await (await fetch(restartedResourcesUrl)).text(); assert.match(html, /Selected 0 files/u); assert.match(html, /data-work-open[^>]*aria-disabled="true"/u);
+  html = await (await fetch(restartedResourcesUrl)).text(); assert.match(html, /No files selected for Work/u); assert.match(html, /data-work-open[^>]*aria-disabled="true"/u);
   await server.close(); server = null;
 });
 
@@ -832,9 +1071,10 @@ test('Work profiles Sources independently, persists field alignment, and stops s
   session = await service.validateSources(session.session_id);
   const mappingWithoutBasis = (items) => items.map(({ source_sha256: _sourceHash, source_sheet: _sourceSheet, ...item }) => item);
   assert.equal(session.sources[0].status, 'changed'); assert.equal(session.sources[1].status, 'ready'); assert.equal(session.sources[2].status, 'failed'); assert.deepEqual(mappingWithoutBasis(session.mapping), mapping); assert.equal(session.preview, null); assert.equal(session.mapping_complete, true);
-  session = await service.prepareSources(session.session_id);
-  assert.equal(session.sources[0].status, 'ready'); assert.equal(session.sources[2].status, 'failed'); assert.deepEqual(mappingWithoutBasis(session.mapping), mapping); assert.equal(session.mapping_complete, false);
-  const restarted = createDataWorkService(options).projectSession(project); assert.deepEqual(mappingWithoutBasis(restarted.mapping), mapping); assert.equal(restarted.mapping_complete, false);
+  await assert.rejects(service.prepareSources(session.session_id, { baseRevision: session.revision }), /reconcile|changed|decision|current/u);
+  session = await service.reconcileSource(session.session_id, session.sources[0].source_key, 'use-current', { baseRevision: session.revision });
+  assert.equal(session.sources[0].status, 'ready'); assert.equal(session.sources[2].status, 'failed'); assert.deepEqual(mappingWithoutBasis(session.mapping), mapping); assert.ok(session.mapping.every((item) => item.source_sha256)); assert.equal(session.mapping_complete, true);
+  const restarted = createDataWorkService(options).projectSession(project); assert.deepEqual(mappingWithoutBasis(restarted.mapping), mapping); assert.ok(restarted.mapping.every((item) => item.source_sha256)); assert.equal(restarted.mapping_complete, true);
   assert.throws(() => service.updateRecipe(session.session_id, { combine: 'concatenate', source_column: true, source_column_name: 'id' }), /Source column must use a new field name/u);
   control.dispose(); registry.dispose();
 });
@@ -1714,7 +1954,7 @@ test('Resources layout collapses before the tested narrow desktop width', () => 
   }, { csrfToken: 'token' });
   const styles = fs.readFileSync(path.resolve('src', 'ui', 'styles', 'components.css'), 'utf8');
   const client = fs.readFileSync(path.resolve('src', 'ui', 'client.js'), 'utf8');
-  assert.match(styles, /@container \(max-width: 900px\) \{[\s\S]*?\.workspace-resource-grid[^\{]*\{ grid-template-columns:/u);
+  assert.match(styles, /@container \(max-width: 1120px\) \{[\s\S]*?\.workspace-resource-grid[^\{]*\{ grid-template-columns:/u);
   assert.match(styles, /\.workspace-folder-scroll, \.workspace-resource-list-scroll, \.workspace-focus \{[^}]*overflow:\s*auto/u);
   assert.match(html, /data-resource-list-toggle[^>]*aria-controls="project-resource-file-list"[^>]*aria-expanded="true"/u);
   assert.match(html, /id="project-resource-file-list"[^>]*data-resource-file-list/u);
@@ -1890,8 +2130,8 @@ test('Resources renders the approved three-pane workspace and remembers the coll
   assert.match(client, /atlas-ui-selected-folder:\$\{projectId\}/u);
   assert.match(client, /atlas-ui-resource-list:\$\{projectId\}/u);
   assert.match(client, /is-file-list-collapsed/u);
-  assert.match(client, /Show resource details/u);
-  assert.match(client, /Back to file list/u);
+  assert.match(client, /resourceText\('resources.show_resource_details'\)/u);
+  assert.match(client, /resourceText\('resources.back_to_file_list'\)/u);
   assert.match(client, /compact !== resourceWorkspaceWasCompact && focusedPath/u);
   assert.match(client, /if \(selectedFolder && \(focusedPath \|\| workspace\.dataset\.selectedFolderExplicit === 'true'\)\)/u);
   assert.match(client, /if \(clearResource\)[\s\S]*?classList\.remove\('is-focused'\)[\s\S]*?history\.replaceState/u);
@@ -1899,7 +2139,7 @@ test('Resources renders the approved three-pane workspace and remembers the coll
   assert.match(styles, /\.workspace-resource-grid\.is-file-list-collapsed/u);
   assert.match(styles, /grid-template-columns:\s*minmax\([^;]+\)\s+minmax\([^;]+\)/u);
   assert.match(styles, /\.workspace-resource-list\[hidden\], \.workspace-folder-files\[hidden\] \{ display: none !important; \}/u);
-  assert.match(styles, /@container \(max-width: 900px\)[\s\S]*?\.workspace-resource-grid:not\(\.is-file-list-collapsed\) \.workspace-focus \{ display: none; \}/u);
+  assert.match(styles, /@container \(max-width: 800px\)[\s\S]*?\.workspace-resource-grid:not\(\.is-file-list-collapsed\) \.workspace-focus \{ display: none; \}/u);
 });
 
 test('Resources exposes direct folder disclosure, adjustable panes, and native zoom reflow', () => {
@@ -2196,13 +2436,14 @@ test('Import save worker executes real Intake state and compensates a failed Rec
   });
   const intake = new Intake({ stateDir });
   const resourceControl = createResourceControl({ stateDir, ledger: registry.ledger });
+  const importSaveService = createSaveService({ stateDir, intake });
   t.after(() => {
+    importSaveService.dispose();
     resourceControl.dispose();
-    intake.dispose();
     registry.dispose();
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   });
-  const service = createProjectImportService({ stateDir, registry, intake });
+  const service = createProjectImportService({ stateDir, registry, saveService: importSaveService });
 
   const inspectForRecentWork = (sourcePath) => {
     const fingerprint = contentFileFingerprint(sourcePath);
@@ -2284,11 +2525,12 @@ test('Import save worker executes real Intake state and compensates a failed Rec
   const executionBeforeRetry = intake.show(failingPrepared.run_id).execution_receipt;
   fs.writeFileSync(failingCache, cachedInspection, 'utf8');
   const reopenedIntake = new Intake({ stateDir });
-  const reopenedImport = createProjectImportService({ stateDir, registry, intake: reopenedIntake });
+  const reopenedSaveService = createSaveService({ stateDir, intake: reopenedIntake });
+  const reopenedImport = createProjectImportService({ stateDir, registry, saveService: reopenedSaveService });
   const resumedPrepared = reopenedImport.prepare({ work: retained, projectId: created.project_id, folder: 'Data' });
   assert.equal(resumedPrepared.save_id, failingPrepared.save_id);
   assert.equal(resumedPrepared.run_id, failingPrepared.run_id);
-  reopenedIntake.dispose();
+  reopenedSaveService.dispose();
   const retried = await runUiContentOperation('project-import-save', { stateDir, imported: resumedPrepared });
   const saveAfterRetry = JSON.parse(fs.readFileSync(path.join(stateDir, 'ui', 'saved-work.json'), 'utf8')).items.find((item) => item.save_id === failingPrepared.save_id);
   assert.equal(retried.file_path, savedPathBeforeRetry);
@@ -2303,7 +2545,7 @@ test('Import save worker executes real Intake state and compensates a failed Rec
 
 test('Import save survives server restart for Undo and Redo', async (t) => {
   fs.mkdirSync(testRoot,{recursive:true});const root=fs.mkdtempSync(path.join(testRoot,'import-restart-'));const stateDir=path.join(root,'state');const workspace=path.join(root,'workspace');const projectRoot=path.join(workspace,'Project');fs.mkdirSync(path.join(projectRoot,'Data'),{recursive:true});const source=write(path.join(root,'incoming','source.txt'),'restart source');const sourceHash=contentFileFingerprint(source).sha256;const registry=new Registry({stateDir});const adopted=registry.adoptRoot({rootPath:workspace,rootType:'project_workspace',contentPolicy:'bounded_content'});const project=registry.create({name:'Project',currentPath:'Project'});registry.attachRoot(project.project_id,{rootId:adopted.root_id,relativePath:'Project',reason:'restart'});const control=createResourceControl({stateDir,ledger:registry.ledger});
-  const fingerprint=contentFileFingerprint(source);const inspection=inspectContent({stateDir,projectRoot:path.resolve('.'),installationRoot:path.resolve('.'),filePath:source,purpose:'content',maxCharacters:4000,pythonPath:'test',runProcess:()=>({status:0,stdout:JSON.stringify({schema:CONTENT_INSPECTION_SCHEMA,purpose:'content',source:fingerprint,selection:{sheet:null},extraction:{status:'success',type:'text',characters:fingerprint.bytes},attention:{maximum_characters:4000,truncated:false},processor:{version:CONTENT_PROCESSOR_VERSION}}),stderr:''})});const work=upsertRecentWork({stateDir,filePath:source,inspect:{purpose:'content',sheet:null,maxCharacters:4000},sourceFingerprint:fingerprint,inspectionId:inspection.inspection_id,cacheReference:path.relative(stateDir,inspection.cache_path),resourceId:control.identify({filePath:source}).resource_id});const intake=new Intake({stateDir});const importer=createProjectImportService({stateDir,registry,intake});const prepared=importer.prepare({work,projectId:project.project_id,folder:'Data'});const saved=await runUiContentOperation('project-import-save',{stateDir,imported:prepared});const target=saved.file_path;const targetHash=contentFileFingerprint(target).sha256;intake.dispose();control.dispose();
+  const fingerprint=contentFileFingerprint(source);const inspection=inspectContent({stateDir,projectRoot:path.resolve('.'),installationRoot:path.resolve('.'),filePath:source,purpose:'content',maxCharacters:4000,pythonPath:'test',runProcess:()=>({status:0,stdout:JSON.stringify({schema:CONTENT_INSPECTION_SCHEMA,purpose:'content',source:fingerprint,selection:{sheet:null},extraction:{status:'success',type:'text',characters:fingerprint.bytes},attention:{maximum_characters:4000,truncated:false},processor:{version:CONTENT_PROCESSOR_VERSION}}),stderr:''})});const work=upsertRecentWork({stateDir,filePath:source,inspect:{purpose:'content',sheet:null,maxCharacters:4000},sourceFingerprint:fingerprint,inspectionId:inspection.inspection_id,cacheReference:path.relative(stateDir,inspection.cache_path),resourceId:control.identify({filePath:source}).resource_id});const intake=new Intake({stateDir});const importerSaveService=createSaveService({stateDir,intake});const importer=createProjectImportService({stateDir,registry,saveService:importerSaveService});const prepared=importer.prepare({work,projectId:project.project_id,folder:'Data'});const saved=await runUiContentOperation('project-import-save',{stateDir,imported:prepared});const target=saved.file_path;const targetHash=contentFileFingerprint(target).sha256;importerSaveService.dispose();control.dispose();
   const open=()=>{const freshIntake=new Intake({stateDir});const freshControl=createResourceControl({stateDir});return {freshIntake,freshControl,server:startAtlasUiServer({stateDir,...serverServices(registry),intake:freshIntake,resourceControl:freshControl})};};let first=open();const server1=await first.server;try{const html=await (await fetch(`${server1.workspace_url}files/result/${work.work_id}`)).text();const csrf=html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1];const response=await fetch(`${server1.workspace_url}files/add-to-project/undo`,{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({csrf,work_id:work.work_id}),redirect:'manual'});const body=await response.text();assert.equal(response.status,303,body.match(/<p>([^<]+)/u)?.[1]??body.slice(-500));}finally{await server1.close();first.freshControl.dispose();first.freshIntake.dispose();}
   let undone=readRecentWorkState(stateDir).items.find(x=>x.work_id===work.work_id);assert.equal(fs.existsSync(target),false);assert.equal(contentFileFingerprint(source).sha256,sourceHash);assert.equal(undone.file_path,source);assert.equal(undone.project_transfer.status,'undone');assert.equal(undone.project_transfer.redo_available,true);
   const second=open();const server2=await second.server;try{const html=await (await fetch(`${server2.workspace_url}files/result/${work.work_id}`)).text();assert.match(html,/Redo Add to Project/u);const csrf=html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1];const response=await fetch(`${server2.workspace_url}files/add-to-project/redo`,{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({csrf,work_id:work.work_id}),redirect:'manual'});assert.equal(response.status,303);}finally{await server2.close();second.freshControl.dispose();second.freshIntake.dispose();}

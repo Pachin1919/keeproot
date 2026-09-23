@@ -21,6 +21,8 @@ import { Intake } from '../src/intake.js';
 import { SaveService } from '../src/save-service.js';
 import { createResourceControl } from '../src/resource-control.js';
 import { createProjectViewService } from '../src/project-view-service.js';
+import { createBoardService } from '../src/board-service.js';
+import { RoundRecovery } from '../src/round-recovery.js';
 import { WorkspaceInspector } from '../src/inspect.js';
 import { Portfolio } from '../src/portfolio.js';
 import { PreferenceRules } from '../src/preference-rules.js';
@@ -37,7 +39,8 @@ import {
 import { openLocalUi } from '../src/ui-launcher.js';
 import { startAtlasUiServer } from '../src/ui-server.js';
 import { createDataWorkService } from '../src/ui/services/data-work-service.js';
-import { createSavedWorkService } from '../src/ui/services/saved-work-service.js';
+import { buildResourceImpactLanes } from '../src/ui/services/resource-impact-service.js';
+import { createSavedWorkService, savedResultFreshness, sourceVersionPolicy } from '../src/ui/services/saved-work-service.js';
 import {
   ATLAS_VERSION,
   CAPABILITIES,
@@ -132,7 +135,8 @@ function foundationUsage() {
 Usage:
   atlas version [--json]
   atlas capabilities [--json]
-  Current product: atlas ui; atlas view; atlas table-work; atlas save prepare/show/execute/undo/redo
+  Current product: atlas ui; atlas view; atlas table-work; atlas board; atlas save prepare/show/execute/undo/redo
+  Experimental recovery: atlas round list/show/protect/extend/checkpoint/restore/return/resume
   Other commands are supporting foundation or diagnostics.
   atlas doctor [ui] [--json]
   atlas inspect --root <path> [--max-depth <1..8>]
@@ -159,6 +163,11 @@ Usage:
                         [--tool <name>] [--client-run-id <id>]
   atlas resource relationships submit --request-file <json> --tool <name> --client-run-id <id>
   atlas resource show <resource_id> --project <project_id>
+  atlas board list --project <project_id>
+  atlas board create --project <project_id> --title <title>
+  atlas board show <board_id> --project <project_id>
+  atlas board save <board_id> --project <project_id> --base-revision <revision> --request-file <board.json>
+  atlas board export <board_id> --project <project_id> --base-revision <revision> --target <folder/file.html> --request-key <key> --tool <tool> --client-run-id <id>
   atlas view list --project <project_id>
   atlas view properties --project <project_id>
   atlas view save --project <project_id> --request-file <view.json> --tool <host> --client-run-id <id>
@@ -172,6 +181,13 @@ Usage:
                          [--intent <work_goal>]
   atlas table-work list --project <project_id> [--limit <1..100>] [--offset <number>]
   atlas table-work show <session_id>
+  atlas table-work reuse <session_id> --base-revision <revision> --request-file <assignments.json> --tool <tool> --client-run-id <id> [--intent <text>]
+  atlas table-work reconcile <session_id> --source-key <source_key>
+                             --decision <use-current|pin-recorded|follow-latest|stop-using>
+                             --base-revision <revision> --tool <tool> --client-run-id <id>
+  atlas table-work reconcile-batch <session_id> --request-file <source-keys.json>
+                                   --decision <use-current|pin-recorded|follow-latest|stop-using>
+                                   --base-revision <revision> --tool <tool> --client-run-id <id>
   atlas table-work add-source <session_id> --source <path> --base-revision <revision>
   atlas table-work remove-source <session_id> --resource <resource_id> --base-revision <revision>
   atlas table-work prepare <session_id> --base-revision <revision>
@@ -304,6 +320,11 @@ Current product:
                          [--intent <work_goal>]
   atlas table-work list --project <project_id> [--limit <1..100>] [--offset <number>]
   atlas table-work show <session_id>
+  atlas table-work reuse <session_id> --base-revision <revision> --request-file <assignments.json> --tool <tool> --client-run-id <id> [--intent <text>]
+  atlas table-work reconcile <session_id> --source-key <source_key> --decision <use-current|pin-recorded|follow-latest|stop-using>
+                             --base-revision <revision> --tool <tool> --client-run-id <id>
+  atlas table-work reconcile-batch <session_id> --request-file <source-keys.json> --decision <use-current|pin-recorded|follow-latest|stop-using>
+                                   --base-revision <revision> --tool <tool> --client-run-id <id>
   atlas table-work prepare|preview <session_id> --base-revision <revision>
   atlas table-work add-source <session_id> --source <path> --base-revision <revision>
   atlas table-work remove-source <session_id> --resource <resource_id> --base-revision <revision>
@@ -312,6 +333,13 @@ Current product:
   atlas table-work save <session_id> --folder <existing_folder> --file-name <new_name>
                         --format <csv|xlsx> --base-revision <revision> --request-key <key> --reason <authorization>
                          --tool <name> --client-run-id <id>
+
+  atlas board list --project <project_id>
+  atlas board create --project <project_id> --title <title>
+  atlas board show <board_id> --project <project_id>
+  atlas board save <board_id> --project <project_id> --base-revision <revision> --request-file <board.json>
+  atlas board export <board_id> --project <project_id> --base-revision <revision>
+                     --target <existing_folder/new.html> --request-key <key> --tool <host> --client-run-id <id>
 
   atlas view list --project <project_id>
   atlas view properties --project <project_id>
@@ -1761,6 +1789,7 @@ function parseTableWork(args) {
     else if (token === '--source') options.sources.push(rest[++index]);
     else if (token === '--resource') options.resourceId = rest[++index];
     else if (token === '--source-key') options.sourceKey = rest[++index];
+    else if (token === '--decision') options.decision = rest[++index];
     else if (token === '--sheet') options.sheet = rest[++index];
     else if (token === '--request-file') options.requestFile = rest[++index];
     else if (token === '--base-revision') options.baseRevision = Number(rest[++index]);
@@ -1842,7 +1871,46 @@ async function handleTableWork(registry, saveService, args) {
     const sessionId = options.positional[0];
     if (!sessionId || options.positional.length !== 1) throw new Error(`table-work ${action} requires one session_id.`);
     const { entry } = sessionEntry(sessionId);
-    if (action === 'show') { emit('table-work.show', await dataWork.validateSources(sessionId), (value) => console.log(`${value.session_id}: ${value.sources.length} Source(s), Recipe v${value.recipe.version}.`)); return; }
+    if (action === 'show') {
+      const shown = await dataWork.validateSources(sessionId);
+      const latestResult = shown.latest_save_id ? savedWork.find(shown.latest_save_id) : null;
+      emit('table-work.show', latestResult ? { ...shown, latest_result: { ...latestResult, freshness: savedResultFreshness(latestResult, { sourceFreshness: shown.freshness, versionPolicy: sourceVersionPolicy(shown.sources, latestResult.version_policy) }) } } : shown, (value) => console.log(`${value.session_id}: ${value.sources.length} Source(s), Recipe v${value.recipe.version}.`)); return;
+    }
+    if (action === 'reuse') {
+      if (options.sources.length || !options.tool || !options.clientRunId) throw new Error('table-work reuse requires --tool and --client-run-id; use --request-file for current Source assignments.');
+      let sourceAssignments = null;
+      if (options.requestFile) {
+        const request = readRequest(); const entries = Array.isArray(request) ? request : request.sources;
+        if (!Array.isArray(entries)) throw new Error('table-work reuse request must contain a sources array.');
+        sourceAssignments = entries.map((item) => {
+          const identified = resourceControl.identify({ filePath: sourcePath(entry, item?.source), project: entry.project });
+          return { source_key: item?.source_key, resource_id: identified.resource_id, sheet: item?.sheet ?? null };
+        });
+      }
+      const reused = dataWork.reuseProjectSession(sessionId, { baseRevision: requireBaseRevision(), sourceAssignments, intent: options.intent, caller: callerFromOptions(options) });
+      emit('table-work.reuse', reused, (value) => console.log(`Reused ${sessionId} as ${value.session_id}.`)); return;
+    }
+    if (action === 'reconcile') {
+      const decisions = ['use-current', 'pin-recorded', 'follow-latest', 'stop-using'];
+      if (!options.sourceKey || !decisions.includes(options.decision) || !options.tool || !options.clientRunId) {
+        throw new Error('table-work reconcile requires --source-key, --decision <use-current|pin-recorded|follow-latest|stop-using>, --tool, and --client-run-id.');
+      }
+      const reconciled = await dataWork.reconcileSource(sessionId, options.sourceKey, options.decision, { baseRevision: requireBaseRevision(), caller: callerFromOptions(options) });
+      emit('table-work.reconcile', reconciled, (value) => console.log(`Reconciled ${options.sourceKey} at Work revision ${value.revision}.`)); return;
+    }
+    if (action === 'reconcile-batch') {
+      const decisions = ['use-current', 'pin-recorded', 'follow-latest', 'stop-using'];
+      if (!options.requestFile || !decisions.includes(options.decision) || !options.tool || !options.clientRunId) {
+        throw new Error('table-work reconcile-batch requires --request-file, --decision <use-current|pin-recorded|follow-latest|stop-using>, --tool, and --client-run-id.');
+      }
+      const request = readRequest();
+      const sourceKeys = Array.isArray(request) ? request : request.source_keys;
+      if (!Array.isArray(sourceKeys) || !sourceKeys.length || sourceKeys.some((item) => typeof item !== 'string' || !item)) {
+        throw new Error('table-work reconcile-batch request must contain a non-empty source_keys array.');
+      }
+      const reconciled = await dataWork.reconcileSources(sessionId, sourceKeys, options.decision, { baseRevision: requireBaseRevision(), caller: callerFromOptions(options) });
+      emit('table-work.reconcile-batch', reconciled, (value) => console.log(`Reconciled ${sourceKeys.length} Sources at Work revision ${value.revision}.`)); return;
+    }
     if (action === 'add-source') {
       if (options.sources.length !== 1) throw new Error('table-work add-source requires exactly one --source.');
       const identified = resourceControl.identify({ filePath: sourcePath(entry, options.sources[0]), project: entry.project });
@@ -1872,14 +1940,16 @@ async function handleTableWork(registry, saveService, args) {
       if (!session.preview || session.preview_revision !== session.revision) { const error = new Error('Preview the current Recipe before saving.'); error.code = 'ATLAS_STATE_CONFLICT'; throw error; }
       const extension = `.${options.format}`;
       const stage = await dataWork.stagePersistent(sessionId, extension, { baseRevision });
-      const sources = session.sources.map((item) => ({ source_key: item.source_key, resource_id: item.resource_id, path: item.file_path, sheet: item.sheet, fingerprint: item.fingerprint }));
+      const sources = session.sources.map((item) => ({ source_key: item.source_key, resource_id: item.resource_id, path: item.file_path, sheet: item.sheet, fingerprint: item.fingerprint, version_policy: item.version_policy ?? 'follow_latest' }));
       let record;
       try {
         dataWork.assertRevision(sessionId, baseRevision);
         record = savedWork.save({
           project: entry.project, projectRoot: entry.root, root: entry.workspaceRoot, folder: options.folder, fileName: options.fileName,
           stagedPath: stage.path, expectedCandidateHash: stage.staged.sha256, sourcePath: sources[0].path, sourceFingerprint: sources[0].fingerprint,
-          sources, recipe: session.recipe, outputExtension: extension, requestKey: options.requestKey, caller: callerFromOptions(options), channel: 'host',
+          sources, recipe: session.recipe,
+          versionPolicy: sourceVersionPolicy(session.sources),
+          outputExtension: extension, requestKey: options.requestKey, caller: callerFromOptions(options), channel: 'host',
           executionReason: options.reason,
           parameters: { work_session_id: sessionId, mapping: session.mapping, recipe_version: session.recipe.version },
           resultSummary: { ...stage.result.result_summary, validation: stage.result.validation, format: options.format.toUpperCase(), recipe_version: session.recipe.version },
@@ -1890,6 +1960,97 @@ async function handleTableWork(registry, saveService, args) {
     }
     throw new Error(`Unknown table-work action: ${action}.`);
   } finally { resourceControl.dispose(); }
+}
+
+async function handleBoard(registry, saveService, args) {
+  const [action, ...rest] = args;
+  const options = { positional: [] };
+  for (let index = 0; index < rest.length; index += 1) {
+    const token = rest[index];
+    if (token === '--project') options.projectId = rest[++index];
+    else if (token === '--title') options.title = rest[++index];
+    else if (token === '--base-revision') options.baseRevision = Number(rest[++index]);
+    else if (token === '--request-file') options.requestFile = rest[++index];
+    else if (token === '--target') options.target = rest[++index];
+    else if (token === '--request-key') options.requestKey = rest[++index];
+    else {
+      const consumed = parseCallerFlag(options, rest, index);
+      if (consumed != null) index = consumed;
+      else if (token.startsWith('--')) throw new Error(`Unknown board argument: ${token}`);
+      else options.positional.push(token);
+    }
+  }
+  if (!action) throw new Error('board requires an action.');
+  const boards = createBoardService({ stateDir, registry, saveService, projectRoot, installationRoot });
+  const boardId = options.positional[0];
+  const requireProject = () => {
+    if (!options.projectId) throw new Error(`board ${action} requires --project <project_id>.`);
+    return options.projectId;
+  };
+  const requireBoard = () => {
+    if (!boardId || options.positional.length !== 1) throw new Error(`board ${action} requires one board_id.`);
+    return boardId;
+  };
+  const requireRevision = () => {
+    if (!Number.isInteger(options.baseRevision) || options.baseRevision < 1) {
+      const error = new Error('board requires --base-revision <current_revision>.');
+      error.code = 'ATLAS_STATE_CONFLICT';
+      throw error;
+    }
+    return options.baseRevision;
+  };
+  try {
+    if (action === 'list') {
+      if (options.positional.length) throw new Error('board list does not accept a board_id.');
+      const data = boards.listBoards(requireProject());
+      emit('board.list', { project_id: options.projectId, boards: data }, (value) => console.log(`${value.boards.length} Board(s).`)); return;
+    }
+    if (action === 'create') {
+      if (options.positional.length || !options.title) throw new Error('board create requires --project and --title.');
+      const created = boards.createBoard({ projectId: requireProject(), title: options.title });
+      emit('board.create', { ...created, desktop_href: `/projects/${encodeURIComponent(options.projectId)}/boards/${encodeURIComponent(created.board_id)}` }, (value) => console.log(`Created ${value.board_id}.`)); return;
+    }
+    if (action === 'show') {
+      const shown = boards.showBoard(requireProject(), requireBoard());
+      emit('board.show', shown, (value) => console.log(`${value.title}: ${value.blocks.length} Block(s), revision ${value.revision}.`)); return;
+    }
+    if (action === 'save') {
+      requireBoard(); requireProject(); requireRevision();
+      if (!options.requestFile) throw new Error('board save requires --request-file <board.json>.');
+      const request = JSON.parse(fs.readFileSync(path.resolve(options.requestFile), 'utf8'));
+      const saved = boards.saveBoard({ projectId: options.projectId, boardId, title: request.title, blocks: request.blocks, baseRevision: options.baseRevision });
+      emit('board.save', { ...saved, desktop_href: `/projects/${encodeURIComponent(options.projectId)}/boards/${encodeURIComponent(boardId)}` }, (value) => console.log(`Saved ${value.board_id} revision ${value.revision}.`)); return;
+    }
+    if (action === 'export') {
+      requireBoard(); requireProject(); requireRevision();
+      if (!options.target || !options.requestKey || !options.tool || !options.clientRunId) throw new Error('board export requires --target, --request-key, --tool, and --client-run-id.');
+      const prepared = await boards.preparePortableDelivery({ projectId: options.projectId, boardId, baseRevision: options.baseRevision, target: options.target, caller: callerFromOptions(options), requestKey: options.requestKey });
+      emit('board.export', prepared, (value) => console.log(`Prepared portable delivery ${value.save_id}; review ${value.desktop_href}.`)); return;
+    }
+    throw new Error(`Unknown board action: ${action}.`);
+  } finally { boards.dispose(); }
+}
+
+function handleRound(registry, args) {
+  const [action, ...rest] = args;
+  const service = new RoundRecovery({ stateDir, registry });
+  let result;
+  try {
+    if (action === 'list' && rest.length === 2 && rest[0] === '--project') {
+      result = { project_id: rest[1], rounds: service.list({ projectId: rest[1] }) };
+    } else if (action === 'show' && rest.length === 3 && rest[1] === '--project') {
+      result = service.show({ projectId: rest[2], roundId: rest[0] });
+    } else if (['protect', 'extend', 'checkpoint', 'restore', 'return', 'resume'].includes(action)
+        && rest.length === 2 && rest[0] === '--request-file') {
+      const requestPath = path.resolve(rest[1]);
+      if (fs.statSync(requestPath).size > 64 * 1024) throw new Error('Round request must be at most 64 KiB.');
+      const request = JSON.parse(fs.readFileSync(requestPath, 'utf8').replace(/^\uFEFF/u, ''));
+      result = service[action === 'return' ? 'returnToLatest' : action](request);
+    } else {
+      throw new Error('Use round list --project <id>; show <round_id> --project <id>; or protect/extend/checkpoint/restore/return/resume --request-file <json>.');
+    }
+    emit(`round.${action}`, result, (value) => console.log(JSON.stringify(value, null, 2)));
+  } finally { service.dispose(); }
 }
 
 async function handleCapture(capture, args) {
@@ -2268,9 +2429,23 @@ async function main() {
         else throw new Error(`Unknown resource show argument: ${rest[index]}`);
       }
       if (!resourceId || !projectId) throw new Error('resource show requires a resource_id and --project');
-      const control = createResourceControl({ stateDir });
-      try { emit('resource.show', control.projectResource(projectId, resourceId, { refresh: true }), (data) => console.log(JSON.stringify(data, null, 2))); }
-      finally { control.dispose(); }
+      const registry = new Registry({ stateDir });
+      const control = createResourceControl({ stateDir, ledger: registry.ledger });
+      try {
+        const entry = tableWorkProject(registry, projectId);
+        const resource = control.projectResource(projectId, resourceId, { refresh: true });
+        const dataWork = createDataWorkService({ stateDir, projectRoot, installationRoot, resourceControl: control });
+        const workSessions = dataWork.openProjectSessions(entry.project);
+        const savedWork = createSavedWorkService({ stateDir }).listForProject(projectId);
+        const boardService = createBoardService({ stateDir, registry, resourceControl: control, projectRoot, installationRoot });
+        try {
+          emit('resource.show', {
+            ...resource,
+            impact_lanes: buildResourceImpactLanes({ resource, workSessions, savedWork }),
+            board_references: boardService.listResourceReferences(projectId, resourceId),
+          }, (data) => console.log(JSON.stringify(data, null, 2)));
+        } finally { boardService.dispose(); }
+      } finally { control.dispose(); registry.dispose(); }
       return;
     }
     if (area !== 'relationships' || action !== 'submit') throw new Error('Use atlas resource show or resource relationships submit.');
@@ -2478,6 +2653,10 @@ async function main() {
       handleSave(save, args);
     } else if (command === 'table-work') {
       await handleTableWork(registry, save, args);
+    } else if (command === 'board') {
+      await handleBoard(registry, save, args);
+    } else if (command === 'round') {
+      handleRound(registry, args);
     } else if (command === 'evolve') {
       handleEvolution(evolution, args);
     } else if (command === 'work') {

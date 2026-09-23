@@ -26,7 +26,24 @@ function completeMapping(value, mapping = value.mapping) {
       return item && String(item.canonical ?? '').trim() && item.source_sha256 === fact.source_sha256 && (item.source_sheet ?? null) === fact.source_sheet;
     });
 }
+function reuseFieldMismatch(recordedProfile, currentProfile) {
+  const recorded = recordedProfile?.profile?.fields ?? [];
+  const current = currentProfile?.profile?.fields ?? [];
+  const currentByName = new Map(current.map((field) => [field.name, field]));
+  const missing = recorded.filter((field) => !currentByName.has(field.name)).map((field) => field.name);
+  const incompatible = recorded.filter((field) => {
+    const next = currentByName.get(field.name);
+    return next && field.inferred_type && next.inferred_type && field.inferred_type !== next.inferred_type;
+  }).map((field) => ({ field: field.name, recorded_type: field.inferred_type, current_type: currentByName.get(field.name).inferred_type }));
+  const added = current.filter((field) => !recorded.some((entry) => entry.name === field.name)).map((field) => field.name);
+  return { missing, incompatible, added };
+}
 function stateConflict(message) { const error = new Error(message); error.code = 'ATLAS_STATE_CONFLICT'; return error; }
+function samePath(left, right) {
+  if (!left || !right) return left === right;
+  const normalize = (value) => path.resolve(value).replaceAll('\\', '/').toLowerCase();
+  return normalize(left) === normalize(right);
+}
 export function createDataWorkService({
   stateDir,
   projectRoot,
@@ -41,6 +58,128 @@ export function createDataWorkService({
   const persistentStages = new Map();
   const discardPersistentStage = (id) => { const value = persistentStages.get(id); if (value?.path) fs.rmSync(value.path, { force: true }); persistentStages.delete(id); };
   const isoNow = () => new Date(now()).toISOString();
+  const profileSummary = (value) => {
+    const profile = value?.profile;
+    if (!profile) return null;
+    return {
+      rows: profile.rows ?? null,
+      columns: profile.columns ?? null,
+      null_cells: profile.null_cells ?? null,
+      duplicate_rows: profile.duplicate_rows ?? null,
+      fields: (profile.fields ?? []).map((field) => field.name),
+      sample: profile.sample ? {
+        columns: (profile.sample.columns ?? []).map(String),
+        rows: (profile.sample.rows ?? []).slice(0, 5),
+      } : null,
+      values: profile.sample?.rows?.slice(0, 5) ?? null,
+    };
+  };
+  const representativeChanges = (recorded, observed) => {
+    if (!recorded?.sample || !observed?.sample) return [];
+    const beforeRows = recorded.sample.rows ?? [];
+    const afterRows = observed.sample.rows ?? [];
+    const changes = [];
+    for (let index = 0; index < Math.max(beforeRows.length, afterRows.length) && changes.length < 3; index += 1) {
+      const before = beforeRows[index] ?? null;
+      const after = afterRows[index] ?? null;
+      if (JSON.stringify(before) !== JSON.stringify(after)) changes.push({ row: index + 1, before, after });
+    }
+    return changes;
+  };
+  const reconciliationSummary = (item, current = null, checkedAt = null) => {
+    const recorded = item.fingerprint ? {
+      path: item.fingerprint.file_path ?? null,
+      sha256: item.fingerprint.sha256 ?? null,
+      bytes: item.fingerprint.bytes ?? null,
+      modified_ns: item.fingerprint.modified_ns ?? null,
+      profile: profileSummary(item.profile),
+    } : null;
+    const observed = current ? {
+      path: current.file_path ?? item.file_path ?? null,
+      sha256: current.sha256 ?? null,
+      bytes: current.bytes ?? null,
+      modified_ns: current.modified_ns ?? null,
+      profile: profileSummary(current.profile),
+    } : null;
+    const pathChanged = Boolean(recorded?.path && observed?.path && !samePath(recorded.path, observed.path));
+    const contentChanged = Boolean(recorded?.sha256 && observed?.sha256 && recorded.sha256 !== observed.sha256);
+    const kind = !item.file_path || !fs.existsSync(item.file_path)
+      ? 'missing'
+      : !recorded ? 'not_prepared'
+        : !observed ? 'not_checked'
+          : pathChanged && contentChanged ? 'moved_and_changed'
+            : pathChanged ? 'moved'
+              : contentChanged ? 'changed'
+                : 'unchanged';
+    const decisionRequired = ['changed', 'moved', 'moved_and_changed', 'missing'].includes(kind) && item.version_policy !== 'pinned_version';
+    const representative = representativeChanges(recorded?.profile, observed?.profile);
+    return {
+      kind,
+      label: ({
+        missing: 'Missing', not_prepared: 'Not prepared', not_checked: 'Not checked',
+        moved_and_changed: 'Moved and changed', moved: 'Moved', changed: 'Changed', unchanged: 'Unchanged',
+      })[kind],
+      version_policy: item.version_policy ?? 'follow_latest',
+      decision_required: decisionRequired,
+      recorded,
+      current: observed,
+      differences: {
+        path_changed: pathChanged,
+        content_changed: contentChanged,
+        rows_delta: recorded?.profile?.rows != null && observed?.profile?.rows != null ? observed.profile.rows - recorded.profile.rows : null,
+        added_fields: observed?.profile?.fields?.filter((field) => !recorded?.profile?.fields?.includes(field)) ?? [],
+        removed_fields: recorded?.profile?.fields?.filter((field) => !observed?.profile?.fields?.includes(field)) ?? [],
+        representative_changes: representative,
+      },
+      comparison_note: recorded?.profile?.sample
+        ? 'Representative values are a bounded comparison sample, not a full copy of either Source.'
+        : 'Recorded values are unavailable for this older Work. Its recorded Hash proves identity; it is not a backup.',
+      checked_at: checkedAt,
+      actions: {
+        use_current: Boolean(observed && ['changed', 'moved', 'moved_and_changed'].includes(kind)),
+        pin_recorded: Boolean(recorded && item.version_policy !== 'pinned_version'),
+        follow_latest: item.version_policy === 'pinned_version',
+        relink: kind === 'missing',
+        stop_using: true,
+      },
+    };
+  };
+  const changeReview = (value) => {
+    const changed = value.sources.filter((item) => ['changed', 'moved', 'moved_and_changed', 'missing'].includes(item.reconciliation?.kind));
+    const unresolved = changed.filter((item) => item.reconciliation?.decision_required === true);
+    const counts = { total: unresolved.length, changed: 0, moved: 0, moved_and_changed: 0, missing: 0 };
+    for (const item of unresolved) counts[item.reconciliation.kind] += 1;
+    return {
+      status: unresolved.length ? 'needs_review' : 'fresh',
+      counts,
+      items: unresolved.map((item) => ({
+        source_key: item.source_key,
+        resource_id: item.resource_id,
+        name: item.name,
+        kind: item.reconciliation.kind,
+        label: item.reconciliation.label,
+        before: item.reconciliation.recorded?.profile ?? null,
+        after: item.reconciliation.current?.profile ?? null,
+        representative_changes: item.reconciliation.differences.representative_changes,
+        comparison_note: item.reconciliation.comparison_note,
+      })),
+      work: {
+        session_id: value.session_id,
+        revision: value.revision,
+        latest_save_id: value.latest_save_id ?? null,
+      },
+      note: 'A recorded Hash proves which Source version the Work used; it is not a backup of the old file. Review representative values before choosing one decision for selected Sources.',
+    };
+  };
+  const freshnessSummary = (value, { checked = false, checkedAt = null } = {}) => {
+    const issue = value.sources.find((item) => ['missing', 'changed', 'moved', 'unsupported', 'failed'].includes(item.status) && item.version_policy !== 'pinned_version');
+    if (issue) return { status: 'needs_review', label: 'Needs review', reason: issue.error_message ?? `${issue.name ?? issue.resource_id} is not ready.`, checked_at: checkedAt };
+    const pinned = value.sources.find((item) => ['missing', 'changed', 'moved'].includes(item.status) && item.version_policy === 'pinned_version');
+    if (pinned) return { status: 'pinned', label: 'Pinned version', reason: 'This Work keeps its recorded Source version. Its saved Result remains fixed; rerun requires an available matching Source or an explicit current-version decision.', checked_at: checkedAt };
+    if (value.sources.some((item) => item.status !== 'ready')) return { status: 'not_ready', label: 'Not ready', reason: 'Prepare every Source before running this Work.', checked_at: checkedAt };
+    if (!checked) return { status: 'not_checked', label: 'Not checked', reason: 'Open this Work or use table-work show to check current Source files.', checked_at: null };
+    return { status: 'fresh', label: 'Fresh', reason: 'Every Source matches the prepared version for this Work.', checked_at: checkedAt };
+  };
   const hydratePersistent = (value) => {
     if (!value) return null;
     const project = projectCache.get(value.project_id) ?? { id: value.project_id };
@@ -59,6 +198,7 @@ export function createDataWorkService({
         status,
         error_message: status === item.status ? item.error_message : status === 'missing' ? 'The selected Resource is no longer available at its recorded location.' : 'Work supports CSV or XLSX Resources.',
         file_path: filePath,
+        resource_href: `/projects/${encodeURIComponent(value.project_id)}/resources?resource_id=${encodeURIComponent(item.resource_id)}`,
         name: detail?.resource?.display_name ?? (filePath ? path.basename(filePath) : item.resource_id),
         sheets: item.profile?.sheets ?? null,
       };
@@ -81,6 +221,32 @@ export function createDataWorkService({
     const targets = [...new Set((Array.isArray(resourceIds) ? resourceIds : []).map(String))];
     for (const resourceId of targets) workResource(project.id, resourceId);
     return persistentSession(repository.create({ projectId: project.id, returnState, resourceIds: targets, intent: metadata.intent ?? null, caller: metadata.caller ?? null, at: isoNow() }).session_id);
+  };
+  const reuseProjectSession = (sourceSessionId, { baseRevision, sourceAssignments = null, intent = null, caller = null } = {}) => {
+    if (!repository || !resourceControl) throw new Error('Persistent Work Sessions require the Atlas Resource store.');
+    if (!Number.isInteger(Number(baseRevision)) || Number(baseRevision) < 1) throw stateConflict('Reusing Work requires its current revision.');
+    const sourceSession = repository.byId(sourceSessionId);
+    if (!sourceSession || sourceSession.status !== 'open') throw new Error('This Work Session is unavailable.');
+    let assignments = null;
+    if (sourceAssignments != null) {
+      if (!Array.isArray(sourceAssignments) || sourceAssignments.length !== sourceSession.sources.length) throw new Error('Reuse requires exactly one current Resource for every recorded Source slot.');
+      const sourceKeys = new Set(sourceSession.sources.map((item) => item.source_key));
+      const assignedKeys = new Set(); const assignedResources = new Set();
+      assignments = sourceAssignments.map((item) => {
+        const sourceKey = String(item?.source_key ?? ''); const resourceId = String(item?.resource_id ?? '');
+        if (!sourceKeys.has(sourceKey) || assignedKeys.has(sourceKey)) throw new Error('Reuse Source assignments must name every recorded Source slot exactly once.');
+        if (!resourceId || assignedResources.has(resourceId)) throw new Error('Reuse requires a different current Resource for every Source slot.');
+        assignedKeys.add(sourceKey); assignedResources.add(resourceId);
+        workResource(sourceSession.project_id, resourceId);
+        const recorded = sourceSession.sources.find((source) => source.source_key === sourceKey);
+        return { source_key: sourceKey, resource_id: resourceId, sheet: item?.sheet == null ? recorded.sheet : String(item.sheet) };
+      });
+      if (assignedKeys.size !== sourceKeys.size) throw new Error('Reuse requires exactly one current Resource for every recorded Source slot.');
+    } else {
+      for (const item of sourceSession.sources) workResource(sourceSession.project_id, item.resource_id);
+    }
+    const reused = repository.reuse({ sourceSessionId, baseRevision: Number(baseRevision), sourceAssignments: assignments, intent, caller, at: isoNow() });
+    return persistentSession(reused.session_id);
   };
   const currentProjectSession = (project) => {
     if (!repository || !project?.id) return null;
@@ -110,9 +276,11 @@ export function createDataWorkService({
       sources: value.sources.map((item) => {
         let name = item.resource_id;
         try { name = resourceControl?.describe(item.resource_id)?.resource?.display_name ?? name; } catch { /* Retain the stored identity when its record cannot be read. */ }
-        return { resource_id: item.resource_id, name, status: item.status };
+        return { resource_id: item.resource_id, name, status: item.status, version_policy: item.version_policy ?? 'follow_latest' };
       }),
       latest_save_id: value.latest_save_id,
+      reused_from_session_id: value.reused_from_session_id,
+      freshness: freshnessSummary(value),
       desktop_href: `/work/${encodeURIComponent(value.session_id)}`,
     }));
     const complete = offset + works.length >= listing.total;
@@ -164,18 +332,33 @@ export function createDataWorkService({
   };
   const persistentSession = (id) => {
     const value = hydratePersistent(repository?.byId(id));
-    return value ? { ...value, comparison: comparison(value), mapping_complete: completeMapping(value) } : null;
+    const reusedFrom = value?.reused_from_session_id ? repository?.byId(value.reused_from_session_id) : null;
+    return value ? {
+      ...value,
+      comparison: comparison(value),
+      mapping_complete: completeMapping(value),
+      freshness: freshnessSummary(value),
+      reuse_action: `/work/${encodeURIComponent(value.session_id)}/reuse`,
+      reused_from_work: value.reused_from_session_id ? {
+        session_id: value.reused_from_session_id,
+        intent: reusedFrom?.intent ?? null,
+        revision: reusedFrom?.revision ?? null,
+        desktop_href: `/work/${encodeURIComponent(value.reused_from_session_id)}`,
+      } : null,
+    } : null;
   };
   const validateSources = async (id) => {
     const stored = repository?.byId(id);
     let value = persistentSession(id);
     if (!value) return null;
     let invalidated = false;
+    const reconciliations = new Map();
     for (const item of value.sources) {
       const priorStatus = stored?.sources.find((source) => source.source_key === item.source_key)?.status;
       if (!item.file_path || !fs.existsSync(item.file_path)) {
         repository.setSourceStatus(id, item.source_key, 'missing', 'The selected Resource is no longer available at its recorded location.', isoNow());
         if (priorStatus !== 'missing') invalidated = true;
+        reconciliations.set(item.source_key, reconciliationSummary(item, null, isoNow()));
         continue;
       }
       if (!dataFile(item.file_path)) {
@@ -184,22 +367,45 @@ export function createDataWorkService({
         continue;
       }
       const current = await fingerprintFn(item.file_path);
-      if (item.fingerprint?.sha256 && current.sha256 !== item.fingerprint.sha256) {
-        if (priorStatus !== 'changed') {
-          repository.setSourceStatus(id, item.source_key, 'changed', 'This Source changed after its facts were prepared. Refresh Sources before continuing.', isoNow());
+      const contentChanged = Boolean(item.fingerprint?.sha256 && current.sha256 !== item.fingerprint.sha256);
+      const pathChanged = Boolean(item.fingerprint?.file_path && !samePath(item.fingerprint.file_path, current.file_path ?? item.file_path));
+      const nextStatus = contentChanged ? 'changed' : pathChanged ? 'moved' : null;
+      let comparedCurrent = current;
+      if (contentChanged) {
+        try {
+          const currentProfile = await runDataWorkFn({ projectRoot, installationRoot, filePath: item.file_path, expectedSha256: current.sha256, action: 'profile', sheet: item.sheet });
+          comparedCurrent = { ...current, profile: currentProfile };
+        } catch { /* Fingerprint facts still provide a deterministic bounded comparison. */ }
+      }
+      if (nextStatus) {
+        if (priorStatus !== nextStatus) {
+          const message = contentChanged && pathChanged
+            ? 'This Source moved and changed after its facts were prepared. Review the recorded and current versions before continuing.'
+            : contentChanged
+              ? 'This Source changed after its facts were prepared. Review the recorded and current versions before continuing.'
+              : 'This Source moved after its facts were prepared. Review the recorded and current locations before continuing.';
+          repository.setSourceStatus(id, item.source_key, nextStatus, message, isoNow());
           invalidated = true;
         }
-      } else if (priorStatus === 'missing' || priorStatus === 'changed') {
+      } else if (['missing', 'changed', 'moved'].includes(priorStatus)) {
         repository.setSourceStatus(id, item.source_key, item.fingerprint ? 'ready' : 'pending', null, isoNow());
       }
+      reconciliations.set(item.source_key, reconciliationSummary(item, comparedCurrent, isoNow()));
     }
     if (invalidated) { discardPersistentStage(id); repository.invalidate(id, isoNow()); }
-    return persistentSession(id);
+    const checkedAt = isoNow();
+    const current = persistentSession(id);
+    if (!current) return null;
+    const withReconciliation = { ...current, sources: current.sources.map((item) => ({ ...item, reconciliation: reconciliations.get(item.source_key) ?? reconciliationSummary(item, null, checkedAt) })) };
+    const checked = { ...withReconciliation, freshness: freshnessSummary(withReconciliation, { checked: true, checkedAt }) };
+    return { ...checked, change_review: changeReview(checked) };
   };
   const prepareSources = async (id, { baseRevision = null } = {}) => {
     if (baseRevision != null) assertRevision(id, baseRevision);
     let value = persistentSession(id);
     if (!value) throw new Error('This Work Session is unavailable.');
+    let reconciliationRequired = false;
+    let detectedNewChange = false;
     for (const item of value.sources) {
       if (!item.file_path || !fs.existsSync(item.file_path)) {
         repository.setSourceStatus(id, item.source_key, 'missing', 'The selected Resource is no longer available at its recorded location.', isoNow());
@@ -207,16 +413,103 @@ export function createDataWorkService({
       }
       try {
         const fingerprint = await fingerprintFn(item.file_path);
-        if (item.fingerprint?.sha256 && item.fingerprint.sha256 !== fingerprint.sha256) { discardPersistentStage(id); repository.invalidate(id, isoNow()); }
+        const changed = Boolean(item.fingerprint?.sha256 && item.fingerprint.sha256 !== fingerprint.sha256);
+        const moved = Boolean(item.fingerprint?.file_path && !samePath(item.fingerprint.file_path, fingerprint.file_path ?? item.file_path));
+        if (changed || moved) {
+          const status = changed ? 'changed' : 'moved';
+          if (item.status !== status) detectedNewChange = true;
+          repository.setSourceStatus(id, item.source_key, status, changed && moved
+            ? 'This Source moved and changed. Choose how to reconcile it before preparing.'
+            : changed ? 'This Source changed. Choose how to reconcile it before preparing.' : 'This Source moved. Choose how to reconcile it before preparing.', isoNow());
+          reconciliationRequired = true;
+          continue;
+        }
         const result = await runDataWorkFn({ projectRoot, installationRoot, filePath: item.file_path, expectedSha256: fingerprint.sha256, action: 'profile', sheet: item.sheet });
+        const replacementPending = Boolean(value.reused_from_session_id && !item.fingerprint && item.profile?.profile?.fields);
+        if (replacementPending && result.status !== 'sheet_required') {
+          const mismatch = reuseFieldMismatch(item.profile, result);
+          if (mismatch.missing.length || mismatch.incompatible.length || mismatch.added.length) {
+            const details = [
+              mismatch.missing.length ? `missing fields: ${mismatch.missing.join(', ')}` : '',
+              mismatch.added.length ? `added fields: ${mismatch.added.join(', ')}` : '',
+              mismatch.incompatible.length ? `type mismatch: ${mismatch.incompatible.map((entry) => `${entry.field} ${entry.recorded_type}→${entry.current_type}`).join(', ')}` : '',
+            ].filter(Boolean).join('; ');
+            repository.updateSource(id, item.source_key, { fingerprint, profile: result, processorVersion: result.processor?.version ?? null, status: 'failed', errorMessage: `This assigned Source does not match its recorded slot (${details}). Review only this Source assignment.` }, isoNow());
+            continue;
+          }
+          repository.updateSource(id, item.source_key, { fingerprint, profile: result, processorVersion: result.processor?.version ?? null, status: 'ready', errorMessage: null }, isoNow());
+          repository.rebindSourceMapping(id, item.source_key, { sha256: fingerprint.sha256, sheet: item.sheet }, isoNow());
+          continue;
+        }
         repository.updateSource(id, item.source_key, { fingerprint, profile: result, processorVersion: result.processor?.version ?? null, status: result.status === 'sheet_required' ? 'sheet_required' : 'ready', errorMessage: null }, isoNow());
       } catch (error) {
         repository.setSourceStatus(id, item.source_key, 'failed', String(error?.message ?? error).slice(0, 300), isoNow());
       }
     }
+    if (reconciliationRequired) {
+      discardPersistentStage(id);
+      if (detectedNewChange) repository.invalidate(id, isoNow());
+      throw stateConflict('One or more Sources changed. Review recorded and current facts, then choose use current, pin recorded, or stop using.');
+    }
     if (baseRevision != null) assertRevision(id, baseRevision);
     return persistentSession(id);
   };
+
+  const reconcileSources = async (id, sourceKeys, decision, { baseRevision = null } = {}) => {
+    assertRevision(id, baseRevision);
+    const value = persistentSession(id);
+    const selected = [...new Set((sourceKeys ?? []).map(String))];
+    if (!selected.length) throw new Error('Choose at least one Work Source to reconcile.');
+    const items = selected.map((sourceKey) => value?.sources.find((entry) => entry.source_key === sourceKey));
+    if (items.some((item) => !item)) throw new Error('Work Source is unavailable.');
+    if (decision === 'pin-recorded') {
+      if (items.some((item) => !item.fingerprint?.sha256)) throw new Error('Every selected Source needs a recorded version before it can be pinned.');
+      const result = repository.applySourceReconciliations(id, selected, decision, {}, isoNow(), baseRevision);
+      discardPersistentStage(id);
+      return persistentSession(result.session_id);
+    }
+    if (decision === 'follow-latest') {
+      const result = repository.applySourceReconciliations(id, selected, decision, {}, isoNow(), baseRevision);
+      discardPersistentStage(id);
+      return persistentSession(result.session_id);
+    }
+    if (decision === 'stop-using') {
+      const result = repository.applySourceReconciliations(id, selected, decision, {}, isoNow(), baseRevision);
+      discardPersistentStage(id);
+      return persistentSession(result.session_id);
+    }
+    if (decision !== 'use-current') throw new Error('Choose use-current, pin-recorded, follow-latest, or stop-using.');
+    const updates = [];
+    for (const item of items) {
+      if (!item.file_path || !fs.existsSync(item.file_path)) throw new Error('A selected current Source is missing. Relink it before using the current version.');
+      if (!dataFile(item.file_path)) throw new Error('Work supports CSV or XLSX Resources.');
+      const fingerprint = await fingerprintFn(item.file_path);
+      const result = await runDataWorkFn({ projectRoot, installationRoot, filePath: item.file_path, expectedSha256: fingerprint.sha256, action: 'profile', sheet: item.sheet });
+      const mismatch = reuseFieldMismatch(item.profile, result);
+      const mappingCompatible = result.status !== 'sheet_required' && !mismatch.missing.length && !mismatch.incompatible.length && !mismatch.added.length;
+      const mismatchDetail = [
+        mismatch.missing.length ? `missing fields: ${mismatch.missing.join(', ')}` : '',
+        mismatch.added.length ? `added fields: ${mismatch.added.join(', ')}` : '',
+        mismatch.incompatible.length ? `type mismatch: ${mismatch.incompatible.map((entry) => `${entry.field} ${entry.recorded_type}→${entry.current_type}`).join(', ')}` : '',
+      ].filter(Boolean).join('; ');
+      updates.push({
+        sourceKey: item.source_key,
+        fingerprint,
+        profile: result,
+        processorVersion: result.processor?.version ?? null,
+        sheet: item.sheet,
+        mappingCompatible,
+        status: result.status === 'sheet_required' ? 'sheet_required' : mappingCompatible ? 'ready' : 'mapping_required',
+        errorMessage: mappingCompatible ? null : result.status === 'sheet_required'
+          ? 'Choose a sheet before continuing.'
+          : `Current Source fields need review (${mismatchDetail}). Only this Source alignment was cleared.`,
+      });
+    }
+    const adopted = repository.applySourceReconciliations(id, selected, decision, { updates }, isoNow(), baseRevision);
+    discardPersistentStage(id);
+    return persistentSession(adopted.session_id);
+  };
+  const reconcileSource = (id, sourceKey, decision, options = {}) => reconcileSources(id, [sourceKey], decision, options);
   const selectSourceSheet = (id, sourceKey, sheet, { baseRevision = null } = {}) => { assertRevision(id, baseRevision); discardPersistentStage(id); return persistentSession(repository.setSheet(id, sourceKey, String(sheet ?? ''), isoNow(), baseRevision).session_id); };
   const confirmMapping = (id, mapping, { baseRevision = null } = {}) => {
     assertRevision(id, baseRevision);
@@ -379,5 +672,5 @@ export function createDataWorkService({
   const stage = async (id) => { const value = session(id); if (!value) throw new Error('This Data Work session is no longer available.'); if (value.staged_path && value.staged && fs.existsSync(value.staged_path)) return value.preview; return invoke(value, 'export', { exportStage: true }); };
   const clearStage = (id) => { const value = session(id); if (!value) return; invalidateStage(value); };
   const attachProject = (id, project) => { const value = session(id); if (!value) return null; value.project = project; return value; };
-  return { projectSession, createProjectSession, currentProjectSession, openProjectSessions, discoverProjectSessions, assertRevision, replaceSources, addSource, removeSource, validateSources, prepareSources, selectSourceSheet, confirmMapping, updateRecipe, previewPersistent, stagePersistent, persistentStage, clearPersistentStage, recordSave, begin, session, selectSheet, change, page, stage, clearStage, attachProject, cleanup, expire };
+  return { projectSession, createProjectSession, reuseProjectSession, currentProjectSession, openProjectSessions, discoverProjectSessions, assertRevision, replaceSources, addSource, removeSource, validateSources, prepareSources, reconcileSource, reconcileSources, selectSourceSheet, confirmMapping, updateRecipe, previewPersistent, stagePersistent, persistentStage, clearPersistentStage, recordSave, begin, session, selectSheet, change, page, stage, clearStage, attachProject, cleanup, expire };
 }
