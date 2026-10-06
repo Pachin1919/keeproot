@@ -142,6 +142,53 @@ test('Intake accepts one Agent-proposed target without forcing a whole-library C
   }), /escapes the root/i);
 });
 
+test('V20 Intake blocks an explicit target that conflicts with an approved placement rule', (t) => {
+  const { caseRoot, vault, stateDir, projectId } = setup('intake-v20-target-rule-conflict');
+  const source = candidate(caseRoot, 'community-notes.md', '# Interview notes\n');
+  const intake = new Intake({ stateDir });
+  t.after(() => intake.dispose());
+  const proposed = intake.rules.propose({
+    root: vault,
+    proposal: {
+      kind: 'placement', scope: { type: 'project', project_id: projectId }, condition: {},
+      value: { role: 'note', target_subdirectory: 'Working' },
+      summary: 'Put Project notes in Working.', basis: 'observed', confidence: 0.9,
+      evidence: [{ path: 'Projects/Atlas/Sources', fact: 'Project source folder observed.' }],
+    },
+  });
+  intake.rules.approve(proposed.rule_change_id, { reason: 'Use the reviewed Project note route.' });
+  const plan = intake.plan({
+    root: vault, candidateFile: source, origin: 'human_written', kind: 'note', projectId,
+    target: 'Projects/Atlas/Outputs/community-notes.md',
+    strictPlacement: true,
+  });
+  assert.equal(plan.status, 'blocked');
+  assert.equal(plan.target, null);
+  assert.equal(plan.recommendation?.target, 'Projects/Atlas/Working/community-notes.md');
+  assert.equal(plan.proposed_target, 'Projects/Atlas/Outputs/community-notes.md');
+  assert.equal(plan.rule_target, 'Projects/Atlas/Working/community-notes.md');
+  assert.equal(intake.plan({
+    root: vault, candidateFile: source, origin: 'human_written', kind: 'note', projectId,
+    target: 'Projects/Atlas/Outputs/community-notes.md',
+  }).status, 'ready');
+});
+
+test('V20 Intake rehashes its source inside the publication lock', (t) => {
+  const { caseRoot, vault, stateDir, projectId } = setup('intake-v20-locked-source-check');
+  const source = candidate(caseRoot, 'locked-source.md', '# Original\n');
+  const intake = new Intake({ stateDir });
+  t.after(() => intake.dispose());
+  const target = 'Projects/Atlas/Outputs/locked-source.md';
+  const prepared = intake.prepare({ root: vault, candidateFile: source, origin: 'human_written', kind: 'note', projectId, target });
+  const originalExecute = intake.derived.execute.bind(intake.derived);
+  intake.derived.execute = (runId, options) => {
+    fs.writeFileSync(source, '# Changed after lock-outside check\n');
+    return originalExecute(runId, options);
+  };
+  assert.throws(() => intake.execute(prepared.run_id, { reason: 'Test source revalidation.' }), /Candidate changed/u);
+  assert.equal(fs.existsSync(path.join(vault, target)), false);
+});
+
 test('Intake defaults origins to clear roles and routes them through the accepted Contract', (t) => {
   const { caseRoot, vault, stateDir, projectId } = setup('intake-origin-defaults');
   const intake = new Intake({ stateDir });

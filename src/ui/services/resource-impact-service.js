@@ -83,3 +83,57 @@ export function buildResourceImpactLanes({ resource, workSessions = [], savedWor
       };
     });
 }
+
+export function buildResourceFocusGraph({ projectId, resource, relationshipFocus, workSessions = [], savedWork = [], impactLanes = null, maxNodes = 50, maxEdges = 100 }) {
+  const resourceId = resource?.resource_id ?? resource?.resource?.id ?? null;
+  if (!projectId || !resourceId || relationshipFocus?.project_id !== projectId || relationshipFocus?.root_resource_id !== resourceId) {
+    return { project_id: projectId ?? null, root_resource_id: resourceId, nodes: [], edges: [], truncated: false, file_verification: 'not_checked' };
+  }
+  const nodes = new Map(); const edges = new Map();
+  const relationshipNodes = relationshipFocus.nodes ?? [];
+  const relationshipNodeLimit = Math.max(1, maxNodes - 10);
+  let truncated = Boolean(relationshipFocus.truncated) || relationshipNodes.length > relationshipNodeLimit;
+  const resourceHref = (id) => `/projects/${encodeURIComponent(projectId)}/resources?resource_id=${encodeURIComponent(id)}`;
+  for (const item of relationshipNodes.slice(0, relationshipNodeLimit)) {
+    if (!item?.resource_id) continue;
+    nodes.set(`resource:${item.resource_id}`, { id: `resource:${item.resource_id}`, kind: 'resource', resource_id: item.resource_id,
+      label: String(item.name ?? item.resource_id).slice(0, 256), relative_path: item.relative_path ?? null, hop: item.hop ?? 0, href: resourceHref(item.resource_id) });
+  }
+  for (const item of relationshipFocus.edges ?? []) {
+    const sourceId = `resource:${item.source_resource_id}`; const targetId = `resource:${item.target_id}`;
+    if (!nodes.has(sourceId) || !nodes.has(targetId)) continue;
+    if (edges.size >= maxEdges) { truncated = true; break; }
+    edges.set(item.id, { id: item.id, kind: 'linked_to', relationship_id: item.id, source: sourceId, target: targetId,
+      direction: item.direction, hop: item.hop, status: item.status, evidence: item.evidence ?? {}, needs_review: item.needs_review === true, file_verification: 'not_checked' });
+  }
+  const lanes = Array.isArray(impactLanes) ? impactLanes : buildResourceImpactLanes({ resource,
+    workSessions: workSessions.filter((work) => work.project_id === projectId),
+    savedWork: savedWork.filter((item) => item.project?.id === projectId || item.project_id === projectId),
+  });
+  const orderedLanes = [...lanes].sort((left, right) => String(left.work?.session_id).localeCompare(String(right.work?.session_id)));
+  for (const lane of orderedLanes) {
+    const work = lane.work;
+    if (!work?.session_id || (nodes.size >= maxNodes && !nodes.has(`work:${work.session_id}`))) { truncated = true; continue; }
+    const workNodeId = `work:${work.session_id}`;
+    nodes.set(workNodeId, { id: workNodeId, kind: 'work', session_id: work.session_id, label: work.session_id,
+      revision: work.revision, freshness: work.freshness, href: work.href ?? `/work/${encodeURIComponent(work.session_id)}` });
+    const sourceEdgeId = `derived:source:${resourceId}:${work.session_id}`;
+    if (edges.size < maxEdges) edges.set(sourceEdgeId, { id: sourceEdgeId, kind: 'derived', derived_kind: 'source_to_work',
+      source: `resource:${resourceId}`, target: workNodeId, resource_id: resourceId, work_session_id: work.session_id, impact: lane.impact });
+    else truncated = true;
+    for (const result of [...(lane.results ?? [])].sort((left, right) => String(left.save_id).localeCompare(String(right.save_id)))) {
+      if (result?.output_state !== 'verified' || !result.save_id) continue;
+      const resultNodeId = `result:${result.save_id}`;
+      if (!nodes.has(resultNodeId) && nodes.size >= maxNodes) { truncated = true; break; }
+      nodes.set(resultNodeId, { id: resultNodeId, kind: 'result', save_id: result.save_id, resource_id: result.resource_id ?? null,
+        label: String(result.name ?? result.save_id).slice(0, 256), output_state: result.output_state, freshness: result.freshness,
+        href: result.href ?? `/work/${encodeURIComponent(work.session_id)}/saved?work_id=${encodeURIComponent(result.save_id)}` });
+      const resultEdgeId = `derived:result:${work.session_id}:${result.save_id}`;
+      if (edges.size < maxEdges) edges.set(resultEdgeId, { id: resultEdgeId, kind: 'derived', derived_kind: 'work_to_result',
+        source: workNodeId, target: resultNodeId, work_session_id: work.session_id, save_id: result.save_id, verified: true });
+      else truncated = true;
+    }
+  }
+  return { project_id: projectId, root_resource_id: resourceId, depth: relationshipFocus.depth, status: relationshipFocus.status,
+    nodes: [...nodes.values()].slice(0, maxNodes), edges: [...edges.values()].slice(0, maxEdges), truncated, file_verification: 'not_checked' };
+}

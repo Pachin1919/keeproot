@@ -103,6 +103,7 @@ function htmlDocument(html) {
   const title = normalizeText(decodeEntities(titleMatch?.[1]?.replace(/<[^>]+>/gu, ' ') ?? ''));
   const withoutHidden = html
     .replace(/<!--[\s\S]*?-->/gu, ' ')
+    .replace(/<head\b[^>]*>[\s\S]*?<\/head>/giu, ' ')
     .replace(/<(script|style|noscript|template|svg)\b[^>]*>[\s\S]*?<\/\1>/giu, ' ');
   const withBreaks = withoutHidden
     .replace(/<br\s*\/?\s*>/giu, '\n')
@@ -231,6 +232,7 @@ export async function fetchPublicDocument(urlInput, {
   fetchImpl = globalThis.fetch,
   lookupHost = dns.lookup,
   timeoutMs = 15_000,
+  includeResponseBytes = false,
 } = {}) {
   if (typeof fetchImpl !== 'function') throw new Error('This Node runtime does not provide fetch.');
   let target = await publicUrl(urlInput, lookupHost);
@@ -257,7 +259,18 @@ export async function fetchPublicDocument(urlInput, {
     resolverModes.add(target.resolver_mode);
     redirects += 1;
   }
-  if (!response.ok) throw new Error(`capture fetch returned HTTP ${response.status}.`);
+  const requested = new URL(requestedUrl);
+  const isRequestedShare = [requested, current].some((url) => url.hostname.toLowerCase() === 'chatgpt.com'
+    && url.pathname.toLowerCase().startsWith('/share/'));
+  if (!response.ok) {
+    if (isRequestedShare && [401, 403, 404, 410].includes(response.status)) {
+      const error = new Error('ChatGPT share is unavailable. Export the conversation and capture the export instead.');
+      error.code = 'ATLAS_CAPTURE_EXPORT_REQUIRED';
+      error.capture = { requested_url: requestedUrl, final_url: current.toString(), http_status: response.status };
+      throw error;
+    }
+    throw new Error(`capture fetch returned HTTP ${response.status}.`);
+  }
   const rawContentType = response.headers.get('content-type') ?? '';
   const contentType = rawContentType.split(';')[0].trim().toLowerCase();
   if (!ALLOWED_CONTENT_TYPES.has(contentType)) {
@@ -269,6 +282,14 @@ export async function fetchPublicDocument(urlInput, {
   try { decoder = new TextDecoder(charset); } catch { decoder = new TextDecoder('utf-8'); }
   const decoded = decoder.decode(bytes);
   const chat = contentType === 'text/plain' ? null : chatGptShareDocument(decoded, current);
+  const isShare = [requested, current].some((url) => url.hostname.toLowerCase() === 'chatgpt.com'
+    && url.pathname.toLowerCase().startsWith('/share/'));
+  if (isShare && !chat) {
+    const error = new Error('ChatGPT share content could not be verified. Export the conversation and capture the export instead.');
+    error.code = 'ATLAS_CAPTURE_EXPORT_REQUIRED';
+    error.capture = { requested_url: requestedUrl, final_url: current.toString(), http_status: response.status, content_type: contentType };
+    throw error;
+  }
   const document = contentType === 'text/plain'
     ? { title: current.hostname, text: normalizeText(decoded) }
     : chat ?? htmlDocument(decoded);
@@ -294,6 +315,7 @@ export async function fetchPublicDocument(urlInput, {
     http_status: response.status,
     content_type: contentType,
     downloaded_bytes: bytes.length,
+    ...(includeResponseBytes ? { response_bytes: bytes } : {}),
     resolver_mode: resolverModes.has('https_proxy_fake_ip') ? 'https_proxy_fake_ip' : 'public_dns',
     network_used: true,
     browser_used: false,

@@ -17,7 +17,7 @@ const RULE_KINDS = new Set([
   'agent_output',
 ]);
 const SCOPE_TYPES = new Set(['artifact', 'project', 'library']);
-const BASIS_TYPES = new Set(['observed', 'default']);
+const BASIS_TYPES = new Set(['observed', 'default', 'user_instruction']);
 const ROLE_IDS = new Set(ARTIFACT_ROLES.map((item) => item.id));
 const WRITE_STRATEGIES = new Set(['create', 'delta', 'new_version', 'supersede']);
 const OPERATION_NEEDS = Object.freeze({
@@ -222,7 +222,7 @@ function normalizeProposal(ledger, root, proposal) {
     normalizeRecord(proposal.value ?? {}, 'Rule value'),
   );
   const basis = proposal.basis ?? 'observed';
-  if (!BASIS_TYPES.has(basis)) throw new Error('Rule basis must be observed or default.');
+  if (!BASIS_TYPES.has(basis)) throw new Error('Rule basis must be observed, user_instruction, or default.');
   const confidence = Number(proposal.confidence);
   if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
     throw new Error('Rule confidence must be between 0 and 1.');
@@ -384,6 +384,95 @@ export class PreferenceRules {
     `).all(root).map(rowToRule);
   }
 
+  pending({ root: rootInput, projectId }) {
+    const root = normalizeRoot(rootInput);
+    if (typeof projectId !== 'string' || !projectId.trim()) {
+      throw new Error('Pending rule proposals require a Project ID.');
+    }
+    return this.ledger.db.prepare(`
+      SELECT id AS rule_change_id, kind, summary, basis, status, created_at
+      FROM rule_change_proposals
+      WHERE root_path = ? AND scope_type = 'project' AND scope_key = ? AND status = 'prepared'
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT 50
+    `).all(root, projectId.trim());
+  }
+
+  pendingPage({ root: rootInput, projectId, limit = 50, cursor = null }) {
+    const root = normalizeRoot(rootInput);
+    if (typeof projectId !== 'string' || !projectId.trim()) {
+      throw new Error('Pending rule proposals require a Project ID.');
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+      throw new Error('Pending rule page limit must be between 1 and 50.');
+    }
+    const project = projectId.trim();
+    let watermark = null;
+    let after = null;
+    if (cursor !== null) {
+      if (typeof cursor !== 'string' || cursor.length > 2048 || !/^[A-Za-z0-9_-]+$/u.test(cursor)) {
+        throw stateConflict('Pending rule cursor is invalid.');
+      }
+      try {
+        const decoded = Buffer.from(cursor, 'base64url');
+        if (decoded.toString('base64url') !== cursor || decoded.length > 1536) throw new Error('invalid encoding');
+        const payload = JSON.parse(decoded.toString('utf8'));
+        const validKey = (key) => key && typeof key.created_at === 'string'
+          && key.created_at.length > 0 && key.created_at.length <= 64
+          && Number.isSafeInteger(key.rowid) && key.rowid > 0;
+        if (!payload || payload.version !== 1 || payload.root !== root || payload.project_id !== project
+            || !validKey(payload.watermark) || !validKey(payload.after)) {
+          throw new Error('invalid cursor payload');
+        }
+        watermark = payload.watermark;
+        after = payload.after;
+      } catch {
+        throw stateConflict('Pending rule cursor is invalid or belongs to a different Project or root.');
+      }
+    }
+
+    const clauses = [
+      'root_path = ?',
+      "scope_type = 'project'",
+      'scope_key = ?',
+      "status = 'prepared'",
+    ];
+    const parameters = [root, project];
+    if (watermark) {
+      clauses.push('(created_at < ? OR (created_at = ? AND rowid <= ?))');
+      parameters.push(watermark.created_at, watermark.created_at, watermark.rowid);
+    }
+    if (after) {
+      clauses.push('(created_at < ? OR (created_at = ? AND rowid < ?))');
+      parameters.push(after.created_at, after.created_at, after.rowid);
+    }
+    parameters.push(limit + 1);
+    const rows = this.ledger.db.prepare(`
+      SELECT rowid AS proposal_rowid, id AS rule_change_id, kind, summary, basis, status, created_at
+      FROM rule_change_proposals
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT ?
+    `).all(...parameters);
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map(({ proposal_rowid, ...item }) => item);
+    if (!watermark && rows.length) {
+      watermark = { created_at: rows[0].created_at, rowid: rows[0].proposal_rowid };
+    }
+    let nextCursor = null;
+    if (hasMore && items.length && watermark) {
+      const last = rows[items.length - 1];
+      nextCursor = Buffer.from(JSON.stringify({
+        version: 1,
+        root,
+        project_id: project,
+        watermark,
+        after: { created_at: last.created_at, rowid: last.proposal_rowid },
+      }), 'utf8').toString('base64url');
+    }
+    return { items, next_cursor: nextCursor, has_more: hasMore };
+  }
+
   history({ root: rootInput }) {
     const root = normalizeRoot(rootInput);
     return this.ledger.db.prepare(`
@@ -538,7 +627,11 @@ export class PreferenceRules {
     const proposalHash = hashJson(normalized);
     const existingProposal = this.ledger.db.prepare(`
       SELECT id, run_id, status FROM rule_change_proposals
-      WHERE root_path = ? AND proposal_hash = ? AND status IN ('prepared', 'approved')
+      WHERE root_path = ? AND proposal_hash = ?
+        AND (status = 'prepared' OR (status = 'approved' AND EXISTS (
+          SELECT 1 FROM preference_rules r
+          WHERE r.id = rule_change_proposals.activated_rule_id AND r.status = 'active'
+        )))
       ORDER BY created_at DESC, rowid DESC LIMIT 1
     `).get(root, proposalHash);
     if (existingProposal) {
@@ -633,6 +726,7 @@ export class PreferenceRules {
       schema: 'atlas-preference-rule-preview.v1',
       rule_change_id: row.id,
       run_id: row.run_id,
+      root: row.root_path,
       status: row.status,
       current_rule: current,
       candidate,
@@ -684,6 +778,15 @@ export class PreferenceRules {
       const definitionHash = hashJson(definition);
       const preferenceRuleId = `PREF-${definitionHash.slice(0, 20).toUpperCase()}`;
       const ruleVersionId = `RULE-PREF-${definitionHash.slice(0, 20).toUpperCase()}`;
+      const priorDefinition = this.ledger.db.prepare(
+        'SELECT status FROM preference_rules WHERE id = ?',
+      ).get(preferenceRuleId);
+      if (priorDefinition) {
+        const message = priorDefinition.status === 'disabled'
+          ? 'A disabled preference rule with this definition already exists; propose a changed definition instead.'
+          : 'A previously recorded preference rule with this definition already exists.';
+        throw stateConflict(message);
+      }
       const receipt = {
         rule_id: preferenceRuleId,
         rule_change_id: changeId,
@@ -804,6 +907,100 @@ export class PreferenceRules {
           INSERT INTO operation_events(id, run_id, event_type, payload_json, occurred_at)
           VALUES (?, ?, 'preference_rule_rejected', ?, ?)
         `).run(`EVT-${crypto.randomUUID()}`, preview.run_id, json(receipt), reviewedAt);
+      });
+      return receipt;
+    });
+  }
+
+  previewDisable(ruleId) {
+    const row = this.ledger.db.prepare('SELECT * FROM preference_rules WHERE id = ?').get(ruleId);
+    if (!row) throw new Error(`Preference rule not found: ${ruleId}`);
+    if (row.status !== 'active') {
+      throw stateConflict(`Preference rule cannot be disabled from status ${row.status}.`);
+    }
+    const rule = rowToRule(row);
+    return {
+      schema: 'atlas-preference-rule-disable-preview.v1',
+      ...rule,
+      impact: { consumers: [...(IMPACT_CONSUMERS[rule.kind] ?? ['rule.context'])] },
+      preview_revision: hashJson({
+        rule_id: row.id,
+        rule_version_id: row.rule_version_id,
+        status: row.status,
+        created_at: row.created_at,
+        superseded_at: row.superseded_at ?? null,
+      }),
+      source_changes: [],
+    };
+  }
+
+  disable(ruleId, { expectedPreviewRevision, reason, caller = {} } = {}) {
+    if (typeof expectedPreviewRevision !== 'string' || !/^[a-f0-9]{64}$/u.test(expectedPreviewRevision)) {
+      throw new Error('Rule deactivation requires a preview revision.');
+    }
+    if (typeof reason !== 'string' || !reason.trim()) {
+      throw new Error('Rule deactivation requires a reason.');
+    }
+    return withStateLock(this.stateDir, () => {
+      let receipt;
+      this.ledger.transaction(() => {
+        const row = this.ledger.db.prepare('SELECT * FROM preference_rules WHERE id = ?').get(ruleId);
+        if (!row) throw new Error(`Preference rule not found: ${ruleId}`);
+        if (row.status === 'disabled') {
+          const prior = this.ledger.db.prepare(`
+            SELECT payload_json FROM operation_events
+            WHERE run_id = ? AND event_type = 'preference_rule_disabled'
+            ORDER BY occurred_at DESC, rowid DESC LIMIT 1
+          `).get(row.run_id);
+          const priorReceipt = prior ? parseJson(prior.payload_json, {}) : null;
+          if (priorReceipt?.preview_revision === expectedPreviewRevision) {
+            receipt = priorReceipt;
+            return;
+          }
+          throw stateConflict('The preference rule changed after disable preview; review it again.');
+        }
+        if (row.status !== 'active') {
+          throw stateConflict(`Preference rule cannot be disabled from status ${row.status}.`);
+        }
+        const currentRevision = hashJson({
+          rule_id: row.id,
+          rule_version_id: row.rule_version_id,
+          status: row.status,
+          created_at: row.created_at,
+          superseded_at: row.superseded_at ?? null,
+        });
+        if (currentRevision !== expectedPreviewRevision) {
+          throw stateConflict('The preference rule changed after disable preview; review it again.');
+        }
+        const disabledAt = timestamp();
+        receipt = {
+          rule_id: row.id,
+          rule_version_id: row.rule_version_id,
+          run_id: row.run_id,
+          status: 'disabled',
+          preview_revision: expectedPreviewRevision,
+          reason: reason.trim(),
+          caller: {
+            actor: caller.actor ?? 'unknown',
+            agent: caller.agent ?? null,
+            model: caller.model ?? null,
+            tool: caller.tool ?? 'atlas-cli',
+            client_run_id: caller.client_run_id ?? null,
+          },
+          disabled_at: disabledAt,
+          source_changes: [],
+        };
+        const updated = this.ledger.db.prepare(`
+          UPDATE preference_rules SET status = 'disabled'
+          WHERE id = ? AND rule_version_id = ? AND status = 'active'
+        `).run(row.id, row.rule_version_id);
+        if (Number(updated.changes) !== 1) {
+          throw stateConflict('The preference rule changed while it was being disabled; review it again.');
+        }
+        this.ledger.db.prepare(`
+          INSERT INTO operation_events(id, run_id, event_type, payload_json, occurred_at)
+          VALUES (?, ?, 'preference_rule_disabled', ?, ?)
+        `).run(`EVT-${crypto.randomUUID()}`, row.run_id, json(receipt), disabledAt);
       });
       return receipt;
     });

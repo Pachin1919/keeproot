@@ -198,10 +198,10 @@ test('Skill command sequence completes Agent Bootstrap, Derived, Tracked Direct,
   assert.ok(capabilities.workflows.bootstrap.includes('recommend'));
   assert.ok(capabilities.workflows.bootstrap.includes('contract'));
   assert.ok(capabilities.workflows.bootstrap.includes('adopt'));
-  assert.deepEqual(capabilities.workflows.save, ['prepare', 'show', 'execute', 'undo', 'redo']);
+  assert.deepEqual(capabilities.workflows.save, ['plan', 'prepare', 'review', 'show', 'execute', 'undo', 'redo', 'directory-prepare', 'directory-show']);
   assert.deepEqual(capabilities.workflows.table_work, ['start', 'show', 'reuse', 'reconcile', 'reconcile-batch', 'add-source', 'remove-source', 'prepare', 'sheet', 'align', 'recipe', 'preview', 'save', 'list']);
   assert.equal(capabilities.workflows.intake.includes('execute'), false);
-  assert.deepEqual(capabilities.workflows.capture, ['fetch', 'localize', 'sample']);
+  assert.deepEqual(capabilities.workflows.capture, ['fetch', 'localize', 'sample', 'source-prepare', 'source-inspect-export', 'source-prepare-export', 'source-show', 'source-read']);
   assert.equal(capabilities.browser_capture.maximum_sample_characters, 4000);
   assert.ok(capabilities.workflows.evolution.includes('execute'));
   assert.deepEqual(capabilities.evolution_operations, [

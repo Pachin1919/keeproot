@@ -328,6 +328,26 @@ test('Derived execute and rollback resume only after Atlas recorded operation in
   assert.equal(derived.rollback(prepared.run_id).status, 'rolled_back');
 });
 
+test('Derived locked preflight gates new publication but preserves proven publication recovery', (t) => {
+  const { vault, stateDir, projectId } = setup('derived-internal-preflight-recovery');
+  const derived = openDerived(t, stateDir);
+  const fresh = derived.prepare({ root: vault, inputs: ['allowed-a.md'], target: 'Projects/Atlas/new-preflight.md', candidateContent: 'new output\n', projectId, role: 'report' });
+  derived.approve(fresh.run_id);
+  assert.throws(() => derived.execute(fresh.run_id, { internalPreflight: () => { throw new Error('preflight rejected'); } }), /preflight rejected/u);
+  assert.equal(fs.existsSync(path.join(vault, 'Projects', 'Atlas', 'new-preflight.md')), false);
+
+  const resumed = derived.prepare({ root: vault, inputs: ['allowed-a.md'], target: 'Projects/Atlas/resumed-preflight.md', candidateContent: 'resumed output\n', projectId, role: 'report' });
+  derived.approve(resumed.run_id);
+  const target = path.join(vault, 'Projects', 'Atlas', 'resumed-preflight.md');
+  const temporary = path.join(path.dirname(target), '.atlas-derived-owned-preflight.publish.tmp');
+  derived.ledger.startDerivedExecution(resumed.run_id, new Date().toISOString(), { publish_token: 'preflight-owned', temp_path: temporary });
+  fs.copyFileSync(derived.preview(resumed.run_id).candidate.blob_path, temporary, fs.constants.COPYFILE_EXCL);
+  fs.linkSync(temporary, target);
+  assert.equal(derived.execute(resumed.run_id, { internalPreflight: () => { throw new Error('must skip preflight for proven publication recovery'); } }).status, 'executed');
+  assert.equal(fs.readFileSync(target, 'utf8'), 'resumed output\n');
+  assert.equal(fs.existsSync(temporary), false);
+});
+
 test('Derived revision preserves a rejected Candidate and requires a new placement review', (t) => {
   const { vault, stateDir, projectId } = setup('derived-revision');
   const derived = openDerived(t, stateDir);

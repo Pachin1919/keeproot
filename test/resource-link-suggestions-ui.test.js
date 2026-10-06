@@ -1,0 +1,97 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { Registry } from '../src/registry.js';
+import { createResourceControl } from '../src/resource-control.js';
+import { startAtlasUiServer } from '../src/ui-server.js';
+
+test('Host suggestion is visible in Project Resources, accepted in HTML, then read back by Host ID', async (t) => {
+  const parent = path.resolve('test/.tmp');
+  fs.mkdirSync(parent, { recursive: true });
+  const root = fs.mkdtempSync(path.join(parent, 'resource-link-suggestion-ui-'));
+  const stateDir = path.join(root, 'state');
+  const workspace = path.join(root, 'workspace');
+  const projectRoot = path.join(workspace, 'A');
+  fs.mkdirSync(projectRoot, { recursive: true });
+  const sourcePath = path.join(projectRoot, 'source.md');
+  const targetPath = path.join(projectRoot, 'target.md');
+  fs.writeFileSync(sourcePath, 'source content\n');
+  fs.writeFileSync(targetPath, 'target content\n');
+  const registry = new Registry({ stateDir });
+  const adopted = registry.adoptRoot({ rootPath: workspace, rootType: 'project_workspace', contentPolicy: 'structure_only' });
+  const project = registry.create({ name: 'A', currentPath: 'A' });
+  registry.attachRoot(project.project_id, { rootId: adopted.root_id, relativePath: 'A', reason: 'Suggestion UI fixture.' });
+  const control = createResourceControl({ stateDir, ledger: registry.ledger, registry });
+  const source = control.identify({ filePath: sourcePath, project: { id: project.project_id } });
+  const target = control.identify({ filePath: targetPath, project: { id: project.project_id } });
+  const server = await startAtlasUiServer({ stateDir, registry, rules: {}, runtime: {}, projectRoot: workspace, installationRoot: root, resourceControl: control, desktopPickerEnabled: false });
+  t.after(async () => { await server.close(); control.dispose(); registry.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); });
+  const caller = { tool: 'test-host', client_run_id: 'resource-link-suggestion-ui' };
+  const request = { project_id: project.project_id, source_resource_id: source.resource_id, target: { kind: 'resource', id: target.resource_id }, type: 'linked_to', source_sha256: source.evidence.sha256, target_sha256: target.evidence.sha256, evidence: { reason: 'The target contains the source schedule data.' } };
+  const requestFile = path.join(root, 'suggestion.json');
+  fs.writeFileSync(requestFile, JSON.stringify(request));
+  const cli = (...args) => spawnSync(process.execPath, [path.resolve('bin/atlas.js'), ...args, '--json'], { cwd: path.resolve('.'), env: { ...process.env, ATLAS_STATE_DIR: stateDir }, encoding: 'utf8' });
+  const submitted = cli('resource', 'relationships', 'suggest', '--request-file', requestFile, '--request-key', 'host-ui-suggestion', '--tool', caller.tool, '--client-run-id', caller.client_run_id);
+  assert.equal(submitted.status, 0, submitted.stderr);
+  const suggestion = JSON.parse(submitted.stdout).data;
+  assert.equal(suggestion.status, 'pending');
+  assert.match(suggestion.review_href, new RegExp(`/projects/${project.project_id}/resources/link-suggestions/${suggestion.candidate_id}`, 'u'));
+  const listed=cli('resource','relationships','suggestions','--project',project.project_id);
+  assert.equal(listed.status,0,listed.stderr);
+  assert.equal(JSON.parse(listed.stdout).data.suggestions[0].candidate_id,suggestion.candidate_id);
+  assert.equal(control.linkedResourceRelationships(project.project_id, source.resource_id).length, 0);
+
+  const base = new URL(`projects/${project.project_id}`, server.workspace_url);
+  let html = await (await fetch(new URL('resources', `${base.href}/`))).text();
+  assert.match(html, new RegExp(suggestion.candidate_id, 'u'));
+  const csrf = html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1];
+  assert.ok(csrf);
+  const detailUrl = new URL(`resources/link-suggestions/${encodeURIComponent(suggestion.candidate_id)}`, `${base.href}/`);
+  const detail = await fetch(detailUrl);
+  assert.equal(detail.status, 200);
+  html = await detail.text();
+  assert.match(html, /The target contains the source schedule data/u);
+  assert.match(html, /name="expected_revision"/u);
+  assert.match(html, /name="binding_digest"/u);
+  const decision = await fetch(new URL('decision', detailUrl.href.endsWith('/') ? detailUrl : `${detailUrl.href}/`), {
+    method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ csrf, decision: 'accept', expected_revision: String(suggestion.revision), binding_digest: suggestion.binding_digest, request_key: 'ui-accept-link-suggestion' }),
+  });
+  assert.equal(decision.status, 303);
+  const relationships = control.linkedResourceRelationships(project.project_id, source.resource_id);
+  assert.equal(relationships.length, 1);
+  assert.equal(relationships[0].status, 'active');
+  const graphHtml=await (await fetch(new URL(`resources?resource_id=${encodeURIComponent(source.resource_id)}`,`${base.href}/`))).text();
+  assert.match(graphHtml,new RegExp(relationships[0].id,'u'));
+  assert.match(graphHtml,new RegExp(target.resource_id,'u'));
+  const readback = cli('resource', 'relationships', 'suggestion', '--project', project.project_id, '--candidate', suggestion.candidate_id);
+  assert.equal(readback.status, 0, readback.stderr);
+  const final = JSON.parse(readback.stdout).data;
+  assert.equal(final.candidate_id, suggestion.candidate_id);
+  assert.equal(final.status, 'accepted');
+  assert.equal(final.receipt.relationship.id, relationships[0].id);
+});
+
+test('Rejected suggestion stays out of the relationship graph and remains readable by its ID', async (t) => {
+  const parent = path.resolve('test/.tmp'); fs.mkdirSync(parent, { recursive: true });
+  const root = fs.mkdtempSync(path.join(parent, 'resource-link-suggestion-reject-ui-'));
+  const stateDir = path.join(root, 'state'); const workspace = path.join(root, 'workspace'); const projectRoot = path.join(workspace, 'A');
+  fs.mkdirSync(projectRoot, { recursive: true }); const sourcePath = path.join(projectRoot, 'source.md'); const targetPath = path.join(projectRoot, 'target.md');
+  fs.writeFileSync(sourcePath, 'source'); fs.writeFileSync(targetPath, 'target');
+  const registry = new Registry({ stateDir }); const adopted = registry.adoptRoot({ rootPath: workspace, rootType: 'project_workspace', contentPolicy: 'structure_only' });
+  const project = registry.create({ name: 'A', currentPath: 'A' }); registry.attachRoot(project.project_id, { rootId: adopted.root_id, relativePath: 'A', reason: 'Rejected suggestion fixture.' });
+  const control = createResourceControl({ stateDir, ledger: registry.ledger, registry }); const source = control.identify({ filePath: sourcePath, project: { id: project.project_id } }); const target = control.identify({ filePath: targetPath, project: { id: project.project_id } });
+  const server = await startAtlasUiServer({ stateDir, registry, rules: {}, runtime: {}, projectRoot: workspace, installationRoot: root, resourceControl: control, desktopPickerEnabled: false });
+  t.after(async () => { await server.close(); control.dispose(); registry.dispose(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); });
+  const submitted = control.suggestLinkedResource({ candidate: { project_id: project.project_id, source_resource_id: source.resource_id, target: { kind: 'resource', id: target.resource_id }, type: 'linked_to', source_sha256: source.evidence.sha256, target_sha256: target.evidence.sha256, evidence: { reason: 'Rejected example.' } }, requestKey: 'host-rejected-suggestion', caller: { tool: 'test-host', client_run_id: 'rejected-suggestion' } });
+  const base = new URL(`projects/${project.project_id}`, server.workspace_url);
+  let html = await (await fetch(new URL('resources', `${base.href}/`))).text(); const csrf = html.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1]; assert.ok(csrf);
+  const detailUrl = new URL(`resources/link-suggestions/${encodeURIComponent(submitted.candidate_id)}`, `${base.href}/`);
+  const response = await fetch(new URL('decision', `${detailUrl.href}/`), { method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, decision: 'reject', expected_revision: String(submitted.revision), binding_digest: submitted.binding_digest, request_key: 'ui-reject-link-suggestion' }) });
+  assert.equal(response.status, 303);
+  assert.equal(control.linkedResourceRelationships(project.project_id, source.resource_id).length, 0);
+  assert.equal(control.linkedResourceSuggestion(project.project_id, submitted.candidate_id).status, 'rejected');
+  html = await (await fetch(new URL('resources', `${base.href}/`))).text(); assert.match(html, new RegExp(submitted.candidate_id, 'u'));
+});

@@ -5,12 +5,12 @@ description: Use the installed Atlas Runtime for real local Workspace files or a
 
 # Atlas File Governance
 
-Use Atlas for deterministic facts, supported file operations, relationships, verification, and recovery. The Host interprets meaning and creates content.
+Atlas supplies facts, supported operations and recovery; Hosts interpret meaning and create content.
 
 ## Gate
 
-- Invoke only for real Workspace material, not because Atlas is mentioned.
-- For development, architecture, Git, docs, or tests, use repository instructions without Runtime workflows.
+- Invoke only for real Workspace material.
+- Development, Git, docs and tests follow repository instructions.
 - Stay within the authorized Project, root, files, and destination.
 
 ## Start once
@@ -19,20 +19,23 @@ Run `scripts/locate-atlas.ps1` once with a 15-second timeout. On `runtime_requir
 
 ## Route
 
+New Hosts or unfamiliar operations: read `capabilities --json` once. `data.product_entrypoints.current_product.command_guide` gives inputs, outputs, failure steps and examples; `atlas --json` gives matching syntax. Use this installation's facts.
+
 Read only the matching reference:
 
 - Inspect one real Resource or compare two files: `references/current-resource.md`.
-- Combine or clean one or more CSV/XLSX Resources in a persistent Work Session: `references/current-table-work.md`.
+- CSV/XLSX processing Work: `references/current-table-work.md`.
 - Save/import a new result, then verify, undo, or redo it: `references/current-save.md`.
-- View writes, property suggestions, or conversation Save: read `capabilities --json`, then `references/cli-protocol.md` and `references/workflows.md`.
+- View writes, property suggestions or conversation Save: `references/cli-protocol.md` and `references/workflows.md`.
 - Unfamiliar JSON or unresolved Runtime errors: `references/cli-protocol.md`.
+- Handoff, local Modules, Project move/split/merge and document updates: use the guide's read-only discovery, then exact mutation syntax.
 - UI only: `atlas ui`, or `atlas ui --path <EXPLICIT_PROJECT_PATH>`.
 
-Never fall back from Resources, Import, Data Work, Save, or Activity to an internal foundation command. Finding an old database row is not authorization. Report unsupported current behavior instead.
+Never fall back to internal foundation commands. Old database rows grant no authority; report unsupported behavior.
 
-Saved View evaluation is read-only and dynamic. Never treat partial or unknown results as complete or as proof nothing changed. A Host may submit at most 10 evidence-backed property candidates for one explicit View or Resource set. This creates a Preview, not accepted values. Only the user can accept, edit-and-accept, or reject them in Desktop.
+Saved Views are read-only and dynamic; partial/unknown is not complete or unchanged. Submit at most 10 evidence-backed property candidates for one explicit View or Resource set. Preview values require user accept/edit/reject in UI.
 
-For structured content, inspect locally first. Let Atlas determine spreadsheet structure, PDF page kind, and PPTX/DOCX objects; do not ask the model to count rows or rediscover facts.
+For structured content, inspect locally first: spreadsheet structure, PDF page kind and Office objects; do not ask the model to count rows or rediscover facts.
 
 ## Execute and stop
 

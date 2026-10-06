@@ -2,11 +2,30 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { sha256File } from './snapshots.js';
-import { Intake } from './intake.js';
+import { Intake, intakePlanRevision } from './intake.js';
 import { withStateLock } from './state-lock.js';
 import { createResourceControl } from './resource-control.js';
 import { projectResourceHref } from './resource-links.js';
 import { assertRecoveryWritable } from './storage/recovery-write-guard.js';
+import { verifyChatGptExportInput } from './chatgpt-export-capture.js';
+
+export function activeSavedResourcePath(db, projectId, resourceId, oldPath) {
+  if (resourceId) {
+    const matches = db.prepare("SELECT path FROM resource_locations WHERE resource_id=? AND project_id=? AND status='active' ORDER BY id").all(resourceId, projectId);
+    return matches.length === 1 ? matches[0].path : oldPath;
+  }
+  if (!oldPath) return oldPath;
+  const identities = db.prepare('SELECT DISTINCT resource_id FROM resource_locations WHERE path=? COLLATE NOCASE').all(oldPath);
+  if (identities.length !== 1) return oldPath;
+  const matches = db.prepare("SELECT path FROM resource_locations WHERE resource_id=? AND project_id=? AND status='active'").all(identities[0].resource_id, projectId);
+  return matches.length === 1 ? matches[0].path : oldPath;
+}
+
+export function currentSavedResourceLocation(db, resourceId) {
+  if (!resourceId) return null;
+  const rows = db.prepare("SELECT * FROM resource_locations WHERE resource_id=? AND status='active' ORDER BY id").all(resourceId);
+  return rows.length === 1 ? rows[0] : null;
+}
 
 const journalPath = (stateDir) => path.join(path.resolve(stateDir), 'ui', 'saved-work.json');
 const now = () => new Date().toISOString();
@@ -136,6 +155,7 @@ function result(row) {
     created_at: row.created_at, executed_at: row.executed_at ?? null,
     resources_href: row.resources_href, verified: row.status === 'executed', undo_available: row.undo_available === true, redo_available: row.redo_available === true,
     resource_id: row.resource_id ?? null, relationships: row.relationships ?? [],
+    preview_revision: row.preview_revision ?? null,
   };
 }
 
@@ -180,10 +200,48 @@ export class SaveService {
   }
 
   #validatePreparedInputs(row) {
-    if (!row?.inputs?.length || !row.prepare_request?.root) return;
-    const current = inputFacts(row.prepare_request.root, row.inputs.map((input) => input.relative_path));
-    if (JSON.stringify(current) !== JSON.stringify(row.inputs)) {
-      throw conflict('A Save input changed after Prepare. Review and prepare the result again.');
+    if (row?.source?.kind === 'capture_source' && row.source.capture_format === 'chatgpt_export') {
+      const input = row.source.export_input;
+      if (!input?.path || !input?.sha256) throw conflict('The prepared ChatGPT export input identity is unavailable.');
+      verifyChatGptExportInput({ inputPath: input.path, expectedInputSha256: input.sha256 });
+    }
+    if (row?.inputs?.length && row.prepare_request?.root) {
+      const current = inputFacts(row.prepare_request.root, row.inputs.map((input) => input.relative_path));
+      if (JSON.stringify(current) !== JSON.stringify(row.inputs)) {
+        throw conflict('A Save input changed after Prepare. Review and prepare the result again.');
+      }
+    }
+  }
+
+  plan(options) {
+    if (typeof this.intake.plan !== 'function') throw new Error('Save planning requires the current Intake planner.');
+    const candidate = candidateFact(options.candidateFile);
+    const root = fs.realpathSync.native(path.resolve(options.root));
+    const inputs = inputFacts(root, options.inputs ?? []);
+    const filename = options.filename ?? (options.target
+      ? path.posix.basename(String(options.target).replaceAll('\\', '/'))
+      : undefined);
+    const plan = this.intake.plan({ ...options, root, candidateFile: candidate.path, filename, strictPlacement: true });
+    const selectedTarget = options.target ?? plan.target ?? null;
+    if (selectedTarget && path.extname(candidate.path).toLowerCase()
+        !== path.extname(String(selectedTarget).replaceAll('\\', '/')).toLowerCase()) {
+      return {
+        ...plan, status: 'blocked', target: null,
+        reason: 'Save cannot change the source file extension in this release.',
+      };
+    }
+    if (plan.proposed_target && plan.rule_target) return plan;
+    const plan_revision = crypto.createHash('sha256').update(JSON.stringify({
+      intake_revision: intakePlanRevision(plan), root, candidate: { path: candidate.path, sha256: candidate.sha256, bytes: candidate.bytes },
+      inputs, target: selectedTarget, project_id: options.projectId ?? plan.project?.id ?? null,
+    })).digest('hex');
+    return { ...plan, target: selectedTarget, plan_revision };
+  }
+
+  #assertPlanRevision(options, expectedPlanRevision) {
+    const current = this.plan(options);
+    if (current.plan_revision !== expectedPlanRevision) {
+      throw conflict('Save plan changed before the locked Prepare; review the current plan again.');
     }
   }
 
@@ -247,7 +305,25 @@ export class SaveService {
       const candidate = candidateFact(options.candidateFile); const inputs = inputFacts(options.root, options.inputs ?? []);
       const replayRoot = fs.realpathSync.native(path.resolve(options.root));
       if (!stored || replayRoot !== stored.root || candidate.path !== stored.candidate_path || candidate.sha256 !== stored.candidate_hash || JSON.stringify(inputs) !== JSON.stringify(stored.inputs)) throw conflict('Save replay no longer matches its reserved prepare request.');
-      detail = this.intake.prepare({ root: stored.root, candidateFile: stored.candidate_path, origin: stored.origin, kind: stored.kind, projectId: stored.project_id, target: stored.target, inputs: options.inputs ?? [], relationType: stored.relation_type, intent: stored.intent, caller: claim.caller, runId: claim.save_id });
+      const replayOptions = {
+        ...options, root: stored.root, candidateFile: stored.candidate_path,
+        origin: stored.origin, kind: stored.kind, projectId: stored.project_id,
+        target: stored.target, inputs: options.inputs ?? [],
+        expectedPlanRevision: stored.expected_plan_revision ?? null,
+      };
+      const planOptions = {
+        ...replayOptions,
+        target: stored.target_was_explicit === false ? undefined : stored.target,
+      };
+      detail = this.intake.prepare({
+        ...replayOptions, relationType: stored.relation_type, intent: stored.intent,
+        caller: claim.caller, runId: claim.save_id,
+        strictPlacement: stored.expected_plan_revision != null,
+        filename: stored.expected_plan_revision != null
+          ? path.posix.basename(String(stored.target).replaceAll('\\', '/')) : options.filename,
+        internalPreflight: stored.expected_plan_revision != null
+          ? () => this.#assertPlanRevision(planOptions, stored.expected_plan_revision) : null,
+      });
     }
     if (detail?.run) {
       const stored = claim.prepare_request;
@@ -279,6 +355,41 @@ export class SaveService {
   }
 
   prepare(options) {
+    const replayChannel = options.channel ?? 'host';
+    const replayCaller = options.caller ?? {};
+    const replayRequestKey = scopedKey({ channel: replayChannel, caller: replayCaller, requestKey: options.requestKey });
+    const existing = readJournal(this.stateDir).find((item) => item.request_key === replayRequestKey) ?? null;
+    if (existing && existing.status !== 'reserving') {
+      const candidate = candidateFact(options.candidateFile);
+      if (options.expectedCandidateHash && options.expectedCandidateHash !== candidate.sha256) {
+        throw conflict('The reviewed Save Candidate changed before confirmation.');
+      }
+      const root = fs.realpathSync.native(path.resolve(options.root));
+      const inputs = inputFacts(root, options.inputs ?? []);
+      const normalized = {
+        root, origin: normalizedToken(options.origin, 'agent_generated'), kind: normalizedToken(options.kind),
+        project_id: options.projectId,
+        target: String(options.target ?? existing.prepare_request?.target ?? '').replaceAll('\\', '/'),
+        candidate_hash: candidate.sha256, inputs,
+        expected_plan_revision: options.expectedPlanRevision ?? null,
+        role: options.role ?? null, relation_type: options.relationType ?? 'derived_from', source: options.source ?? null,
+        parameters: options.parameters ?? {}, result_summary: options.resultSummary ?? {},
+      };
+      const explicitTargetMatches = existing.prepare_request?.target_was_explicit == null
+        || existing.prepare_request.target_was_explicit === (options.target != null);
+      if (!explicitTargetMatches || existing.request_hash !== requestHash(normalized)) {
+        throw conflict('This caller request key was already used for a different save request.');
+      }
+      return result(existing);
+    }
+    let plannedTarget = options.target;
+    if (options.expectedPlanRevision != null) {
+      const plan = this.plan(options);
+      if (plan.plan_revision !== options.expectedPlanRevision) throw conflict('Save plan changed; review the current plan before Prepare.');
+      if (plan.status !== 'ready' || !plan.auto_execute || !plan.target) throw conflict(plan.reason ?? 'Save plan is not ready.');
+      if (options.target && String(options.target).replaceAll('\\', '/') !== String(plan.target).replaceAll('\\', '/')) throw conflict('Save target differs from the reviewed plan.');
+      plannedTarget = plan.target;
+    }
     this.#assertRecoveryWritable(options.projectId, options.source, options.inputs, options.root);
     const channel = options.channel ?? 'host';
     const caller = options.caller ?? {};
@@ -291,8 +402,9 @@ export class SaveService {
     const inputs = inputFacts(root, options.inputs ?? []);
     const normalized = {
       root, origin: normalizedToken(options.origin, 'agent_generated'), kind: normalizedToken(options.kind),
-      project_id: options.projectId, target: String(options.target ?? '').replaceAll('\\', '/'),
+      project_id: options.projectId, target: String(plannedTarget ?? '').replaceAll('\\', '/'),
       candidate_hash: candidate.sha256, inputs,
+      expected_plan_revision: options.expectedPlanRevision ?? null,
       role: options.role ?? null, relation_type: options.relationType ?? 'derived_from', source: options.source ?? null,
       parameters: options.parameters ?? {}, result_summary: options.resultSummary ?? {},
     };
@@ -307,7 +419,7 @@ export class SaveService {
         save_id: saveId, run_id: saveId, status: 'reserving', channel, caller,
         project: null, target: { path: null, relative_path: normalized.target, resource_path: null }, candidate,
         request_key, request_hash: hash, owner_pid: process.pid, owner_token: crypto.randomUUID(), created_at: now(), resources_href: null, undo_available: false, source: options.source ?? null, parameters: options.parameters ?? {}, result_summary: options.resultSummary ?? {},
-        prepare_request: { root: normalized.root, project_id: options.projectId, target: normalized.target, candidate_path: candidate.path, candidate_hash: candidate.sha256, inputs, origin: normalized.origin, kind: normalized.kind, relation_type: options.relationType ?? 'derived_from', intent: options.intent ?? 'Save one prepared result.', source: options.source ?? null, parameters: options.parameters ?? {}, result_summary: options.resultSummary ?? {} },
+        prepare_request: { root: normalized.root, project_id: options.projectId, target: normalized.target, target_was_explicit: options.target != null, candidate_path: candidate.path, candidate_hash: candidate.sha256, inputs, origin: normalized.origin, kind: normalized.kind, expected_plan_revision: options.expectedPlanRevision ?? null, relation_type: options.relationType ?? 'derived_from', intent: options.intent ?? 'Save one prepared result.', source: options.source ?? null, parameters: options.parameters ?? {}, result_summary: options.resultSummary ?? {} },
       };
       items.unshift(row); this.writeJournal(this.stateDir, items); return row;
     });
@@ -329,7 +441,12 @@ export class SaveService {
     try {
       prepared = this.intake.prepare({
       root: normalized.root, candidateFile: candidate.path, origin: normalized.origin,
-      kind: normalized.kind, projectId: options.projectId, target: options.target, inputs: options.inputs ?? [],
+      kind: normalized.kind, projectId: options.projectId, target: plannedTarget, inputs: options.inputs ?? [],
+      filename: options.expectedPlanRevision != null && plannedTarget
+        ? path.posix.basename(String(plannedTarget).replaceAll('\\', '/')) : options.filename,
+      strictPlacement: options.expectedPlanRevision != null,
+      internalPreflight: options.expectedPlanRevision != null
+        ? () => this.#assertPlanRevision(options, options.expectedPlanRevision) : null,
       relationType: options.relationType ?? 'derived_from', intent: options.intent ?? 'Save one prepared result.',
       caller, runId: saveId,
     });
@@ -353,18 +470,39 @@ export class SaveService {
     }
   }
 
+  findByRequestKey({ channel = 'host', caller, requestKey }) {
+    const key = scopedKey({ channel, caller, requestKey });
+    const row = readJournal(this.stateDir).find((item) => item.request_key === key);
+    return row ? this.show(row.save_id) : null;
+  }
+
+  captureSourceSaves({ projectId, sourceId }) {
+    if (!projectId || !sourceId) throw new Error('Capture Source history requires a Project and source ID.');
+    return readJournal(this.stateDir)
+      .filter((row) => (row.project?.id ?? row.prepare_request?.project_id) === projectId
+        && row.source?.kind === 'capture_source'
+        && row.parameters?.capture_source?.source_id === sourceId)
+      .map((row) => {
+        const shown = this.show(row.save_id);
+        return row.status === 'undone' && row.executed_at ? { ...shown, current_output: 'missing' } : shown;
+      })
+      .sort((left, right) => (Date.parse(right.executed_at ?? '') || 0) - (Date.parse(left.executed_at ?? '') || 0)
+        || String(right.save_id).localeCompare(String(left.save_id)));
+  }
+
   show(saveId) {
     let row = readJournal(this.stateDir).find((item) => item.save_id === saveId);
     if (!row) throw new Error('Save result is unavailable.');
     if (row.status === 'committing') row = this.reconcileCommitting(saveId, row);
     if (row.status === 'undoing' || row.status === 'redoing') row = this.reconcileTransition(saveId, row);
     const shown = result(row);
+    const projected = this.projectRecord(shown);
     if (row.status === 'executed') {
       // A Save receipt records a past verification, not proof that today's bytes exist.
       shown.verified = false;
       shown.current_output = 'unavailable';
       try {
-        const target = path.resolve(row.target.path);
+        const target = path.resolve(projected.target.path);
         let cursor = path.parse(target).root;
         for (const part of target.slice(cursor.length).split(path.sep).filter(Boolean)) {
           cursor = path.join(cursor, part);
@@ -378,12 +516,64 @@ export class SaveService {
         shown.undo_available = false;
       }
     }
-    return shown;
+    return { ...projected, verified: shown.verified, current_output: shown.current_output,
+      undo_available: projected.project.id === row.project.id && projected.target.path === row.target.path && projected.target.resource_path === row.target.resource_path && shown.undo_available,
+      redo_available: projected.project.id === row.project.id && projected.target.path === row.target.path && projected.target.resource_path === row.target.resource_path && shown.redo_available };
+  }
+
+  // Read projection only. Original Save, Intake journal and verification receipts stay immutable.
+  projectRecord(row) {
+    if (!row?.project?.id || !fs.existsSync(path.join(this.stateDir, 'ledger.sqlite'))) return row;
+    this.resourceControl ??= createResourceControl({ stateDir: this.stateDir });
+    const db = this.resourceControl.ledger.db;
+    const resourceId = row.resource_id ?? this.resourceControl.ledger.resources.bySave(row.save_id)?.id;
+    const currentLocation = currentSavedResourceLocation(db, resourceId);
+    const projectId = currentLocation?.project_id ?? row.project.id;
+    const project = db.prepare('SELECT * FROM projects WHERE id=?').get(projectId);
+    const projectLocations = db.prepare("SELECT l.relative_path,r.current_path AS root_path FROM project_locations l JOIN portfolio_roots r ON r.id=l.root_id WHERE l.project_id=? AND l.status='active'").all(projectId);
+    const projectLocation = projectLocations.length === 1 ? projectLocations[0] : null;
+    const projectRoot = projectLocation ? path.resolve(projectLocation.root_path, projectLocation.relative_path) : null;
+    const active = (resourceId, oldPath) => activeSavedResourcePath(db, projectId, resourceId, oldPath);
+    const source = (item) => {
+      if (!item) return item;
+      const currentPath = active(item.resource_id, item.path);
+      if (changed && currentPath) {
+        const relative = projectRoot && path.relative(projectRoot,currentPath);
+        if (!projectRoot || relative.startsWith('..') || path.isAbsolute(relative)) throw conflict('Relocated Save Source has no unique location inside its current Project.');
+      }
+      return { ...item, path: currentPath, ...(item.fingerprint ? { fingerprint: { ...item.fingerprint, file_path: currentPath } } : {}) };
+    };
+    const targetPath = active(resourceId, row.target?.path);
+    const changed = projectId !== row.project.id || targetPath !== row.target?.path || projectRoot && row.target?.resource_path !== path.relative(projectRoot,targetPath).replaceAll('\\','/');
+    let target = row.target ? { ...row.target, path: targetPath } : row.target;
+    if (currentLocation && projectLocation) {
+      const resourcePath = path.relative(projectRoot,targetPath).replaceAll('\\','/');
+      if (!resourcePath || resourcePath.startsWith('..') || path.isAbsolute(resourcePath)) throw conflict('Current Save Resource is outside its active Project.');
+      target = { ...target, relative_path: path.relative(projectLocation.root_path,targetPath).replaceAll('\\','/'), resource_path: resourcePath };
+    }
+    return { ...row, origin_project: row.origin_project ?? row.project,
+      project: project ? { ...row.project, id: project.id, name: project.name, current_path: project.current_path, path: projectRoot } : row.project,
+      target,
+      source: row.source ? { ...source(row.source), ...(row.source.sources ? { sources: row.source.sources.map(source) } : {}) } : row.source,
+      resources_href: resourceId ? projectResourceHref(`/projects/${encodeURIComponent(projectId)}`, target?.resource_path, resourceId) : row.resources_href,
+      undo_available: !changed && row.undo_available, redo_available: !changed && row.redo_available };
+  }
+
+  #assertOriginalSaveLocation(row) {
+    if (!row?.project?.id) return;
+    const projected = this.projectRecord(row);
+    if (projected.project?.id !== row.project.id || projected.target?.path !== row.target?.path || projected.target?.resource_path !== row.target?.resource_path) {
+      throw conflict('Resource facts changed: this Save now belongs to a different Project or path. Its original Execute, Undo and Redo cannot change the relocated result.');
+    }
   }
 
   review(saveId) {
     const save = this.show(saveId);
-    if (!['.md', '.txt'].includes(path.extname(save.target?.path ?? '').toLowerCase())) return { save, preview: null };
+    if (!['.md', '.txt'].includes(path.extname(save.target?.path ?? '').toLowerCase())) {
+      const preview_revision = crypto.createHash('sha256').update(JSON.stringify({ save_id: saveId, target: save.target?.relative_path, candidate: save.candidate?.sha256 ?? null })).digest('hex');
+      const row = mutate(this.stateDir, saveId, (current) => current ? { ...current, preview_revision } : current, this.writeJournal);
+      return { save: result(row), preview: null, preview_revision };
+    }
     const detail = this.intake.show(saveId);
     const candidate = detail.candidate;
     if (!candidate?.blob_path || sha256File(candidate.blob_path) !== candidate.content_hash) throw conflict('Stored Save preview is unavailable or changed.');
@@ -391,7 +581,13 @@ export class SaveService {
     try {
       const bytes = Buffer.alloc(20_000);
       const length = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
-      return { save, preview: { text: bytes.subarray(0, length).toString('utf8'), truncated: candidate.byte_size > length } };
+      const text = bytes.subarray(0, length).toString('utf8');
+      const preview_revision = crypto.createHash('sha256').update(JSON.stringify({
+        save_id: saveId, target: save.target?.relative_path, candidate_hash: candidate.content_hash,
+        preview_hash: crypto.createHash('sha256').update(text).digest('hex'), truncated: candidate.byte_size > length,
+      })).digest('hex');
+      const row = mutate(this.stateDir, saveId, (current) => current ? { ...current, preview_revision } : current, this.writeJournal);
+      return { save: result(row), preview: { text, truncated: candidate.byte_size > length }, preview_revision };
     } finally { fs.closeSync(descriptor); }
   }
 
@@ -404,8 +600,14 @@ export class SaveService {
     return { path: candidate.blob_path, sha256: candidate.content_hash, bytes: candidate.byte_size };
   }
 
-  execute(saveId, { reason } = {}) {
+  execute(saveId, { reason, expectedPreviewRevision = null } = {}) {
+    this.#assertOriginalSaveLocation(readJournal(this.stateDir).find((row) => row.save_id === saveId));
     this.#assertRowWritable(readJournal(this.stateDir).find((row) => row.save_id === saveId));
+    const savedRow = readJournal(this.stateDir).find((row) => row.save_id === saveId);
+    if (savedRow?.prepare_request?.expected_plan_revision != null && expectedPreviewRevision == null) {
+      throw conflict('This V20-bound Save requires the reviewed preview revision before Execute.');
+    }
+    if (expectedPreviewRevision != null && savedRow?.preview_revision !== expectedPreviewRevision) throw conflict('Save preview changed or was not reviewed; review it again before Execute.');
     const before = this.show(saveId);
     if (before.status === 'executed') return before;
     if (before.status !== 'prepared' && before.status !== 'committing') throw conflict(`Save cannot execute from ${before.status}.`);
@@ -417,7 +619,20 @@ export class SaveService {
     if (claimed.status !== 'committing') return result(claimed);
     const reconciled = this.reconcileCommitting(saveId, claimed);
     if (reconciled.status === 'executed') return result(reconciled);
-    const receipt = this.intake.execute(saveId, { reason });
+    let receipt;
+    try {
+      receipt = this.intake.execute(saveId, { reason });
+    } catch (error) {
+      const detail = this.intake.show?.(saveId);
+      const publicationStarted = detail?.events?.some((event) => event.type === 'derived_execution_started') === true;
+      if (['prepared', 'approved'].includes(detail?.run?.status)
+          && !publicationStarted && !detail.execution_receipt) {
+        mutate(this.stateDir, saveId, (row) => row?.status === 'committing'
+          ? { ...row, status: 'prepared', committing_at: undefined, owner_pid: null, owner_token: null }
+          : row, this.writeJournal);
+      }
+      throw error;
+    }
     if (!receipt.verified) throw new Error('Atlas did not verify the saved result.');
     const verification = { sha256: receipt.after_sha256 ?? receipt.output_hash, verified_at: receipt.executed_at ?? now() };
     const current = readJournal(this.stateDir).find((row) => row.save_id === saveId);
@@ -429,6 +644,7 @@ export class SaveService {
   }
 
   undo(saveId) {
+    this.#assertOriginalSaveLocation(readJournal(this.stateDir).find((row) => row.save_id === saveId));
     this.#assertRowWritable(readJournal(this.stateDir).find((row) => row.save_id === saveId));
     const before = this.show(saveId);
     if (!before.undo_available) throw conflict('Undo is not available for this save.');
@@ -458,6 +674,7 @@ export class SaveService {
   }
 
   redo(saveId) {
+    this.#assertOriginalSaveLocation(readJournal(this.stateDir).find((row) => row.save_id === saveId));
     this.#assertRowWritable(readJournal(this.stateDir).find((row) => row.save_id === saveId));
     const before = this.show(saveId);
     if (!before.redo_available || before.status !== 'undone') throw conflict('Redo is not available for this save.');

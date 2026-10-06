@@ -1,0 +1,65 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { Registry } from '../src/registry.js';
+import { createResourceControl } from '../src/resource-control.js';
+import { startAtlasUiServer } from '../src/ui-server.js';
+
+test('Resources HTML shows the same bounded relationship focus and adjacent Resource links', async (t) => {
+  const root = fs.mkdtempSync(path.join(path.resolve('test/.tmp'), 'relationship-focus-ui-'));
+  const stateDir = path.join(root, 'state');
+  const workspace = path.join(root, 'workspace');
+  const projectPath = path.join(workspace, 'A');
+  fs.mkdirSync(path.join(projectPath, 'Data'), { recursive: true });
+  const registry = new Registry({ stateDir });
+  const adopted = registry.adoptRoot({ rootPath: workspace, rootType: 'project_workspace', contentPolicy: 'structure_only' });
+  const project = registry.create({ name: 'A', currentPath: 'A' });
+  registry.attachRoot(project.project_id, { rootId: adopted.root_id, relativePath: 'A', reason: 'Relationship focus UI test.' });
+  const control = createResourceControl({ stateDir, ledger: registry.ledger, registry });
+  const resources = [];
+  for (const [name, content] of [['origin', 'origin content'], ['adjacent', 'adjacent content']]) {
+    const filePath = path.join(projectPath, 'Data', `${name}.md`);
+    fs.writeFileSync(filePath, content);
+    resources.push(control.identify({ filePath, project: { id: project.project_id, name: 'A' } }));
+  }
+  const candidate = { project_id: project.project_id, source_resource_id: resources[0].resource_id, target: { kind: 'resource', id: resources[1].resource_id }, type: 'linked_to', evidence: { reason: 'Stored HTML evidence <and escaped text>' } };
+  const preview = control.previewLinkedResource({ operation: 'add', candidate, decisionChannel: 'host_command' });
+  const receipt = control.submitLinkedResource({ operation: 'add', candidate, previewToken: preview.preview_token, requestKey: 'focus-ui-edge', caller: { tool: 'focus-ui-test', client_run_id: 'focus-ui' }, decisionChannel: 'host_command' });
+  const externalPath = path.join(workspace, 'external.md');
+  fs.writeFileSync(externalPath, 'external reference');
+  const external = control.identify({ filePath: externalPath });
+  control.submitRelationships({ caller: { tool: 'focus-ui-test', client_run_id: 'focus-ui-external' }, candidates: [{ source_resource_id: external.resource_id, target: { kind: 'project', id: project.project_id }, type: 'used_by', evidence: { reason: 'Referenced by Project A' } }] });
+  const server = await startAtlasUiServer({ stateDir, registry, rules: {}, runtime: {}, projectRoot: root, installationRoot: root, resourceControl: control });
+  t.after(async () => {
+    await server.close();
+    control.dispose();
+    registry.dispose();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+  });
+  const pageUrl = new URL(`/projects/${encodeURIComponent(project.project_id)}/resources?resource_id=${encodeURIComponent(resources[0].resource_id)}&relation_depth=2&relation_status=active`, server.workspace_url);
+  const response = await fetch(pageUrl);
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /<details class="workspace-resource-links resource-relationship-focus" open>/u);
+  assert.match(html, new RegExp(`data-relationship-focus-edge="${receipt.relationship.id}"`, 'u'));
+  assert.match(html, /Stored evidence/u);
+  assert.match(html, /Stored HTML evidence &lt;and escaped text&gt;/u);
+  assert.match(html, new RegExp(`href="[^"]*resource_id=${resources[1].resource_id}"`, 'u'));
+  assert.match(html, /name="relation_depth"/u);
+  assert.match(html, /name="relation_status"/u);
+  assert.match(html, /Files were not checked|File contents were not checked/u);
+  const ordinaryUrl = new URL(pageUrl); ordinaryUrl.searchParams.delete('relation_depth'); ordinaryUrl.searchParams.delete('relation_status');
+  const ordinaryResponse = await fetch(ordinaryUrl); assert.equal(ordinaryResponse.status, 200);
+  const ordinaryHtml = await ordinaryResponse.text();
+  assert.match(ordinaryHtml, /<details class="workspace-resource-links resource-relationship-focus"><summary>/u);
+  assert.match(ordinaryHtml, new RegExp(`data-relationship-focus-edge="${receipt.relationship.id}"`, 'u'));
+  assert.match(ordinaryHtml, /<details class="resource-link-create-disclosure"><summary>/u);
+  assert.match(ordinaryHtml, /class="resource-link-add"/u);
+  const externalResponse = await fetch(new URL(`/projects/${encodeURIComponent(project.project_id)}/resources?resource_id=${encodeURIComponent(external.resource_id)}`, server.workspace_url));
+  assert.equal(externalResponse.status, 200);
+  const externalHtml = await externalResponse.text();
+  assert.match(externalHtml, /external\.md/u);
+  assert.doesNotMatch(externalHtml, /data-relationship-focus-edge=/u);
+});

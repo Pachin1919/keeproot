@@ -12,11 +12,11 @@ import { locateContentPython } from './python-runtime.js';
 export const CONTENT_INSPECTION_SCHEMA = 'atlas.content-inspection.v1';
 export const CONTENT_PROCESSOR_VERSION = '0.3.4';
 export const CONTENT_RELATIONSHIP_SCHEMA = 'atlas.content-relationship.v1';
-export const CONTENT_RELATIONSHIP_PROCESSOR_VERSION = '0.2.0';
+export const CONTENT_RELATIONSHIP_PROCESSOR_VERSION = '0.4.0';
 export const CHAT_BRANCH_SET_SCHEMA = 'atlas.chat-branch-set.v1';
 export const CHAT_BRANCH_PROCESSOR_VERSION = '0.1.0';
 export const DATA_WORK_PROCESSOR_VERSION = '1.2.0';
-const CONTENT_COMPARISON_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.json', '.jsonl', '.csv', '.tsv', '.log']);
+const CONTENT_COMPARISON_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.json', '.jsonl', '.csv', '.tsv', '.log', '.xlsx']);
 const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function sha256File(filePath) {
@@ -396,7 +396,7 @@ export function runDataWork({
   return parsed;
 }
 
-function relationshipInput(filePathInput, label) {
+function relationshipInput(filePathInput, label, details = false) {
   if (!filePathInput) throw new Error(`content compare requires --${label} <path>`);
   const filePath = path.resolve(filePathInput);
   if (!fs.existsSync(filePath)) throw new Error(`Content comparison input does not exist: ${filePath}`);
@@ -405,7 +405,10 @@ function relationshipInput(filePathInput, label) {
   if (!stat.isFile() || stat.isSymbolicLink()) {
     throw new Error(`Content comparison input must be a regular non-symbolic-link file: ${filePath}`);
   }
-  return { filePath, hash: sha256File(filePath) };
+  if (details && stat.size > (path.extname(filePath).toLowerCase() === '.xlsx' ? 16 * 1024 * 1024 : 256 * 1024)) {
+    throw new Error(path.extname(filePath).toLowerCase() === '.xlsx' ? 'XLSX comparison input exceeds 16 MiB.' : 'Detailed comparison input exceeds 256 KiB.');
+  }
+  return { filePath, hash: sha256File(filePath), modifiedAt: stat.mtime.toISOString(), modifiedMs: stat.mtimeMs };
 }
 
 function parseRelationshipCache(cachePath, leftHash, rightHash) {
@@ -431,17 +434,34 @@ export function compareContent({
   installationRoot,
   leftPath: leftPathInput,
   rightPath: rightPathInput,
+  details = false, keyColumn = null, periodColumn = null, eventDateColumn = null, leftSheet = null, rightSheet = null,
   pythonPath = null,
   runProcess = spawnSync,
 } = {}) {
-  const left = relationshipInput(leftPathInput, 'left');
-  const right = relationshipInput(rightPathInput, 'right');
+  const left = relationshipInput(leftPathInput, 'left', details);
+  const right = relationshipInput(rightPathInput, 'right', details);
+  [leftSheet, rightSheet] = [leftSheet, rightSheet].map(v => v === '' || v == null ? null : v);
+  const xlsx = [left, right].some(input => path.extname(input.filePath).toLowerCase() === '.xlsx');
+  if (xlsx && (!details || ![left, right].every(input => path.extname(input.filePath).toLowerCase() === '.xlsx') || !leftSheet || !rightSheet)) throw new Error('XLSX comparison requires --details and both exact selected sheets.');
+  if (!xlsx && (leftSheet || rightSheet)) throw new Error('Selected sheets apply only to XLSX comparison.');
+  if ([leftSheet, rightSheet].some(v => v != null && (typeof v !== 'string' || !v || v.length > 31))) throw new Error('XLSX sheet names must be exact names of at most 31 characters.');
+  const columns = [keyColumn, periodColumn, eventDateColumn].map(value => value === '' || value == null ? null : value);
+  if (columns.some(value => value != null && (typeof value !== 'string' || !value.trim() || value.length > 1200))) {
+    throw new Error('Comparison column names must be exact non-empty headers of at most 1200 characters.');
+  }
+  [keyColumn, periodColumn, eventDateColumn] = columns;
+  if (columns.some(Boolean) && !details) throw new Error('Comparison columns require --details.');
+  if (columns.some(Boolean) && !xlsx && ![left, right].every(input => ['.csv', '.tsv'].includes(path.extname(input.filePath).toLowerCase()))) {
+    throw new Error('Comparison key, period and event-date columns apply only to CSV/TSV inputs.');
+  }
   const cacheKey = crypto.createHash('sha256').update(JSON.stringify({
     left_path: left.filePath,
     left_hash: left.hash,
     right_path: right.filePath,
     right_hash: right.hash,
     processor_version: CONTENT_RELATIONSHIP_PROCESSOR_VERSION,
+    left_sheet: leftSheet, right_sheet: rightSheet, details: Boolean(details), key_column: keyColumn, period_column: periodColumn, event_date_column: eventDateColumn,
+    left_modified_ms: left.modifiedMs, right_modified_ms: right.modifiedMs,
   })).digest('hex');
   const relationshipId = `REL-${cacheKey.slice(0, 24)}`;
   const cacheDirectory = path.join(path.resolve(stateDirInput), 'tmp', 'content-relationships');
@@ -476,6 +496,12 @@ export function compareContent({
     '--right', right.filePath,
     '--expected-left-sha256', left.hash,
     '--expected-right-sha256', right.hash,
+    ...(details ? ['--details'] : []),
+    ...(leftSheet ? ['--left-sheet', leftSheet] : []),
+    ...(rightSheet ? ['--right-sheet', rightSheet] : []),
+    ...(keyColumn ? ['--key-column', keyColumn] : []),
+    ...(periodColumn ? ['--period-column', periodColumn] : []),
+    ...(eventDateColumn ? ['--event-date-column', eventDateColumn] : []),
   ], {
     cwd: projectRoot,
     env: {
@@ -505,7 +531,8 @@ export function compareContent({
   if (relationship.schema !== CONTENT_RELATIONSHIP_SCHEMA
       || relationship.processor?.version !== CONTENT_RELATIONSHIP_PROCESSOR_VERSION
       || relationship.sources?.left?.sha256 !== left.hash
-      || relationship.sources?.right?.sha256 !== right.hash) {
+      || relationship.sources?.right?.sha256 !== right.hash
+      || details && (!relationship.details || !Array.isArray(relationship.details.entries))) {
     throw new Error('Atlas local content comparison returned an incompatible or stale result.');
   }
   if (sha256File(left.filePath) !== left.hash || sha256File(right.filePath) !== right.hash) {
@@ -513,6 +540,11 @@ export function compareContent({
     error.code = 'ATLAS_STATE_CONFLICT';
     throw error;
   }
+  if (fs.statSync(left.filePath).mtimeMs !== left.modifiedMs || fs.statSync(right.filePath).mtimeMs !== right.modifiedMs) {
+    throw Object.assign(new Error('Content comparison input time changed during analysis; retry.'), { code: 'ATLAS_STATE_CONFLICT' });
+  }
+  relationship.sources.left.modified_at = left.modifiedAt; relationship.sources.right.modified_at = right.modifiedAt;
+  if (relationship.details) relationship.details.time_sources.file_modified = { basis: 'filesystem_mtime', left: left.modifiedAt, right: right.modifiedAt };
 
   fs.mkdirSync(cacheDirectory, { recursive: true });
   const temporary = `${cachePath}.tmp-${process.pid}-${crypto.randomUUID()}`;

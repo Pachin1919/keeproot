@@ -20,20 +20,27 @@ export function sourceVersionPolicy(sources, fallback = 'follow_latest') {
   return pinned === sources.length ? 'pinned_version' : pinned > 0 ? 'mixed' : 'follow_latest';
 }
 
-export function savedResultFreshness(result, { sourceFreshness = null, versionPolicy = null } = {}) {
+export function savedResultFreshness(result) {
   const outputStatus = savedResultState(result);
-  versionPolicy ??= result.version_policy ?? result.source?.version_policy ?? result.parameters?.version_policy ?? 'pinned_version';
+  const versionPolicy = result.version_policy ?? result.source?.version_policy ?? result.parameters?.version_policy ?? 'pinned_version';
   if (outputStatus === 'missing_source') return { status: 'missing', label: 'Result missing', version_policy: versionPolicy, output_status: outputStatus, reason: 'The saved output is not at its recorded location.' };
   if (outputStatus === 'changed') return { status: 'needs_review', label: 'Result changed', version_policy: versionPolicy, output_status: outputStatus, reason: 'The saved output was edited outside Atlas after verification.' };
   if (outputStatus === 'undone') return { status: 'undone', label: 'Save undone', version_policy: versionPolicy, output_status: outputStatus, reason: 'The output was removed by Atlas Undo.' };
   if (outputStatus !== 'verified') return { status: 'not_checked', label: 'Result not checked', version_policy: versionPolicy, output_status: outputStatus, reason: 'Atlas does not have a current verification result for this output.' };
-  if (versionPolicy === 'follow_latest' && sourceFreshness?.status === 'needs_review') {
-    return { status: 'needs_review', label: 'Sources need review', version_policy: versionPolicy, output_status: outputStatus, reason: 'The saved output still matches its verified bytes, but one or more followed Sources changed.' };
-  }
-  if (versionPolicy === 'mixed' && sourceFreshness?.status === 'needs_review') {
-    return { status: 'needs_review', label: 'Sources need review', version_policy: versionPolicy, output_status: outputStatus, reason: 'The saved output still matches its verified bytes, but one or more followed Sources changed.' };
-  }
   if (versionPolicy === 'pinned_version') return { status: 'pinned', label: 'Pinned result', version_policy: versionPolicy, output_status: outputStatus, reason: 'This result remains bound to the recorded Source versions.' };
+  // A Work may have adopted newer sources or policies after this Save. Its
+  // current freshness cannot describe the immutable saved result's inputs.
+  const sources = result.sources ?? result.source?.sources ?? (result.source_path
+    ? [{ path: result.source_path, fingerprint: result.source_fingerprint }] : []);
+  if (!Array.isArray(sources) || !sources.length) return { status: 'not_checked', label: 'Result not checked', version_policy: versionPolicy, output_status: outputStatus, reason: 'The saved result has no recorded Source versions to compare.' };
+  for (const source of sources) {
+    if (source.version_policy === 'pinned_version') continue;
+    if (!source.path || !/^[a-f0-9]{64}$/iu.test(source.fingerprint?.sha256 ?? '')) return { status: 'not_checked', label: 'Result not checked', version_policy: versionPolicy, output_status: outputStatus, reason: 'A saved Source lacks its recorded path or Hash.' };
+    try {
+      if (contentFileFingerprint(source.path).sha256 === source.fingerprint.sha256.toLowerCase()) continue;
+    } catch { /* Missing or unreadable followed inputs require review. */ }
+    return { status: 'needs_review', label: 'Sources need review', version_policy: versionPolicy, output_status: outputStatus, reason: 'The saved output still matches its verified bytes, but one or more followed Sources changed.' };
+  }
   if (versionPolicy === 'mixed') return { status: 'fresh', label: 'Mixed source policy', version_policy: versionPolicy, output_status: outputStatus, reason: 'The output is verified; each Source keeps its recorded pin or follow policy.' };
   return { status: 'fresh', label: 'Fresh', version_policy: versionPolicy, output_status: outputStatus, reason: 'The output is verified and followed Sources match their recorded versions.' };
 }
@@ -98,8 +105,13 @@ function destination(projectRoot, folder, fileName, sourcePath = null, checkExis
 }
 
 export function createSavedWorkService({ stateDir, saveService = null }) {
-  const stateForProject = (projectId) => {
+  const currentState = () => {
     const state = readSavedWorkState(stateDir);
+    if (saveService) state.items = state.items.map((item) => validRecord(saveService.projectRecord(item)));
+    return state;
+  };
+  const stateForProject = (projectId) => {
+    const state = currentState();
     return {
       items: state.items.filter((item) => (['active', 'executed'].includes(item.status) || (item.status === 'undone' && item.write?.redo_available === true)) && item.project?.id === projectId),
       error: state.error,
@@ -110,8 +122,8 @@ export function createSavedWorkService({ stateDir, saveService = null }) {
     if (state.error) throw state.error;
     return state.items;
   };
-  const find = (workId) => readSavedWorkState(stateDir).items.find((item) => item.work_id === workId || item.save_id === workId) ?? null;
-  const activityItems = () => readSavedWorkState(stateDir).items.filter((item) => item.save_id && item.status === 'executed').map((item) => ({
+  const find = (workId) => currentState().items.find((item) => item.work_id === workId || item.save_id === workId) ?? null;
+  const activityItems = () => currentState().items.filter((item) => item.save_id && item.status === 'executed').map((item) => ({
     activity_id: item.save_id, work_id: item.save_id, save_id: item.save_id, file_path: item.result_path,
     project: item.project, initiated_by: { channel: item.channel === 'host' ? 'host' : 'desktop', agent: item.caller?.tool ?? null }, caller: item.caller ?? null,
     channel: item.channel ?? 'work', status: 'completed', updated_at: item.executed_at ?? item.created_at,
@@ -121,6 +133,12 @@ export function createSavedWorkService({ stateDir, saveService = null }) {
     resource_id: item.resource_id ?? null,
   }));
   const prepareDestination = ({ projectRoot, folder, fileName, sourcePath, outputExtension = null }) => destination(projectRoot, folder, fileName, sourcePath, true, outputExtension);
+  const replayRequest = ({ projectRoot, folder, fileName, sourcePath, outputExtension, channel, caller, requestKey }) => {
+    if (!saveService) throw new Error('The Atlas Save Service is unavailable for current saves.');
+    const target = destination(projectRoot, folder, fileName, sourcePath, false, outputExtension);
+    const receipt = saveService.findByRequestKey({ channel, caller, requestKey });
+    return { target, receipt: receipt ? validRecord(receipt) : null };
+  };
   const save = ({ project, projectRoot, root = projectRoot, target: targetInput = null, folder, fileName, stagedPath, expectedCandidateHash = null, sourcePath, sourceFingerprint, sourceResourceId = null, sources = null, recipe = null, versionPolicy = 'pinned_version', outputExtension = null, parameters, resultSummary, requestKey = null, caller = {}, channel = 'work', executionReason = 'User confirmed this Data Work result.' }) => {
     if (!saveService) throw new Error('The Atlas Save Service is unavailable for current saves.');
     const requestedSources = Array.isArray(sources) && sources.length ? sources : [{ path: sourcePath, fingerprint: sourceFingerprint, ...(sourceResourceId ? { resource_id: sourceResourceId } : {}) }];
@@ -149,5 +167,5 @@ export function createSavedWorkService({ stateDir, saveService = null }) {
     if (!saveService) throw new Error('The Atlas Save Service is unavailable for current Redo.');
     return saveService.redo(workId);
   };
-  return { stateForProject, listForProject, find, activityItems, prepareDestination, save, undo, redo };
+  return { stateForProject, listForProject, find, activityItems, prepareDestination, replayRequest, save, undo, redo };
 }

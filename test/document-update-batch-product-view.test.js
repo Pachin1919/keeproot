@@ -1,0 +1,44 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {renderDocumentUpdateBatchView} from '../src/ui/views/document-update-batch-view.js';
+import {renderDocumentReferenceRepairView} from '../src/ui/views/reference-repair-view.js';
+const project={id:'PRJ-review',name:'项目'};
+const entry={update_id:'UPD-one',resource_id:'RES-one',revision:2,relative_path:'<材料>.md',current_sha256:'a'.repeat(64),candidate_sha256:'b'.repeat(64),source:{save_id:'SAV-source'},href:'/projects/PRJ-review/document-updates/UPD-one',work_references:[]};
+const decode=value=>value.replaceAll('&quot;','"').replaceAll('&amp;','&');
+test('batch selection requires explicit files, carries reviewed facts and supplies a per-form retry key',()=>{
+  const html=renderDocumentUpdateBatchView({project,selection:{entries:[entry]}},{csrfToken:'token',locale:'zh-CN'});
+  const item=html.match(/name="item" value="([^"]+)"/u)[1];
+  assert.deepEqual(JSON.parse(decode(item)),{updateId:'UPD-one',expectedRevision:2,expectedCurrentSha256:'a'.repeat(64),expectedCandidateSha256:'b'.repeat(64)});
+  assert.doesNotMatch(html, /type="checkbox"[^>]+checked/u);
+  assert.match(html,/name="csrf" value="token"/u);
+  assert.match(html,/type="hidden" name="request_key" value="UI-BATCH-[a-f0-9-]{36}"/u);
+  assert.match(html,/&lt;材料&gt;.md/u);
+  assert.match(html,/准备批次不会改写文件/u);
+  assert.match(html,/batch-item-details"><summary>/u);
+});
+test('batch progress puts guarded advance before files, retains blocked reasons and refuses changed history',()=>{
+  const batch={batch_id:'BUP-one',revision:5,digest:'digest',successful_count:1,remaining_count:1,blocked_count:1,items:[{...entry,status:'blocked',reason:'External <change>',current_deviation:true,work_references:[{title:'表格工作',href:'/work/DWT-one'}]}]};
+  let html=renderDocumentUpdateBatchView({project,batch},{csrfToken:'token',locale:'zh-CN'});
+  assert.ok(html.indexOf('/BUP-one/advance')<html.indexOf('data-batch-item='));
+  assert.match(html,/name="expected_revision" value="5"/u);
+  assert.match(html,/name="expected_digest" value="digest"/u);
+  assert.match(html,/External &lt;change&gt;/u);
+  assert.match(html,/相关表格工作不会在此重算/u);
+  batch.history_changed=true;
+  html=renderDocumentUpdateBatchView({project,batch});
+  assert.doesNotMatch(html,/action="[^"]+\/advance"/u);
+  batch.history_changed=false;batch.remaining_count=0;
+  assert.doesNotMatch(renderDocumentUpdateBatchView({project,batch}),/action="[^"]+\/advance"/u);
+});
+test('repair review separates exact link changes from decisions and keeps the same Resource return',()=>{
+  const update={...entry,project_id:project.id,status:'preview_ready',resource:{relative_path:entry.relative_path},source:{kind:'project_move',source_project_id:project.id,operation_id:'RUN-one'},source_status:'current',current:{sha256:'a'.repeat(64)},change:{edits:[{old_text:'[Doc](../旧/doc.md)',new_text:'[Doc](../新/doc.md)'}]}};
+  const html=renderDocumentReferenceRepairView({project,update},{csrfToken:'token',locale:'zh-CN'});
+  assert.match(html,/data-repair-edits/u);
+  assert.match(html,/\[Doc\]\(\.\.\/旧\/doc.md\)/u);
+  assert.match(html,/\[Doc\]\(\.\.\/新\/doc.md\)/u);
+  assert.match(html,/name="expected_current_sha256" value="a{64}"/u);
+  assert.doesNotMatch(html,/value="revise"/u);
+  const reader=new URL(decode(html.match(/href="([^"]+\/resources\/read\?[^"]+)"/u)[1]),'http://atlas.local');
+  assert.equal(reader.searchParams.get('resource_id'),'RES-one');
+  assert.equal(reader.searchParams.get('return_to'),'/projects/PRJ-review/resources?resource_id=RES-one');
+});

@@ -117,6 +117,34 @@ test('R3 portable CSV Result embeds a bounded table and excludes a mismatched pi
   if (!(changed instanceof Error)) assert.ok(changed.issues.some((item) => /not included|changed|recorded|missing/iu.test(item)));
 });
 
+test('Portable Board delivery includes the exact pinned XLSX Result as a download', async (t) => {
+  const f = fixture(t);
+  const workbook = fs.readFileSync(path.resolve('fixtures/v20-board-result.xlsx'));
+  const candidatePath = path.join(f.root, 'state', 'board-workbook-candidate.xlsx');
+  fs.writeFileSync(candidatePath, workbook);
+  const preparedResult = f.saveService.prepare({
+    root: f.workspace, candidateFile: candidatePath, projectId: f.project.project_id,
+    target: 'Project/Results/board-workbook.xlsx', inputs: [f.tablePath], origin: 'agent_generated',
+    kind: 'intermediate', channel: 'host', requestKey: 'board-xlsx-result',
+    caller: { actor: 'agent', tool: 'board-readable-test', client_run_id: 'board-xlsx-result' },
+    source: { path: f.tablePath, resource_id: f.table.resource_id, sources: [{ path: f.tablePath, resource_id: f.table.resource_id }] },
+    parameters: { fixture: 'board-xlsx' }, resultSummary: { rows: 1, columns: 2 }, intent: 'Save a workbook Result.'
+  });
+  const result = f.saveService.execute(preparedResult.save_id, { reason: 'Fixture participant reviewed workbook Result.' });
+  const service = f.makeService();
+  const board = service.createBoard({ projectId: f.project.project_id, title: 'Workbook delivery' });
+  const saved = service.saveBoard({ projectId: f.project.project_id, boardId: board.board_id, title: board.title,
+    baseRevision: board.revision, blocks: [{ type: 'result_preview', save_id: result.save_id, version_policy: 'pinned_version' }] });
+  const delivery = await service.preparePortableDelivery({ projectId: f.project.project_id, boardId: board.board_id,
+    baseRevision: saved.revision, target: 'Results/workbook-download.html',
+    caller: { actor: 'agent', tool: 'board-readable-test', client_run_id: 'board-xlsx-delivery' }, requestKey: 'board-xlsx-delivery' });
+  const html = fs.readFileSync(f.saveService.candidateSnapshot(delivery.save_id).path, 'utf8');
+  const match = html.match(/<a download="board-workbook\.xlsx" href="data:application\/vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet;base64,([A-Za-z0-9+/=]+)"/u);
+  assert.ok(match, 'portable HTML must expose the XLSX Result with its workbook MIME type');
+  assert.deepEqual(Buffer.from(match[1], 'base64'), workbook, 'the download must contain the complete saved workbook bytes');
+  assert.match(html, /Missing or not included<\/h2><p>None\.<\/p>/u);
+});
+
 test('Board detail uses dedicated readable forms for each Block type and portable delivery', () => {
   const html = renderBoardView({ mode: 'detail', base: '/projects/PRJ-board-layout', project: { id: 'PRJ-board-layout', name: 'Board Layout' }, board: { board_id: 'BRD-board-layout', revision: 4, title: 'Layout Board', freshness: { status: 'fresh' }, blocks: [{ block_id: 'BLK-text', type: 'text', text: 'A readable note.' }] }, resources: [{ resource_id: 'RES-layout', resource: { display_name: 'Material' } }], results: [{ save_id: 'SAV-layout', name: 'Result' }], folders: [{ relative_path: 'Results' }] }, { csrfToken: 'csrf-board-layout' });
   assert.match(html, /href="#portable-delivery">Prepare Delivery<\/a>/u); assert.match(html, /id="portable-delivery"/u); assert.match(html, /class="surface board-add-blocks"/u); assert.match(html, /class="board-block-form board-text-block-form"/u); assert.match(html, /Text block/u); assert.match(html, /Material reference/u); assert.match(html, /Result preview/u); assert.match(html, /class="surface board-portable-delivery"/u); assert.match(html, /class="board-delivery-form"/u); assert.match(html, /<details class="board-text-editor"><summary>Edit text<\/summary>/u); assert.match(html, /<details class="board-block-actions"><summary>Block actions<\/summary>/u);

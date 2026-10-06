@@ -10,6 +10,7 @@
   "scripts": {
     "test": "node --test --test-concurrency=1",
     "runtime": "node ./scripts/runtime-manager.js",
+    "dev:isolated": "node ./scripts/dev-isolation.js",
     "demo": "node ./scripts/demo.js"
   },
   "engines": {

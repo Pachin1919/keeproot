@@ -1,0 +1,7 @@
+{
+  "module_id": "local.example-uppercase-prefix",
+  "module_version": "1.0.0",
+  "adapter": "text_transform_v1",
+  "permissions": ["node_full_account"],
+  "entry_source": "export function transform(text) { return `REVIEWED: ${text.toUpperCase()}`; }"
+}

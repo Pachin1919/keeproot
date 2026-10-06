@@ -95,11 +95,18 @@ test('installed product help and capabilities hide direct internal write engines
   const capabilityResult = cli(stateDir, ['capabilities', '--json'], installedEnv);
   assert.equal(capabilityResult.status, 0, capabilityResult.stderr);
   const capabilities = JSON.parse(capabilityResult.stdout).data;
+  for (const command of ['handoff list', 'module list', 'project move prepare', 'project membership prepare', 'document update inspect', 'table-work details']) {
+    assert.ok(capabilities.product_entrypoints.current_product.commands.includes(command), command);
+  }
+  for (const guide of capabilities.product_entrypoints.current_product.command_guide) {
+    for (const field of ['purpose', 'required', 'returns', 'on_failure', 'example']) assert.ok(guide[field], field);
+    assert.ok(help.includes(guide.example), guide.example);
+  }
   assert.match(help, /atlas table-work start/u);
   assert.match(help, /atlas table-work reuse/u);
   assert.match(help, /atlas table-work reconcile/u);
   assert.deepEqual(capabilities.workflows.table_work, ['start', 'show', 'reuse', 'reconcile', 'reconcile-batch', 'add-source', 'remove-source', 'prepare', 'sheet', 'align', 'recipe', 'preview', 'save', 'list']);
-  assert.deepEqual(capabilities.workflows.resource_views, ['list', 'evaluate', 'files', 'candidates-submit', 'properties', 'candidates-show', 'save']);
+  assert.deepEqual(capabilities.workflows.resource_views, ['list', 'evaluate', 'files', 'candidates-submit', 'candidates-show', 'row-candidates-submit', 'row-candidates-show', 'properties', 'save']);
   assert.deepEqual(capabilities.workflows.resource_facts, ['show']);
   assert.deepEqual(capabilities.resource_views, {
     modes: ['files', 'table', 'cards'],
@@ -242,8 +249,14 @@ test('CLI Host completes one persistent multi-source Table Work through the shar
   const saved = invoke(['table-work', 'save', started.session_id, '--base-revision', String(currentRevision), '--folder', 'Results', '--file-name', 'merged.csv', '--format', 'csv', '--request-key', 'host-table-work-save', '--reason', 'The user authorized this exact reviewed Preview and destination.']);
   assert.equal(saved.status, 'executed'); assert.match(saved.verification.sha256, /^[a-f0-9]{64}$/u); assert.equal(saved.channel, 'host'); assert.equal(saved.source.sources.length, 2);
   assert.equal(fs.existsSync(path.join(results, 'merged.csv')), true);
+  const savedTarget = path.join(results, 'merged.csv');
+  const originalOutput = contentFileFingerprint(savedTarget);
+  const originalMtime = fs.statSync(savedTarget, { bigint: true }).mtimeNs;
   const replayed = invoke(['table-work', 'save', started.session_id, '--base-revision', String(currentRevision), '--folder', 'Results', '--file-name', 'merged.csv', '--format', 'csv', '--request-key', 'host-table-work-save', '--reason', 'The user authorized this exact reviewed Preview and destination.']);
   assert.equal(replayed.save_id, saved.save_id); assert.equal(replayed.status, 'executed');
+  assert.equal(replayed.current_output, 'verified');
+  assert.equal(contentFileFingerprint(savedTarget).sha256, originalOutput.sha256);
+  assert.equal(fs.statSync(savedTarget, { bigint: true }).mtimeNs, originalMtime);
   const conflicting = cli(stateDir, ['table-work', 'save', started.session_id, '--base-revision', String(currentRevision), '--folder', 'Results', '--file-name', 'merged.csv', '--format', 'csv', '--request-key', 'different-host-save', '--reason', 'Try a different request against the occupied target.', ...host, '--json'], env);
   assert.notEqual(conflicting.status, 0); assert.equal(JSON.parse(conflicting.stdout).error.code, 'ATLAS_STATE_CONFLICT');
   const shown = invoke(['table-work', 'show', started.session_id]);
@@ -512,13 +525,20 @@ test('Agent JSON protocol exposes version, capabilities, doctor, and structured 
     assert.ok(envelope.data);
     if (expected === 'capabilities') {
       assert.deepEqual(envelope.data.product_entrypoints.current_product.commands, [
+        'handoff create', 'handoff list', 'handoff show', 'handoff read',
+        'module list', 'module package-preview', 'module package-list', 'module install', 'module preview', 'module save', 'module enable', 'module disable',
+        'project move prepare', 'project move show', 'project move execute', 'project move undo', 'project move recover',
+        'project membership prepare', 'project membership show', 'project membership execute', 'project membership undo', 'project membership recover',
+        'document update inspect', 'document update prepare', 'document update show', 'document update decide', 'document update execute', 'document update undo', 'document update recover', 'document update batch prepare', 'document update batch show', 'document update batch advance',
+        'table-work focus', 'table-work details', 'content locate', 'content read-ref', 'view row-candidates submit', 'view row-candidates show',
         'ui', 'ui install', 'ui doctor', 'ui remove',
-        'save prepare', 'save show', 'save execute', 'save undo', 'save redo',
+        'save plan', 'save prepare', 'save review', 'save show', 'save execute', 'save undo', 'save redo', 'save directory prepare', 'save directory show',
         'table-work start', 'table-work show', 'table-work reuse', 'table-work reconcile', 'table-work reconcile-batch', 'table-work add-source', 'table-work remove-source',
         'table-work prepare', 'table-work sheet', 'table-work align', 'table-work recipe', 'table-work preview', 'table-work save', 'table-work list',
         'board list', 'board create', 'board show', 'board save', 'board export',
         'view list', 'view evaluate', 'view files', 'view properties', 'view candidates submit', 'view candidates show', 'view save',
         'content localize-conversation',
+        'capture source prepare', 'capture source show', 'capture source read', 'capture source inspect-export', 'capture source prepare-export',
         'resource show',
       ]);
       assert.equal(envelope.data.table_work.semantic_authority, 'user_or_host_proposal');
@@ -527,7 +547,8 @@ test('Agent JSON protocol exposes version, capabilities, doctor, and structured 
       assert.equal(Object.hasOwn(envelope.data.workflows, 'task'), false);
       assert.equal(Object.hasOwn(envelope.data.workflows, 'analytics'), false);
       assert.equal(Object.hasOwn(envelope.data.workflows, 'agent'), false);
-      assert.deepEqual(envelope.data.workflows.resource_views, ['list', 'evaluate', 'files', 'candidates-submit', 'properties', 'candidates-show', 'save']);
+      assert.deepEqual(envelope.data.workflows.resource_views, ['list', 'evaluate', 'files', 'candidates-submit', 'candidates-show', 'row-candidates-submit', 'row-candidates-show', 'properties', 'save']);
+      assert.deepEqual(envelope.data.workflows.capture, ['fetch', 'localize', 'sample', 'source-prepare', 'source-inspect-export', 'source-prepare-export', 'source-show', 'source-read']);
       assert.deepEqual(envelope.data.workflows.resource_facts, ['show']);
       assert.deepEqual(envelope.data.resource_views, {
         modes: ['files', 'table', 'cards'],

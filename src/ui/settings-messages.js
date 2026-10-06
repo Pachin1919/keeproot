@@ -3,7 +3,7 @@ const COPY = {
   appearance: ['Appearance', '外观'], theme_color: ['Theme and color', '主题与颜色'],
   palette_help: ['Curated palettes preserve readable contrast; arbitrary color values are not accepted.', '预设配色保留可读对比度，不接受任意颜色值。'],
   background: ['Background palette', '背景配色'],
-  theme_slate: ['Archive Signal', '档案信号'], theme_slate_detail: ['Charcoal, vermilion, ochre and paper.', '炭黑、朱红、赭黄和纸色。'],
+  theme_slate: ['Workspace', '工作区'], theme_slate_detail: ['Light gray navigation and white reading surfaces.', '浅灰导航与白色阅读区。'],
   theme_graphite: ['Post-Internet Plum', '梅紫界面'], theme_graphite_detail: ['Plum, mint, coral and warm white.', '梅紫、薄荷绿、珊瑚色和暖白。'],
   theme_warm: ['Gallery Grid', '展厅网格'], theme_warm_detail: ['Stone, black-green, ochre and sage.', '石色、墨绿、赭黄和鼠尾草绿。'],
   accent: ['Accent', '强调色'], accent_green: ['Sage', '鼠尾草绿'], accent_green_detail: ['Calm local status.', '柔和的本地状态。'],
@@ -24,6 +24,7 @@ const COPY = {
   continue: ['Continue', '继续'], primary_action: ['Primary action', '主要操作'], remove: ['Remove', '移除'],
   preview_ready: ['Ready', '就绪'], preview_waiting: ['Awaiting review', '待审核'], preview_blocked: ['Blocked', '受阻'],
   boundary: ['What Settings does not change', '设置不会改变什么'], boundary_routing: ['Project routing and naming rules', '项目路由与命名规则'], boundary_approval: ['Approval or recovery policy', '审核或恢复策略'], boundary_install: ['Runtime installation', 'Runtime 安装'], boundary_history: ['Ledger facts and history', 'Ledger 事实与历史'],
+  installed_build: ['Installed build', '安装构建'], source_build: ['Source working tree', '源码工作目录'],
   runtime_diagnostics: ['Runtime diagnostics', 'Runtime 诊断'], atlas_version: ['Atlas version', 'Atlas 版本'], node_version: ['Node version', 'Node 版本'], runtime_source: ['Runtime source', 'Runtime 来源'], state_location: ['State location', '状态位置'], content_component: ['Content component', '内容组件'], ledger_integrity: ['Ledger integrity', 'Ledger 完整性'], unavailable: ['Not available', '不可用'],
   diagnostics_help: ["Ledger is Atlas's internal write and recovery record. Hashes identify exact file content. They are diagnostic facts, not tasks the user must manage.", 'Ledger 是 Atlas 内部写入和恢复记录；Hash 用于识别精确文件内容。这些是诊断事实，不是用户必须管理的任务。'],
 };

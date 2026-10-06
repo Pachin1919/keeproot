@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { Derived } from './derived.js';
 import { isPathInside, normalizeRoot, toPortablePath } from './paths.js';
@@ -220,6 +221,21 @@ function stateConflict(message) {
   return error;
 }
 
+export function intakePlanRevision(plan) {
+  const facts = {
+    schema: plan?.schema, status: plan?.status,
+    classification: plan?.classification ?? null, project: plan?.project ?? null,
+    target: plan?.target ?? null, route: plan?.route ?? null,
+    rule_version_id: plan?.rule_version_id ?? null, preference: plan?.preference ?? null,
+    correction: plan?.correction ?? null, context_hash: plan?.attention?.context_hash ?? null,
+    candidate: plan?.candidate ? {
+      path: plan.candidate.path, content_hash: plan.candidate.content_hash,
+      byte_size: plan.candidate.byte_size,
+    } : null,
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(facts)).digest('hex');
+}
+
 export class Intake {
   constructor({ stateDir }) {
     if (!stateDir) throw new Error('Intake requires a stateDir');
@@ -237,6 +253,7 @@ export class Intake {
     projectId = null,
     target = null,
     inputs = [],
+    strictPlacement = false,
   }) {
     const root = normalizeRoot(rootInput);
     if (isPathInside(root, this.stateDir)) {
@@ -369,6 +386,27 @@ export class Intake {
         selectedProjectId,
         classification.role,
       );
+      if (strictPlacement && recommendation.status === 'ready' && (preference || correction)) {
+        const ruleRecommendation = this.derived.recommend({
+          root, inputs, role: classification.role, filename: selectedFilename,
+          projectId: selectedProjectId, routeOverride,
+        });
+        const explicitPath = path.posix.normalize(String(recommendation.target).replaceAll('\\', '/'));
+        const rulePath = path.posix.normalize(String(ruleRecommendation.target ?? '').replaceAll('\\', '/'));
+        if (rulePath && explicitPath !== rulePath) {
+          return {
+            schema: 'atlas-intake-plan.v1', status: 'blocked', run_id: null,
+            reason: 'The explicit target conflicts with the approved Project placement rule.',
+            classification: { origin, ...classification },
+            project: { id: recommendation.project_id, name: recommendation.project_name, path: recommendation.project_path, basis: projectBasis },
+            target: null, proposed_target: recommendation.target, rule_target: rulePath,
+            recommendation: { target: rulePath, rule_id: preference?.rule_id ?? correction?.correction_id ?? null },
+            preference: preference ? { rule_id: preference.rule_id, rule_version_id: preference.rule_version_id, scope: preference.scope, target_subdirectory: preference.value.target_subdirectory } : null,
+            correction: correction ? { correction_id: correction.correction_id, rule_version_id: correction.rule_version_id, target_subdirectory: correction.target_subdirectory } : null,
+            attention, confidence: 0, auto_execute: false, questions: [], candidate,
+          };
+        }
+      }
     } else {
       try {
         recommendation = this.derived.recommend({
@@ -420,6 +458,7 @@ export class Intake {
         basis: projectBasis ?? recommendation.project_basis,
       } : null,
       target: recommendation.target ?? null,
+      recommendation: recommendation,
       route: recommendation.route ?? null,
       rule_version_id: recommendation.rule_version_id ?? null,
       correction: correction ? {
@@ -450,6 +489,7 @@ export class Intake {
   prepare(options) {
     const plan = this.plan(options);
     if (!plan.auto_execute) return plan;
+    const expectedRevision = intakePlanRevision(plan);
     const intakeContext = {
       schema: 'atlas-intake-context.v1',
       origin: plan.classification.origin,
@@ -491,6 +531,13 @@ export class Intake {
       intakeContext,
       caller: options.caller ?? {},
       runId: options.runId ?? null,
+      internalPreflight: () => {
+        const current = this.plan(options);
+        if (intakePlanRevision(current) !== expectedRevision) {
+          throw stateConflict('Intake source, Project, or effective rules changed before Prepare; recompute the plan.');
+        }
+        options.internalPreflight?.();
+      },
     });
     return {
       ...plan,
@@ -661,47 +708,53 @@ export class Intake {
       throw new Error('Intake execution is not allowed without a high-confidence Intake policy.');
     }
     const source = context.source;
-    if (!source?.path || !fs.existsSync(source.path)) {
-      throw stateConflict('Intake source Candidate no longer exists; prepare a new Intake run.');
-    }
-    const sourceStat = fs.lstatSync(source.path);
-    if (!sourceStat.isFile() || sourceStat.isSymbolicLink()
-        || sourceStat.size !== source.byte_size || sha256File(source.path) !== source.content_hash) {
-      throw stateConflict('Intake source Candidate changed after prepare; prepare a new Intake run.');
-    }
-    const project = this.derived.ledger.getProject(detail.placement.project_id);
     const preparedProjectPath = detail.placement.policy?.project_path;
-    if (project.status !== 'active' || !preparedProjectPath || project.current_path !== preparedProjectPath) {
-      throw stateConflict('Intake Project changed after prepare; recompute placement before execution.');
-    }
-    const activePolicy = this.derived.ledger.getActiveEnvironmentPolicy(detail.run.root_path);
-    if (context.contract_rule_version_id
-        && (!activePolicy || activePolicy.rule_version_id !== context.contract_rule_version_id)) {
-      throw stateConflict('The active Library Contract changed after Intake prepare; recompute placement.');
-    }
-    if (context.correction) {
-      const currentCorrection = this.derived.ledger.findRoutingCorrection({
-        root: detail.run.root_path,
-        origin: context.origin,
-        kind: context.kind,
-        candidateHash: context.source.content_hash,
-        projectId: detail.placement.project_id,
-      });
-      if (currentCorrection?.correction_id !== context.correction.correction_id) {
-        throw stateConflict('The reviewed Intake routing correction changed after prepare; recompute placement.');
+    const hasExecutionIntent = detail.events?.some((event) => event.type === 'derived_execution_started') === true;
+    const validateCurrentFacts = (currentDetail) => {
+      const currentContext = currentDetail.placement.policy?.intake;
+      if (!currentContext || currentContext.source?.path !== source.path
+          || currentContext.source?.content_hash !== source.content_hash
+          || currentContext.attention?.context_hash !== context.attention?.context_hash) {
+        throw stateConflict('Intake facts changed before the locked Save publication; prepare again.');
       }
-    }
-    if (context.attention) {
-      const currentAttention = this.rules.context({
-        root: detail.run.root_path,
-        request: context.attention.request,
-      });
-      if (currentAttention.context_hash !== context.attention.context_hash) {
-        throw stateConflict('The effective rule context changed after Intake prepare; recompute placement.');
+      if (!source?.path || !fs.existsSync(source.path)) {
+        throw stateConflict('Intake source Candidate no longer exists; prepare a new Intake run.');
       }
-    }
-    this.derived.approve(runId, { reason: reason.trim() });
-    const receipt = this.derived.execute(runId);
+      const sourceStat = fs.lstatSync(source.path);
+      if (!sourceStat.isFile() || sourceStat.isSymbolicLink()
+          || sourceStat.size !== source.byte_size || sha256File(source.path) !== source.content_hash) {
+        throw stateConflict('Intake source Candidate changed after prepare; prepare a new Intake run.');
+      }
+      const currentProject = this.derived.ledger.getProject(currentDetail.placement.project_id);
+      if (currentProject.status !== 'active' || !preparedProjectPath || currentProject.current_path !== preparedProjectPath) {
+        throw stateConflict('Intake Project changed after prepare; recompute placement before execution.');
+      }
+      if (context.attention) {
+        const currentAttention = this.rules.context({ root: currentDetail.run.root_path, request: context.attention.request });
+        if (currentAttention.context_hash !== context.attention.context_hash) {
+          throw stateConflict('The effective rule context changed after Intake prepare; recompute placement.');
+        }
+      }
+      const activePolicy = this.derived.ledger.getActiveEnvironmentPolicy(currentDetail.run.root_path);
+      if (context.contract_rule_version_id
+          && (!activePolicy || activePolicy.rule_version_id !== context.contract_rule_version_id)) {
+        throw stateConflict('The active Library Contract changed after Intake prepare; recompute placement.');
+      }
+      if (context.correction) {
+        const currentCorrection = this.derived.ledger.findRoutingCorrection({
+          root: currentDetail.run.root_path, origin: context.origin, kind: context.kind,
+          candidateHash: context.source.content_hash, projectId: currentDetail.placement.project_id,
+        });
+        if (currentCorrection?.correction_id !== context.correction.correction_id) {
+          throw stateConflict('The reviewed Intake routing correction changed after prepare; recompute placement.');
+        }
+      }
+    };
+    if (!hasExecutionIntent) validateCurrentFacts(detail);
+    if (detail.run.status === 'prepared') this.derived.approve(runId, { reason: reason.trim() });
+    const receipt = this.derived.execute(runId, {
+      internalPreflight: validateCurrentFacts,
+    });
     return { ...receipt, intake: context };
   }
 

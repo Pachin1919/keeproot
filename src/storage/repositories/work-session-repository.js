@@ -355,9 +355,14 @@ export class WorkSessionRepository {
     });
   }
 
-  setRecipe(id, recipe, at, baseRevision = null) {
+  setRecipe(id, recipe, at, baseRevision = null, guard = null) {
     return this.transaction(() => {
       this.assertRevision(id, baseRevision);
+      if (guard != null) {
+        if (typeof guard !== 'function') throw new Error('Work Recipe guard must be synchronous.');
+        const result = guard();
+        if (result && typeof result.then === 'function') throw new Error('Work Recipe guard must be synchronous.');
+      }
       this.db.prepare('UPDATE work_sessions SET recipe_json=?,revision=revision+1,preview_json=NULL,preview_revision=NULL,updated_at=? WHERE id=?').run(JSON.stringify(recipe), at, id);
       return this.byId(id);
     });

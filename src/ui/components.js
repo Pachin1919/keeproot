@@ -127,9 +127,19 @@ export function renderNav(current, {
   settingsHref = null,
   locale = 'en',
   languageCatalog = null,
+  projectSection = null,
 } = {}) {
   const t = (key) => translateUi(locale, key, languageCatalog);
   const projectsHref = workspaceHref || '/projects';
+  const projectBase = resourcesHref?.match(/^(\/projects\/[^/?#]+)(?:\/|$)/u)?.[1];
+  const currentProjectSection = projectSection ?? (current === 'Resources' ? 'materials' : null);
+  const projectNavigation = interactive && projectBase ? `<nav class="project-navigation" aria-label="${escapeHtml(t('workspace.project_navigation'))}"><span class="nav-section-label">${escapeHtml(t('workspace.project_navigation'))}</span><ul class="nav-list">${[
+    ['overview', projectBase, 'projects'],
+    ['materials', resourcesHref, 'resources'],
+    ['results', `${projectBase}/boards`, 'resources'],
+    ['recovery', `${projectBase}/rounds`, 'activity'],
+    ['rules', `${projectBase}/rules`, 'settings'],
+  ].map(([key, href, icon]) => `<li class="nav-item${currentProjectSection === key ? ' is-current-project' : ''}"><a href="${escapeHtml(href)}" title="${escapeHtml(t(`workspace.${key}`))}"${key === 'materials' ? ' data-resources-nav' : ''}${currentProjectSection === key ? ' aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${renderNavIcon(icon)}</span><span class="nav-label">${escapeHtml(t(`workspace.${key}`))}</span></a></li>`).join('')}</ul></nav>` : '';
   const items = interactive
     ? [
         { current: 'Projects', label: t('nav.projects'), icon: 'projects', href: projectsHref },
@@ -150,13 +160,14 @@ export function renderNav(current, {
     <div class="brand"><span class="brand-mark">A</span><span class="brand-copy">Atlas<small>Workspace</small></span></div>
     <nav aria-label="${escapeHtml(t('nav.primary'))}">
       <ul class="nav-list">
-        ${items.map((item) => (
-    `<li class="nav-item"${item.current === current ? ' aria-current="page"' : ''}>${item.href
-      ? `<a href="${escapeHtml(item.href)}" title="${escapeHtml(item.title ?? item.label)}"${item.current === 'Resources' ? ' data-resources-nav' : ''}><span class="nav-icon" aria-hidden="true">${renderNavIcon(item.icon)}</span><span class="nav-label">${escapeHtml(item.label)}</span></a>`
+        ${items.filter((item) => !projectBase || item.current !== 'Resources').map((item) => (
+    `<li class="nav-item"${item.current === current && !(projectBase && current === 'Projects') ? ' aria-current="page"' : ''}>${item.href
+      ? `<a href="${escapeHtml(item.href)}" title="${escapeHtml(item.title ?? item.label)}"${item.current === 'Resources' ? ' data-resources-nav' : ''}${item.current === 'Settings' ? ' data-settings-nav' : ''}><span class="nav-icon" aria-hidden="true">${renderNavIcon(item.icon)}</span><span class="nav-label">${escapeHtml(item.label)}</span></a>`
       : `<span class="nav-link nav-link-disabled"${item.current === 'Resources' ? ' data-resources-nav' : ''} aria-disabled="true" title="${escapeHtml(item.current === 'Resources' ? t('nav.resources_choose_project') : item.label)}"><span class="nav-icon" aria-hidden="true">${renderNavIcon(item.icon)}</span><span class="nav-label">${escapeHtml(item.label)}</span></span>`}</li>`
   )).join('')}
       </ul>
     </nav>
+    ${projectNavigation}
     ${interactive ? `<button class="rail-toggle" type="button" data-toggle-rail data-collapse-label="${escapeHtml(t('nav.collapse'))}" data-expand-label="${escapeHtml(t('nav.expand'))}" aria-label="${escapeHtml(t('nav.collapse'))}" aria-expanded="true"><span aria-hidden="true">‹</span></button>` : ''}
     <div class="sidebar-signature" aria-label="Pachin Studio · Local Workspace">
       <div class="signature-art" aria-hidden="true"><img class="signature-calligraphy" src="/ui/pachin-calligraphy.png" alt=""><img class="signature-seal" src="/ui/pachin-seal.png" alt=""></div>

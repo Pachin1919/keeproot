@@ -32,8 +32,11 @@ import {
 import { applyProjectBoardsMigration, PROJECT_BOARDS_SCHEMA_VERSION } from './migrations/v30-project-boards.js';
 
 import { applyRecoveryRoundsMigration, RECOVERY_ROUNDS_SCHEMA_VERSION } from './migrations/v31-recovery-rounds.js';
+import { applyRowPropertyCandidatesMigration, ROW_PROPERTY_CANDIDATES_SCHEMA_VERSION } from './migrations/v32-row-property-candidates.js';
+import { applyHandoffsMigration, HANDOFFS_SCHEMA_VERSION } from './migrations/v33-handoffs.js';
+import { applyResourceLinkCandidatesMigration, RESOURCE_LINK_CANDIDATES_SCHEMA_VERSION } from './migrations/v34-resource-link-candidates.js';
 
-export const LATEST_SCHEMA_VERSION = RECOVERY_ROUNDS_SCHEMA_VERSION;
+export const LATEST_SCHEMA_VERSION = RESOURCE_LINK_CANDIDATES_SCHEMA_VERSION;
 
 function now() {
   return new Date().toISOString();
@@ -596,6 +599,9 @@ export function initializeLedgerSchema(db, transaction) {
       applyWorkSourceReconciliationMigration(db, appliedAt);
       applyProjectBoardsMigration(db, appliedAt);
       applyRecoveryRoundsMigration(db, appliedAt);
+      applyRowPropertyCandidatesMigration(db, appliedAt);
+      applyHandoffsMigration(db, appliedAt);
+      applyResourceLinkCandidatesMigration(db, appliedAt);
       db.exec(`PRAGMA user_version = ${LATEST_SCHEMA_VERSION};`);
     });
 }

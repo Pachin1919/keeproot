@@ -30,7 +30,7 @@ test('locale interface falls back to English and keeps names and route identity 
   const nav = renderNav('Resources', { locale: 'zh-CN', interactive: true, resourcesHref: '/projects/P/resources' });
   assert.match(nav, /aria-current="page"/u);
   assert.match(nav, /href="\/projects\/P\/resources"/u);
-  assert.match(nav, />资源<\/span>/u);
+  assert.match(nav, />材料与阅读<\/span>/u);
   assert.match(nav, /状态说明/u);
   assert.doesNotMatch(nav, /Status guide/u);
   const projects = renderProjectsHomeView({ projects: [{ id: 'PRJ-1', name: 'User <Project>', folder_available: true,
@@ -59,6 +59,12 @@ test('locale interface falls back to English and keeps names and route identity 
   assert.match(importHome, /本次选择/u);
   assert.match(importHome, /添加文件夹/u);
   assert.match(importHome, /data-import-messages=/u);
+  assert.match(importHome, /data-desktop-picker-enabled="false"/u);
+  assert.match(importHome, /要选择本地文件入库，请打开已安装的 Atlas Desktop/u);
+  assert.match(importHome, /href="\/projects">浏览项目/u);
+  const desktopImport = renderBatchWorkView({ mode: 'empty-selection', desktop_picker_enabled: true }, { locale: 'en' });
+  assert.match(desktopImport, /data-desktop-picker-enabled="true"/u);
+  assert.doesNotMatch(desktopImport, /This HTML preview can read/u);
   assert.match(importHome, /桌面文件选择器尚未就绪/u);
   assert.doesNotMatch(importHome, /data-import-messages="\{&quot;picker_unavailable&quot;:&quot;The Desktop/u);
   const importSelection = renderBatchWorkView({ mode: 'selection-set', items: [], projects: [], queue_id: 'QUE-1' }, { locale: 'zh-CN' });
@@ -77,6 +83,13 @@ test('locale interface falls back to English and keeps names and route identity 
   assert.doesNotMatch(html, /START HERE/u);
   assert.match(html, /Original 文件名 &lt;test&gt;/u);
   assert.doesNotMatch(html, /<test>/u);
+  const continuing = renderProjectHomeView({ base: '/projects/P', project: { name: '原项目' },
+    continue_item: { title: 'Original 工作名', href: '/work/DWT-original', position: 'Confirm field alignment' },
+  }, { locale: 'zh-CN' });
+  assert.match(continuing, /状态: 确认字段对应/u);
+  assert.doesNotMatch(continuing, /Confirm field alignment/u);
+  assert.match(continuing, /Original 工作名/u);
+  assert.match(continuing, /href="\/work\/DWT-original"/u);
   const attention = renderProjectHomeView({ base: '/projects/P', project: { name: 'Project' }, empty_project: false,
     continue_item: null, other_work: [], pinned: [], recent_results: [],
     changes: { state: 'attention', scope_label: 'Known Project facts', items: [

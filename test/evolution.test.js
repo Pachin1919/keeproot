@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { Evolution } from '../src/evolution.js';
 import { Registry } from '../src/registry.js';
+import { RoundRecovery } from '../src/round-recovery.js';
+import { SaveService } from '../src/save-service.js';
+import { createProjectMoveService } from '../src/project-move-service.js';
 
 const tempRoot = path.resolve('test', '.tmp');
 
@@ -18,6 +22,17 @@ function setup(name) {
   const project = registry.create({ name: 'Atlas', currentPath: 'Projects/Atlas' });
   registry.dispose();
   return { caseRoot, root, stateDir, projectId: project.project_id };
+}
+
+function projectMove(t, { root, stateDir, projectId }, hooks = {}) {
+  const registry = new Registry({ stateDir });
+  const adopted = registry.adoptRoot({ rootPath: root, rootType: 'project_workspace' });
+  registry.attachRoot(projectId, { rootId: adopted.root_id, relativePath: 'Projects/Atlas', reason: 'Project Move migration fixture.' });
+  const service = createProjectMoveService({ stateDir, registry, ...hooks });
+  t.after(() => { service.dispose(); registry.dispose(); });
+  const options = (row, requestKey) => ({ projectId, expectedRevision: row.revision, expectedDigest: row.digest, requestKey });
+  const prepare = (target = 'Projects/Atlas-New') => service.prepare({ projectId, targetRelativePath: target, requestKey: `prepare-${target}` });
+  return { service, registry, options, prepare };
 }
 
 test('Evolution creates one reviewed directory and removes it on safe rollback', (t) => {
@@ -309,26 +324,24 @@ test('Evolution blocks a cross-Root move when an ancestor control file still use
   assert.equal(fs.existsSync(path.join(targetRoot, 'projects', 'Website')), false);
 });
 
-test('Evolution migrates one Project directory and updates Registry only after verification', (t) => {
+test('Project Move migrates one Project directory and updates Registry only after verification', (t) => {
   const { root, stateDir, projectId } = setup('evolution-migrate-project');
   fs.mkdirSync(path.join(root, 'Projects', 'Atlas', 'nested'), { recursive: true });
   fs.writeFileSync(path.join(root, 'Projects', 'Atlas', 'nested', 'data.json'), '{"ok":true}\n', 'utf8');
   const evolution = new Evolution({ stateDir });
   t.after(() => evolution.dispose());
-  const prepared = evolution.prepare({
-    root,
-    operation: 'migrate_project',
-    projectId,
-    target: 'Projects/Atlas-Renamed',
-  });
-  assert.equal(prepared.source, 'Projects/Atlas');
+  const move = projectMove(t, { root, stateDir, projectId });
+  const prepared = move.prepare('Projects/Atlas-Renamed');
+  assert.equal(prepared.source.relative_path, 'Projects/Atlas');
   assert.equal(prepared.project_id, projectId);
-  evolution.approve(prepared.run_id, { reason: 'Migrate this Project directory.' });
-  evolution.execute(prepared.run_id);
+  const applied = move.service.execute(prepared.move_id, move.options(prepared, 'execute'));
+  const receipt = evolution.preview(prepared.move_id).execution_receipt;
+  assert.equal(receipt.verified, true);
+  assert.equal(receipt.before_manifest_hash, receipt.after_manifest_hash);
   assert.equal(fs.existsSync(path.join(root, 'Projects', 'Atlas')), false);
   assert.equal(fs.existsSync(path.join(root, 'Projects', 'Atlas-Renamed', 'nested', 'data.json')), true);
   assert.equal(evolution.ledger.getProject(projectId).current_path, 'Projects/Atlas-Renamed');
-  evolution.rollback(prepared.run_id);
+  move.service.undo(prepared.move_id, move.options(applied, 'undo'));
   assert.equal(fs.existsSync(path.join(root, 'Projects', 'Atlas', 'nested', 'data.json')), true);
   assert.equal(evolution.ledger.getProject(projectId).current_path, 'Projects/Atlas');
 });
@@ -541,13 +554,12 @@ test('Evolution rollback refuses later content in a created or migrated director
   assert.throws(() => evolution.rollback(created.run_id), /conflict|no longer match/i);
   assert.equal(fs.existsSync(path.join(root, created.target, 'later.md')), true);
 
-  const migrated = evolution.prepare({
-    root, operation: 'migrate_project', projectId, target: 'Projects/Atlas-New',
-  });
-  evolution.approve(migrated.run_id, { reason: 'Migrate Project.' });
-  evolution.execute(migrated.run_id);
-  fs.writeFileSync(path.join(root, migrated.target, 'later.md'), 'later\n', 'utf8');
-  assert.throws(() => evolution.rollback(migrated.run_id), /conflict|no longer match/i);
+  const move = projectMove(t, { root, stateDir, projectId });
+  const migrated = move.prepare();
+  const applied = move.service.execute(migrated.move_id, move.options(migrated, 'execute'));
+  fs.writeFileSync(path.join(root, migrated.target.relative_path, 'later.md'), 'later\n', 'utf8');
+  assert.throws(() => move.service.undo(migrated.move_id, move.options(applied, 'undo')), { code: 'ATLAS_STATE_CONFLICT' });
+  assert.equal(fs.readFileSync(path.join(root, migrated.target.relative_path, 'later.md'), 'utf8'), 'later\n');
   assert.equal(evolution.ledger.getProject(projectId).current_path, 'Projects/Atlas-New');
 });
 
@@ -558,9 +570,8 @@ test('Evolution rejects path escape, nested Project targets, and symbolic-link s
   assert.throws(() => evolution.prepare({
     root, operation: 'create_directory', target: '../outside',
   }), /escape|outside/i);
-  assert.throws(() => evolution.prepare({
-    root, operation: 'migrate_project', projectId, target: 'Projects/Atlas/nested',
-  }), /inside itself|nested/i);
+  const move = projectMove(t, { root, stateDir, projectId });
+  assert.throws(() => move.prepare('Projects/Atlas/nested'), /overlap|escape/i);
   const link = path.join(root, 'Projects', 'Atlas', 'link.md');
   try {
     fs.symlinkSync(path.join(root, 'Projects', 'Atlas', 'note.md'), link, 'file');
@@ -577,10 +588,8 @@ test('Project migration stops before filesystem mutation when Registry changed a
   const { root, stateDir, projectId } = setup('evolution-registry-execute-conflict');
   const evolution = new Evolution({ stateDir });
   t.after(() => evolution.dispose());
-  const prepared = evolution.prepare({
-    root, operation: 'migrate_project', projectId, target: 'Projects/Atlas-New',
-  });
-  evolution.approve(prepared.run_id, { reason: 'Approve the original Registry state.' });
+  const move = projectMove(t, { root, stateDir, projectId });
+  const prepared = move.prepare();
   const project = evolution.ledger.getProject(projectId);
   evolution.ledger.updateProject(projectId, {
     name: project.name,
@@ -590,7 +599,7 @@ test('Project migration stops before filesystem mutation when Registry changed a
     reason: 'Simulate a later legitimate Registry edit.',
     updatedAt: new Date().toISOString(),
   });
-  assert.throws(() => evolution.execute(prepared.run_id), /Registry changed/i);
+  assert.throws(() => move.service.execute(prepared.move_id, move.options(prepared, 'execute')), { code: 'ATLAS_STATE_CONFLICT' });
   assert.equal(fs.existsSync(path.join(root, 'Projects', 'Atlas', 'note.md')), true);
   assert.equal(fs.existsSync(path.join(root, 'Projects', 'Atlas-New')), false);
 });
@@ -599,11 +608,9 @@ test('Project rollback stops before filesystem mutation when Registry changed af
   const { root, stateDir, projectId } = setup('evolution-registry-rollback-conflict');
   const evolution = new Evolution({ stateDir });
   t.after(() => evolution.dispose());
-  const prepared = evolution.prepare({
-    root, operation: 'migrate_project', projectId, target: 'Projects/Atlas-New',
-  });
-  evolution.approve(prepared.run_id, { reason: 'Migrate the Project.' });
-  evolution.execute(prepared.run_id);
+  const move = projectMove(t, { root, stateDir, projectId });
+  const prepared = move.prepare();
+  const applied = move.service.execute(prepared.move_id, move.options(prepared, 'execute'));
   const project = evolution.ledger.getProject(projectId);
   evolution.ledger.updateProject(projectId, {
     name: project.name,
@@ -613,7 +620,7 @@ test('Project rollback stops before filesystem mutation when Registry changed af
     reason: 'Simulate a later legitimate Registry edit.',
     updatedAt: new Date().toISOString(),
   });
-  assert.throws(() => evolution.rollback(prepared.run_id), /Registry changed/i);
+  assert.throws(() => move.service.undo(prepared.move_id, move.options(applied, 'undo')), { code: 'ATLAS_STATE_CONFLICT' });
   assert.equal(fs.existsSync(path.join(root, 'Projects', 'Atlas')), false);
   assert.equal(fs.existsSync(path.join(root, 'Projects', 'Atlas-New', 'note.md')), true);
 });
@@ -665,29 +672,25 @@ test('Project migration and rollback resume after filesystem mutation but before
   const { root, stateDir, projectId } = setup('evolution-project-resume');
   const evolution = new Evolution({ stateDir });
   t.after(() => evolution.dispose());
-  const prepared = evolution.prepare({
-    root, operation: 'migrate_project', projectId, target: 'Projects/Atlas-New',
-  });
-  evolution.approve(prepared.run_id, { reason: 'Migrate with simulated interruption.' });
-
-  evolution.ledger.startEvolutionExecution(prepared.run_id, new Date().toISOString());
-  fs.renameSync(
-    path.join(root, 'Projects', 'Atlas'),
-    path.join(root, 'Projects', 'Atlas-New'),
-  );
-  const executed = evolution.execute(prepared.run_id);
-  assert.equal(executed.status, 'executed');
+  const move = projectMove(t, { root, stateDir, projectId }, { afterPhysicalMove: () => { throw new Error('Injected after physical Project move.'); } });
+  const prepared = move.prepare();
+  assert.throws(() => move.service.execute(prepared.move_id, move.options(prepared, 'execute')), /Injected after physical/u);
+  assert.equal(fs.existsSync(path.join(root, 'Projects', 'Atlas')), false);
+  assert.equal(fs.readFileSync(path.join(root, 'Projects', 'Atlas-New', 'note.md'), 'utf8'), '# Note\n');
+  assert.equal(evolution.ledger.getProject(projectId).current_path, 'Projects/Atlas');
+  const pending = move.service.show(prepared.move_id, { projectId });
+  assert.equal(pending.status, 'needs_recovery');
+  const executed = move.service.recover(prepared.move_id, move.options(pending, 'recover-execute'));
+  assert.equal(executed.status, 'applied');
   assert.equal(evolution.ledger.getProject(projectId).current_path, 'Projects/Atlas-New');
-
-  evolution.ledger.recordEvent(prepared.run_id, 'evolution_rollback_started', {
-    source: 'Projects/Atlas', target: 'Projects/Atlas-New',
-  });
-  fs.renameSync(
-    path.join(root, 'Projects', 'Atlas-New'),
-    path.join(root, 'Projects', 'Atlas'),
-  );
-  const rolledBack = evolution.rollback(prepared.run_id);
-  assert.equal(rolledBack.status, 'rolled_back');
+  const receipt = evolution.preview(prepared.move_id).execution_receipt;
+  assert.equal(receipt.before_manifest_hash, receipt.after_manifest_hash);
+  assert.throws(() => move.service.undo(prepared.move_id, move.options(executed, 'undo')), /Injected after physical/u);
+  assert.equal(evolution.ledger.getProject(projectId).current_path, 'Projects/Atlas-New');
+  const undoPending = move.service.show(prepared.move_id, { projectId });
+  assert.equal(undoPending.status, 'needs_recovery');
+  const rolledBack = move.service.recover(prepared.move_id, move.options(undoPending, 'recover-undo'));
+  assert.equal(rolledBack.status, 'undone');
   assert.equal(evolution.ledger.getProject(projectId).current_path, 'Projects/Atlas');
   assert.equal(fs.existsSync(path.join(root, 'Projects', 'Atlas', 'note.md')), true);
 });
@@ -889,7 +892,7 @@ test('multi-step organization plan resumes after one child completed and the nex
   assert.equal(fs.existsSync(path.join(root, 'Projects', 'Website', 'Demos')), false);
 });
 
-test('Employment to Employment and Life keeps stable Project identity, alias, path history, and a readable migration plan', (t) => {
+test('Project Move from Employment to Employment and Life keeps identity, alias, path history, and a readable preview', (t) => {
   const { root, stateDir, projectId } = setup('evolution-employment-life-scenario');
   const registry = new Registry({ stateDir });
   registry.update(projectId, {
@@ -900,28 +903,221 @@ test('Employment to Employment and Life keeps stable Project identity, alias, pa
   registry.dispose();
   const evolution = new Evolution({ stateDir });
   t.after(() => evolution.dispose());
-  const prepared = evolution.preparePlan({
-    root,
-    intent: 'Rename the durable area without losing its digital lineage.',
-    operations: [{
-      operation: 'migrate_project',
-      projectId,
-      target: 'Projects/Employment and Life',
-    }],
-  });
-  const preview = evolution.previewPlan(prepared.run_id);
-  assert.equal(preview.operations[0].project_id, projectId);
-  assert.equal(preview.operations[0].source, 'Projects/Atlas');
-  assert.equal(preview.operations[0].target, 'Projects/Employment and Life');
-  assert.equal(preview.user_decisions_required, 1);
-  evolution.approvePlan(prepared.run_id, { reason: 'Approve the exact identity-preserving migration.' });
-  evolution.executePlan(prepared.run_id);
+  const move = projectMove(t, { root, stateDir, projectId });
+  const prepared = move.prepare('Projects/Employment and Life');
+  const preview = move.service.show(prepared.move_id, { projectId });
+  assert.equal(preview.project_id, projectId);
+  assert.equal(preview.source.relative_path, 'Projects/Atlas');
+  assert.equal(preview.target.relative_path, 'Projects/Employment and Life');
+  assert.equal(preview.can_execute, true);
+  const applied = move.service.execute(prepared.move_id, move.options(preview, 'execute'));
   const project = evolution.ledger.getProjectDetail(projectId);
   assert.equal(project.project.id, projectId);
   assert.equal(project.project.name, 'Employment and Life');
   assert.equal(project.project.current_path, 'Projects/Employment and Life');
   assert.ok(project.aliases.includes('Employment'));
-  assert.ok(project.paths.some((item) => item.path === 'Projects/Atlas' && item.valid_to));
-  evolution.rollbackPlan(prepared.run_id);
+  const priorLocation = evolution.ledger.db.prepare("SELECT status,valid_to FROM project_locations WHERE project_id=? AND relative_path=? ORDER BY valid_from DESC").get(projectId, 'Projects/Atlas');
+  assert.equal(priorLocation.status, 'historical');
+  assert.ok(priorLocation.valid_to);
+  move.service.undo(prepared.move_id, move.options(applied, 'undo'));
   assert.equal(evolution.ledger.getProject(projectId).current_path, 'Projects/Atlas');
+});
+
+test('Save directory prepare creates a Project-bound review record without creating the directory', (t) => {
+  fs.mkdirSync(tempRoot, { recursive: true });
+  const caseRoot = fs.mkdtempSync(path.join(tempRoot, 'save-directory-prepare-'));
+  assert.equal(path.dirname(caseRoot), tempRoot);
+  const root = path.join(caseRoot, 'vault');
+  const stateDir = path.join(caseRoot, 'state');
+  const projectPath = path.join(root, 'Projects', 'Atlas');
+  fs.mkdirSync(projectPath, { recursive: true });
+  const candidateFile = path.join(caseRoot, 'candidate.md');
+  fs.writeFileSync(candidateFile, '# Candidate\n');
+  const registry = new Registry({ stateDir });
+  const workspaceRoot = registry.adoptRoot({ rootPath: root, rootType: 'project_workspace', contentPolicy: 'bounded_content' });
+  const project = registry.create({ name: 'Atlas', currentPath: 'Projects/Atlas' });
+  registry.attachRoot(project.project_id, { rootId: workspaceRoot.root_id, relativePath: 'Projects/Atlas', reason: 'Save directory fixture.' });
+  registry.dispose();
+  let reviewRegistry = null;
+  let saveService = null;
+  let evolution = null;
+  let roundRecovery = null;
+  t.after(() => {
+    evolution?.dispose();
+    saveService?.dispose();
+    roundRecovery?.dispose();
+    reviewRegistry?.dispose();
+    fs.rmSync(caseRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+  });
+
+  const cliPath = path.resolve('bin/atlas.js');
+  const invokeRaw = (args) => spawnSync(process.execPath, [cliPath, ...args, '--json'], {
+    cwd: path.resolve('.'), env: { ...process.env, ATLAS_STATE_DIR: stateDir }, encoding: 'utf8',
+  });
+  const invoke = (args) => {
+    const result = invokeRaw(args);
+    assert.equal(result.status, 0, result.stderr);
+    const envelope = JSON.parse(result.stdout);
+    assert.equal(envelope.ok, true);
+    return envelope.data;
+  };
+  const base = [
+    '--root', root, '--candidate-file', candidateFile, '--project', project.project_id,
+    '--target', 'Projects/Atlas/Working/result.md', '--origin', 'human_written', '--kind', 'note',
+    '--tool', 'evolution-test', '--client-run-id', 'save-directory-prepare',
+  ];
+  const plan = invoke(['save', 'plan', ...base]);
+  assert.equal(plan.status, 'needs_structure_change');
+  assert.match(plan.plan_revision, /^[a-f0-9]{64}$/u);
+  assert.equal(fs.existsSync(path.join(root, 'Projects', 'Atlas', 'Working')), false);
+
+  fs.writeFileSync(candidateFile, '# Changed candidate\n');
+  const stalePrepare = invokeRaw(['save', 'directory', 'prepare', ...base, '--expected-plan-revision', plan.plan_revision]);
+  assert.notEqual(stalePrepare.status, 0);
+  assert.equal(fs.existsSync(path.join(root, 'Projects', 'Atlas', 'Working')), false);
+  fs.writeFileSync(candidateFile, '# Candidate\n');
+
+  const prepared = invoke(['save', 'directory', 'prepare', ...base, '--expected-plan-revision', plan.plan_revision]);
+  assert.equal(prepared.project_id, project.project_id);
+  assert.equal(prepared.directory_path, 'Projects/Atlas/Working');
+  assert.equal(prepared.save_target, plan.target);
+  assert.equal(prepared.plan_revision, plan.plan_revision);
+  assert.equal(prepared.review_href, `/projects/${project.project_id}/save-directory/${prepared.run_id}`);
+  assert.equal(fs.existsSync(path.join(root, prepared.directory_path)), false);
+
+  const shown = invoke(['save', 'directory', 'show', prepared.run_id]);
+  assert.equal(shown.run_id, prepared.run_id);
+  assert.equal(shown.plan_revision, plan.plan_revision);
+  assert.equal(shown.directory_path, prepared.directory_path);
+  assert.equal(shown.save_target, plan.target);
+  assert.equal(fs.existsSync(path.join(root, prepared.directory_path)), false);
+  assert.notEqual(spawnSync(process.execPath, [cliPath, 'save', 'prepare', ...base, '--expected-plan-revision', plan.plan_revision, '--json'], {
+    cwd: path.resolve('.'), env: { ...process.env, ATLAS_STATE_DIR: stateDir }, encoding: 'utf8',
+  }).status, 0);
+
+  reviewRegistry = new Registry({ stateDir });
+  saveService = new SaveService({ stateDir });
+  evolution = new Evolution({ stateDir, registry: reviewRegistry, saveService });
+  const displacedProjectPath = `${projectPath}.displaced`;
+  fs.renameSync(projectPath, displacedProjectPath);
+  fs.mkdirSync(projectPath);
+  assert.throws(
+    () => evolution.approve(prepared.run_id, { reason: 'Approve only the same Project directory.' }),
+    (error) => error.code === 'ATLAS_STATE_CONFLICT' && /identity changed/u.test(error.message),
+  );
+  fs.rmdirSync(projectPath);
+  fs.renameSync(displacedProjectPath, projectPath);
+
+  evolution.approve(prepared.run_id, { reason: 'Approve this exact Save directory.' });
+  const executed = evolution.execute(prepared.run_id);
+  assert.equal(executed.status, 'executed');
+  assert.ok(executed.save_directory_identity?.ino);
+  assert.deepEqual(evolution.execute(prepared.run_id), executed);
+  assert.equal(fs.existsSync(path.join(root, prepared.directory_path)), true);
+  const executedShow = invoke(['save', 'directory', 'show', prepared.run_id]);
+  assert.equal(executedShow.status, 'executed');
+  assert.deepEqual(executedShow.execution_receipt.save_directory_identity, executed.save_directory_identity);
+  assert.equal(evolution.rollback(prepared.run_id).status, 'rolled_back');
+  assert.equal(fs.existsSync(path.join(root, prepared.directory_path)), false);
+
+  const unknownBase = [...base];
+  unknownBase[unknownBase.indexOf('Projects/Atlas/Working/result.md')] = 'Projects/Atlas/Working2/result.md';
+  const unknownPlan = invoke(['save', 'plan', ...unknownBase]);
+  const unknownPrepared = invoke(['save', 'directory', 'prepare', ...unknownBase, '--expected-plan-revision', unknownPlan.plan_revision]);
+  evolution.approve(unknownPrepared.run_id, { reason: 'Prepare an interruption recovery fixture.' });
+  const recordEvent = evolution.ledger.recordEvent.bind(evolution.ledger);
+  evolution.ledger.recordEvent = (runId, type, payload, occurredAt) => {
+    if (type === 'evolution_save_directory_identity') throw new Error('fixture interruption after directory creation');
+    return recordEvent(runId, type, payload, occurredAt);
+  };
+  assert.throws(() => evolution.execute(unknownPrepared.run_id), /fixture interruption/u);
+  evolution.ledger.recordEvent = recordEvent;
+  const unknownDirectory = path.join(root, unknownPrepared.directory_path);
+  assert.equal(fs.existsSync(unknownDirectory), true);
+  evolution.dispose();
+  evolution = new Evolution({ stateDir, registry: reviewRegistry, saveService });
+  assert.throws(
+    () => evolution.execute(unknownPrepared.run_id),
+    (error) => error.code === 'ATLAS_STATE_CONFLICT' && /will not claim or remove/u.test(error.message),
+  );
+  assert.equal(evolution.preview(unknownPrepared.run_id).run.status, 'stale');
+  assert.equal(fs.existsSync(unknownDirectory), true);
+
+  const receiptBase = [...base];
+  receiptBase[receiptBase.indexOf('Projects/Atlas/Working/result.md')] = 'Projects/Atlas/WorkingReceipt/result.md';
+  const receiptPlan = invoke(['save', 'plan', ...receiptBase]);
+  const receiptPrepared = invoke(['save', 'directory', 'prepare', ...receiptBase, '--expected-plan-revision', receiptPlan.plan_revision]);
+  evolution.approve(receiptPrepared.run_id, { reason: 'Prepare a receipt-recovery fixture.' });
+  const originalFinish = evolution.ledger.finishEvolutionExecution.bind(evolution.ledger);
+  evolution.ledger.finishEvolutionExecution = () => { throw new Error('fixture interruption after identity event'); };
+  assert.throws(() => evolution.execute(receiptPrepared.run_id), /fixture interruption after identity event/u);
+  evolution.ledger.finishEvolutionExecution = originalFinish;
+  const interruptedDetail = evolution.preview(receiptPrepared.run_id);
+  const identityEvent = interruptedDetail.events.find((event) => event.type === 'evolution_save_directory_identity');
+  assert.ok(identityEvent?.payload?.identity?.ino);
+  assert.equal(interruptedDetail.execution_receipt, null);
+  const receiptDirectory = path.join(root, receiptPrepared.directory_path);
+  const interruptedIdentity = identityEvent.payload.identity;
+  evolution.dispose();
+  evolution = new Evolution({ stateDir, registry: reviewRegistry, saveService });
+  const recoveredReceipt = evolution.execute(receiptPrepared.run_id);
+  assert.equal(recoveredReceipt.status, 'executed');
+  assert.deepEqual(recoveredReceipt.save_directory_identity, interruptedIdentity);
+  assert.deepEqual(evolution.execute(receiptPrepared.run_id), recoveredReceipt);
+
+  const displacedReceiptDirectory = `${receiptDirectory}.displaced`;
+  fs.renameSync(receiptDirectory, displacedReceiptDirectory);
+  fs.mkdirSync(receiptDirectory);
+  assert.throws(
+    () => evolution.rollback(receiptPrepared.run_id),
+    (error) => error.code === 'ATLAS_STATE_CONFLICT' && /identity cannot be proven/u.test(error.message),
+  );
+  assert.equal(fs.existsSync(receiptDirectory), true);
+  assert.equal(fs.readdirSync(receiptDirectory).length, 0);
+  fs.rmdirSync(receiptDirectory);
+  fs.renameSync(displacedReceiptDirectory, receiptDirectory);
+  assert.equal(evolution.rollback(receiptPrepared.run_id).status, 'rolled_back');
+
+  const recoveryBase = [...base];
+  recoveryBase[recoveryBase.indexOf('Projects/Atlas/Working/result.md')] = 'Projects/Atlas/WorkingRecovery/result.md';
+  const recoveryPlan = invoke(['save', 'plan', ...recoveryBase]);
+  const recoveryPrepared = invoke(['save', 'directory', 'prepare', ...recoveryBase, '--expected-plan-revision', recoveryPlan.plan_revision]);
+  roundRecovery = new RoundRecovery({ stateDir, registry: reviewRegistry });
+  const recoveryFiles = ['recovery-a.md', 'recovery-b.md'];
+  for (const file of recoveryFiles) fs.writeFileSync(path.join(projectPath, file), `before ${file}`);
+  const recoveryCaller = { actor: 'agent', tool: 'evolution-test', client_run_id: 'pending-recovery' };
+  const protectedRound = roundRecovery.protect({
+    projectId: project.project_id,
+    paths: recoveryFiles,
+    label: 'Pending directory guard',
+    requestKey: 'protect',
+    caller: recoveryCaller,
+  });
+  for (const file of recoveryFiles) fs.writeFileSync(path.join(projectPath, file), `after ${file}`);
+  const currentRound = roundRecovery.show({ projectId: project.project_id, roundId: protectedRound.round_id });
+  const originalRename = fs.renameSync;
+  const rename = t.mock.method(fs, 'renameSync', (from, to) => {
+    if (String(from).includes('.atlas-restore-') && to === path.join(projectPath, recoveryFiles[1])) {
+      throw new Error('fixture interruption during pending recovery');
+    }
+    return originalRename(from, to);
+  });
+  assert.throws(() => roundRecovery.restore({
+    projectId: project.project_id,
+    roundId: protectedRound.round_id,
+    nodeId: protectedRound.head_node_id,
+    baseRevision: currentRound.revision,
+    expectedDigest: currentRound.current_digest,
+    requestKey: 'restore',
+    caller: recoveryCaller,
+  }), /fixture interruption during pending recovery/u);
+  rename.mock.restore();
+  const pendingRound = roundRecovery.show({ projectId: project.project_id, roundId: protectedRound.round_id });
+  assert.ok(pendingRound.pending_restore);
+  const pendingRecoveryDirectory = path.join(root, recoveryPrepared.directory_path);
+  assert.throws(
+    () => evolution.approve(recoveryPrepared.run_id, { reason: 'Must wait for recovery.' }),
+    (error) => error.code === 'ATLAS_RECOVERY_INCOMPLETE',
+  );
+  assert.equal(fs.existsSync(pendingRecoveryDirectory), false);
 });

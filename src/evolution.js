@@ -6,6 +6,7 @@ import { Ledger } from './ledger.js';
 import { isPathInside, normalizeRoot, toPortablePath } from './paths.js';
 import { sha256File } from './snapshots.js';
 import { withStateLock } from './state-lock.js';
+import { assertRecoveryWritable } from './storage/recovery-write-guard.js';
 import { RollbackConflictError } from './tracker.js';
 
 const OPERATIONS = new Set([
@@ -17,6 +18,13 @@ const OPERATIONS = new Set([
   'remove_empty_directory',
 ]);
 const MAX_MANIFEST_ENTRIES = 100_000;
+const PROJECT_MOVE_GUIDANCE = 'Legacy Evolution migrate_project is unsupported. Use project move prepare --request-file <request.json> for an active Project with an active registered location inside the same Root; review a fresh Project Move preview and confirm its exact revision and digest. Historical Evolution RUN records cannot use Project Move Undo; inspect their receipts and use targeted recovery.';
+function refuseProjectMigration(operation) {
+  if (operation === 'migrate_project') throw stateConflict(PROJECT_MOVE_GUIDANCE);
+}
+function refuseProjectPlan(detail) {
+  if (detail.operations.some((item) => item.operation === 'migrate_project')) throw stateConflict(PROJECT_MOVE_GUIDANCE);
+}
 const MAX_PORTABLE_WINDOWS_PATH = 240;
 const MAX_CONTROL_FILE_BYTES = 256 * 1024;
 const MAX_REFERENCE_FILE_BYTES = 2 * 1024 * 1024;
@@ -127,6 +135,44 @@ function normalizeTarget(root, input) {
   if (!isPathInside(root, realParent)) throw new Error(`Evolution target resolves outside the root: ${input}`);
   const absolute = path.join(realParent, path.basename(lexical));
   return { absolute, relative: toPortablePath(path.relative(root, absolute)) };
+}
+
+function directoryIdentity(directory) {
+  const stat = fs.lstatSync(directory, { bigint: true });
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw stateConflict(`Save directory is not a real directory: ${directory}`);
+  }
+  return {
+    dev: stat.dev.toString(),
+    ino: stat.ino.toString(),
+    birthtime_ns: stat.birthtimeNs.toString(),
+  };
+}
+
+function sameDirectoryIdentity(directory, expected) {
+  if (!expected || !fs.existsSync(directory)) return false;
+  try {
+    return JSON.stringify(directoryIdentity(directory)) === JSON.stringify(expected);
+  } catch {
+    return false;
+  }
+}
+
+function assertSaveDirectoryPath(root, relative, { mustExist = false } = {}) {
+  const absolute = path.resolve(root, ...String(relative).split('/'));
+  if (!isPathInside(root, absolute) || absolute === root) {
+    throw stateConflict('Save directory escapes its authorized Root.');
+  }
+  assertPortableWindowsPath(root, absolute);
+  assertNoLinkTraversal(root, absolute);
+  if (mustExist) {
+    if (!fs.existsSync(absolute) || !fs.lstatSync(absolute).isDirectory() || fs.lstatSync(absolute).isSymbolicLink()) {
+      throw stateConflict(`Save directory is unavailable: ${relative}`);
+    }
+    const real = fs.realpathSync.native(absolute);
+    if (!isPathInside(root, real)) throw stateConflict('Save directory resolves outside its authorized Root.');
+  }
+  return absolute;
 }
 
 function normalizePlannedTarget(root, input, plannedDirectories) {
@@ -642,9 +688,11 @@ function stateConflict(message) {
 }
 
 export class Evolution {
-  constructor({ stateDir }) {
+  constructor({ stateDir, registry = null, saveService = null }) {
     if (!stateDir) throw new Error('Evolution requires a stateDir');
     this.stateDir = path.resolve(stateDir);
+    this.registry = registry;
+    this.saveService = saveService;
     this._ledger = null;
   }
 
@@ -653,7 +701,65 @@ export class Evolution {
     return this._ledger;
   }
 
+  #verifySaveDirectoryContext(context, { checkPlan = true, identityEvent = null, allowAbsentIdentity = false } = {}) {
+    if (!context || !this.registry || !this.saveService) {
+      throw new Error('Project Save directory changes require Registry and Save services.');
+    }
+    const root = normalizeRoot(context.root);
+    if (root !== context.root) {
+      throw stateConflict('Save directory Root context changed.');
+    }
+    const detail = this.registry.show(context.project_id);
+    const project = detail.project;
+    const location = detail.location;
+    if (!project || project.status !== 'active' || !location
+      || location.root_id !== context.root_id
+      || path.resolve(location.root_path).toLowerCase() !== root.toLowerCase()
+      || project.current_path !== context.project_path
+      || location.relative_path !== context.project_path) {
+      throw stateConflict('Project or attached Root changed after Save directory preparation.');
+    }
+    assertRecoveryWritable(this.ledger.db, { projectId: context.project_id });
+    const rootIdentity = directoryIdentity(root);
+    const projectPath = assertSaveDirectoryPath(root, context.project_path, { mustExist: true });
+    const parentPath = assertSaveDirectoryPath(root, context.parent_path, { mustExist: true });
+    if (JSON.stringify(rootIdentity) !== JSON.stringify(context.root_identity)
+      || JSON.stringify(directoryIdentity(projectPath)) !== JSON.stringify(context.project_identity)
+      || JSON.stringify(directoryIdentity(parentPath)) !== JSON.stringify(context.parent_identity)) {
+      throw stateConflict('Save directory Root, Project, or existing parent identity changed.');
+    }
+    const targetPath = assertSaveDirectoryPath(root, context.directory_path);
+    const saveTargetPath = assertSaveDirectoryPath(root, context.save_target);
+    if (!isPathInside(projectPath, targetPath) || !isPathInside(targetPath, saveTargetPath)
+      || toPortablePath(path.relative(root, targetPath)) !== context.directory_path
+      || toPortablePath(path.relative(root, saveTargetPath)) !== context.save_target) {
+      throw stateConflict('Save directory target is outside the attached Project.');
+    }
+    if (checkPlan) {
+      const plan = this.saveService.plan(context.save_options);
+      if (plan.status !== 'needs_structure_change'
+        || plan.plan_revision !== context.plan_revision
+        || String(plan.target ?? '').replaceAll('\\', '/') !== context.save_target) {
+        throw stateConflict('Save plan changed; review the current plan before approving or creating its directory.');
+      }
+    }
+    if (identityEvent) {
+      if (!sameDirectoryIdentity(targetPath, identityEvent.payload?.identity)
+        && !(allowAbsentIdentity && !fs.existsSync(targetPath))) {
+        throw stateConflict('Created Save directory identity cannot be proven; recovery is required.');
+      }
+      if (fs.existsSync(targetPath)) {
+        const manifest = directoryManifest(targetPath);
+        if (manifest.entries.length !== 1) throw stateConflict('Created Save directory is no longer empty.');
+      }
+    } else if (fs.existsSync(targetPath)) {
+      throw stateConflict('Save directory target was claimed before Atlas recorded its identity.');
+    }
+    return { targetPath, targetRelative: context.directory_path };
+  }
+
   preparePlan({ root: rootInput, operations, intent = null, caller = {}, runId: requestedRunId = null }) {
+    if (Array.isArray(operations)) operations.forEach((item) => refuseProjectMigration(item?.operation));
     const root = normalizeRoot(rootInput);
     if (isPathInside(root, this.stateDir)) {
       throw new Error(`Atlas state directory must be outside the organization plan root: ${this.stateDir}`);
@@ -742,12 +848,17 @@ export class Evolution {
   }
 
   previewPlan(runId) {
-    return this.ledger.getOrganizationPlan(runId);
+    const detail = this.ledger.getOrganizationPlan(runId);
+    if (detail.operations.some((item) => item.operation === 'migrate_project')) {
+      return { ...detail, project_migration_compatibility: { guidance: PROJECT_MOVE_GUIDANCE, legacy_undo_supported: false } };
+    }
+    return detail;
   }
 
   approvePlan(runId, { reason = null } = {}) {
     if (!reason?.trim()) throw new Error('Organization plan approval requires a reason.');
     const detail = this.previewPlan(runId);
+    refuseProjectPlan(detail);
     const blockers = detail.operations.flatMap((operation) => operation.blockers ?? []);
     if (blockers.length) {
       throw new Error(`Organization plan has unresolved blockers: ${[...new Set(blockers)].join(', ')}.`);
@@ -810,6 +921,7 @@ export class Evolution {
 
   executePlan(runId) {
     let detail = this.previewPlan(runId);
+    refuseProjectPlan(detail);
     if (detail.execution_receipt) return detail.execution_receipt;
     if (!['approved', 'partially_executed'].includes(detail.run.status)) {
       throw new Error(`Organization plan execution requires approval; current status is ${detail.run.status}.`);
@@ -877,6 +989,7 @@ export class Evolution {
 
   rollbackPlan(runId) {
     let detail = this.previewPlan(runId);
+    refuseProjectPlan(detail);
     if (detail.rollback_receipt) return detail.rollback_receipt;
     if (!['executed', 'partially_executed', 'stale'].includes(detail.run.status)) {
       throw new Error(`Organization plan has no executed source changes to roll back from ${detail.run.status}.`);
@@ -916,7 +1029,10 @@ export class Evolution {
     projectId = null,
     intent = null,
     caller = {},
+    saveDirectory = null,
+    internalPreflight = null,
   }) {
+    refuseProjectMigration(operation);
     const root = normalizeRoot(rootInput);
     const targetRoot = operation === 'migrate_cross_root'
       ? normalizeRoot(targetRootInput)
@@ -942,6 +1058,7 @@ export class Evolution {
       throw new Error(`Evolution operation must be one of: ${[...OPERATIONS].join(', ')}.`);
     }
     return withStateLock(this.stateDir, () => {
+      if (internalPreflight) internalPreflight();
       let normalizedSource = null;
       let normalizedTarget = null;
       let project = null;
@@ -953,6 +1070,15 @@ export class Evolution {
         };
       } else {
         normalizedTarget = normalizeTarget(targetRoot, target);
+      }
+      if (saveDirectory) {
+        if (operation !== 'create_directory' || !projectId || saveDirectory.project_id !== projectId
+          || normalizeRoot(saveDirectory.root) !== root
+          || String(saveDirectory.directory_path).replaceAll('\\', '/') !== normalizedTarget.relative
+          || saveDirectory.save_target == null || saveDirectory.plan_revision == null) {
+          throw new Error('Save directory preparation context does not match the Evolution operation.');
+        }
+        this.#verifySaveDirectoryContext(saveDirectory);
       }
       if (operation === 'move_file') {
         normalizedSource = normalizeSource(root, source, 'file');
@@ -1039,6 +1165,7 @@ export class Evolution {
           path: project.current_path,
           status: project.status,
         } : null,
+        ...(saveDirectory ? { save_directory: saveDirectory } : {}),
       };
       const sourceChanges = operation === 'create_directory'
         ? [{ path: normalizedTarget.relative, change: 'create_directory' }]
@@ -1074,6 +1201,15 @@ export class Evolution {
           available_target_bytes: freeBytes == null ? null : freeBytes.toString(),
         } : {}),
         project_id: projectId,
+        ...(saveDirectory ? { save_directory: {
+          project_id: saveDirectory.project_id,
+          root_id: saveDirectory.root_id,
+          root: saveDirectory.root,
+          project_path: saveDirectory.project_path,
+          directory_path: saveDirectory.directory_path,
+          save_target: saveDirectory.save_target,
+          plan_revision: saveDirectory.plan_revision,
+        } } : {}),
         source_manifest: sourceManifest ? publicManifest(sourceManifest) : null,
         ...(inspection ? {
           inspection,
@@ -1130,18 +1266,29 @@ export class Evolution {
   }
 
   preview(runId) {
-    return this.ledger.getEvolutionDetail(runId);
+    const detail = this.ledger.getEvolutionDetail(runId);
+    if (detail.operation.type === 'migrate_project' && !this.ledger.getEvolutionOperation(runId).baseline.project_move) {
+      return { ...detail, project_migration_compatibility: { guidance: PROJECT_MOVE_GUIDANCE, legacy_undo_supported: false } };
+    }
+    return detail;
   }
 
   approve(runId, { reason = null } = {}) {
     if (!reason?.trim()) throw new Error('Evolution approval requires a reason.');
+    const approveLocked = () => {
+      const detail = this.preview(runId);
+      refuseProjectMigration(detail.operation.type);
+      if (detail.plan.blockers?.length) {
+        throw new Error(`Evolution plan has unresolved blockers: ${detail.plan.blockers.join(', ')}.`);
+      }
+      const record = this.ledger.getEvolutionOperation(runId);
+      if (record.baseline.save_directory) this.#verifySaveDirectoryContext(record.baseline.save_directory);
+      return this.ledger.reviewEvolution(runId, {
+        decision: 'accepted', reason: reason.trim(), reviewedAt: timestamp(),
+      });
+    };
     const detail = this.preview(runId);
-    if (detail.plan.blockers?.length) {
-      throw new Error(`Evolution plan has unresolved blockers: ${detail.plan.blockers.join(', ')}.`);
-    }
-    return this.ledger.reviewEvolution(runId, {
-      decision: 'accepted', reason: reason.trim(), reviewedAt: timestamp(),
-    });
+    return detail.plan.save_directory ? withStateLock(this.stateDir, approveLocked) : approveLocked();
   }
 
   reject(runId, { reason = null } = {}) {
@@ -1151,11 +1298,13 @@ export class Evolution {
   }
 
   execute(runId) {
+    refuseProjectMigration(this.ledger.getEvolutionOperation(runId).operation_type);
     return withStateLock(this.stateDir, () => this.#execute(runId));
   }
 
   #execute(runId) {
     const detail = this.preview(runId);
+    refuseProjectMigration(detail.operation.type);
     if (detail.execution_receipt) return detail.execution_receipt;
     if (detail.run.status !== 'approved') {
       throw new Error(`Evolution execution requires approval; current status is ${detail.run.status}.`);
@@ -1185,7 +1334,7 @@ export class Evolution {
           && sourceState.entries.length === 1
         : sameManifest(sourceState, expectedKind, record.baseline.source_manifest_hash)
           && targetState.kind === 'absent';
-    const afterMatches = record.operation_type === 'create_directory'
+    let afterMatches = record.operation_type === 'create_directory'
       ? sameManifest(targetState, 'directory', hashJson([{ path: '', kind: 'directory' }]))
       : record.operation_type === 'remove_empty_directory'
         ? sourceState.kind === 'absent'
@@ -1194,6 +1343,24 @@ export class Evolution {
     const crossRootCopyReady = record.operation_type === 'migrate_cross_root'
       && sameManifest(sourceState, expectedKind, record.baseline.source_manifest_hash)
       && sameManifest(targetState, expectedKind, record.baseline.source_manifest_hash);
+    const saveDirectory = record.baseline.save_directory ?? null;
+    const directoryIdentityEvent = detail.events.find((event) => event.type === 'evolution_save_directory_identity') ?? null;
+    if (saveDirectory) {
+      if (started && !directoryIdentityEvent && fs.existsSync(targetPath)) {
+        this.ledger.markEvolutionStale(runId, {
+          reason: 'save_directory_created_without_identity_receipt',
+          target_observed_hash: targetState.hash,
+        }, timestamp());
+        throw stateConflict('Save directory was created without a durable identity receipt; Atlas will not claim or remove it.');
+      }
+      this.#verifySaveDirectoryContext(saveDirectory, {
+        checkPlan: !directoryIdentityEvent,
+        identityEvent: directoryIdentityEvent,
+      });
+      afterMatches = Boolean(directoryIdentityEvent
+        && sameDirectoryIdentity(targetPath, directoryIdentityEvent.payload?.identity)
+        && targetState.kind === 'directory' && targetState.entries.length === 1);
+    }
     if (record.operation_type === 'migrate_project') {
       const project = this.ledger.getProject(record.project_id);
       const allowedRegistryPaths = started && afterMatches
@@ -1213,7 +1380,16 @@ export class Evolution {
     }
     if (beforeMatches || (started && crossRootCopyReady)) {
       if (!started) this.ledger.startEvolutionExecution(runId, timestamp());
-      if (record.operation_type === 'create_directory') fs.mkdirSync(targetPath);
+      if (record.operation_type === 'create_directory') {
+        fs.mkdirSync(targetPath);
+        if (saveDirectory) {
+          const identity = directoryIdentity(targetPath);
+          this.ledger.recordEvent(runId, 'evolution_save_directory_identity', {
+            directory_path: saveDirectory.directory_path,
+            identity,
+          });
+        }
+      }
       else if (record.operation_type === 'remove_empty_directory') fs.rmdirSync(sourcePath);
       else if (record.operation_type === 'migrate_directory') {
         renameMigratableDirectory(sourcePath, targetPath, record.baseline.source_entries);
@@ -1284,6 +1460,7 @@ export class Evolution {
         after_manifest_hash: record.operation_type === 'remove_empty_directory' ? null : verifiedTarget.hash,
         verified: true,
         rollback_ready: true,
+        ...(saveDirectory ? { save_directory_identity: directoryIdentity(targetPath) } : {}),
         executed_at: executedAt,
       },
       executedAt,
@@ -1291,6 +1468,8 @@ export class Evolution {
   }
 
   rollback(runId) {
+    // Unsupported legacy records must not acquire a rollback-error event.
+    refuseProjectMigration(this.ledger.getEvolutionOperation(runId).operation_type);
     return withStateLock(this.stateDir, () => {
       try {
         return this.#rollback(runId);
@@ -1302,6 +1481,7 @@ export class Evolution {
   }
 
   #rollback(runId) {
+    refuseProjectMigration(this.ledger.getEvolutionOperation(runId).operation_type);
     const detail = this.preview(runId);
     if (detail.rollback_receipt) return detail.rollback_receipt;
     if (detail.run.status !== 'executed') {
@@ -1322,7 +1502,7 @@ export class Evolution {
       : null;
     const targetState = manifestForOperation(targetPath, record.operation_type, expectedKind);
     const started = detail.events.some((event) => event.type === 'evolution_rollback_started');
-    const endMatches = record.operation_type === 'create_directory'
+    let endMatches = record.operation_type === 'create_directory'
       ? sameManifest(targetState, 'directory', record.execution_receipt.after_manifest_hash)
       : record.operation_type === 'remove_empty_directory'
         ? sourceState.kind === 'absent'
@@ -1335,6 +1515,23 @@ export class Evolution {
           && sourceState.entries.length === 1
         : sameManifest(sourceState, expectedKind, record.baseline.source_manifest_hash)
           && targetState.kind === 'absent';
+    const saveDirectory = record.baseline.save_directory ?? null;
+    const directoryIdentityEvent = detail.events.find((event) => event.type === 'evolution_save_directory_identity') ?? null;
+    if (saveDirectory) {
+      if (!directoryIdentityEvent
+        || JSON.stringify(directoryIdentityEvent.payload?.identity) !== JSON.stringify(record.execution_receipt?.save_directory_identity)) {
+        throw stateConflict('Created Save directory has no matching identity receipt.');
+      }
+      this.#verifySaveDirectoryContext(saveDirectory, {
+        checkPlan: false,
+        identityEvent: directoryIdentityEvent,
+        allowAbsentIdentity: started,
+      });
+      endMatches = !fs.existsSync(targetPath)
+        ? started
+        : sameDirectoryIdentity(targetPath, record.execution_receipt.save_directory_identity)
+          && targetState.kind === 'directory' && targetState.entries.length === 1;
+    }
     const crossRootRestoreReady = record.operation_type === 'migrate_cross_root'
       && sameManifest(sourceState, expectedKind, record.baseline.source_manifest_hash)
       && sameManifest(targetState, expectedKind, record.baseline.source_manifest_hash);
@@ -1359,7 +1556,9 @@ export class Evolution {
       if (!started) this.ledger.recordEvent(runId, 'evolution_rollback_started', {
         source: record.source_path, target: record.target_path,
       });
-      if (record.operation_type === 'create_directory') fs.rmdirSync(targetPath);
+      if (record.operation_type === 'create_directory') {
+        if (fs.existsSync(targetPath)) fs.rmdirSync(targetPath);
+      }
       else if (record.operation_type === 'remove_empty_directory') fs.mkdirSync(sourcePath);
       else if (record.operation_type === 'migrate_directory') {
         renameMigratableDirectory(targetPath, sourcePath, record.baseline.source_entries);

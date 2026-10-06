@@ -5,6 +5,7 @@ import { Ledger } from './ledger.js';
 import { isPathInside, normalizeRoot } from './paths.js';
 import { captureProjectIdentity, compareProjectIdentity } from './project-identity.js';
 import { ProjectContextRepository } from './storage/repositories/project-context-repository.js';
+import { assertRecoveryWritable } from './storage/recovery-write-guard.js';
 
 const ROOT_TYPES = new Set([
   'managed_library',
@@ -48,6 +49,12 @@ function normalizeAliases(values = []) {
   return [...new Set(values.map((value) => normalizeName(value, 'Project alias')))];
 }
 
+function renamePreviewRevision({ projectId, expectedName, expectedUpdatedAt, newName }) {
+  return crypto.createHash('sha256')
+    .update([projectId, expectedName, expectedUpdatedAt, newName].join('\0'))
+    .digest('hex');
+}
+
 function normalizeReason(value, field) {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} requires a reason.`);
   return value.trim().normalize('NFC');
@@ -70,7 +77,7 @@ function normalizeExtensions(values = []) {
   }))].sort();
 }
 
-function realProjectDirectory(root, relativePath) {
+export function realProjectDirectory(root, relativePath) {
   const portable = normalizeProjectPath(relativePath);
   const absolute = path.resolve(root, ...portable.split('/'));
   if (!isPathInside(root, absolute) || absolute === root) {
@@ -271,6 +278,7 @@ export class Registry {
     relativePath = null,
     reason,
   }) {
+    assertRecoveryWritable(this.ledger.db, { projectId: projectIdValue });
     const project = this.ledger.getProject(projectIdValue);
     const root = this.projectContext.getRoot(rootId).root;
     if (root.governance_status !== 'adopted') throw new Error(`Workspace Root is not adopted: ${rootId}`);
@@ -302,6 +310,7 @@ export class Registry {
     relativePath,
     reason,
   }) {
+    assertRecoveryWritable(this.ledger.db, { projectId: projectIdValue });
     const project = this.ledger.getProject(projectIdValue);
     const current = this.projectContext.getActiveLocation(projectIdValue);
     if (!current) throw new Error(`Project has no active Workspace Root location: ${projectIdValue}`);
@@ -538,6 +547,59 @@ export class Registry {
       semantic_only: true,
       current_path: existing.current_path,
       source_changes: [],
+    };
+  }
+
+  previewRename(projectIdValue, newName) {
+    const project = this.ledger.getProject(projectIdValue);
+    const normalizedName = normalizeName(newName);
+    if (normalizedName === project.name) throw new Error('Choose a different Project name.');
+    return {
+      project_id: project.id,
+      old_name: project.name,
+      new_name: normalizedName,
+      current_path: project.current_path,
+      expected_updated_at: project.updated_at,
+      preview_revision: renamePreviewRevision({
+        projectId: project.id, expectedName: project.name,
+        expectedUpdatedAt: project.updated_at, newName: normalizedName,
+      }),
+      source_changes: [],
+      files_moved: false,
+    };
+  }
+
+  renameProject(projectIdValue, {
+    newName, expectedName, expectedUpdatedAt, previewRevision, reason = 'Project Home semantic rename confirmed.',
+  } = {}) {
+    const normalizedName = normalizeName(newName);
+    const expectedRevision = renamePreviewRevision({
+      projectId: projectIdValue, expectedName, expectedUpdatedAt, newName: normalizedName,
+    });
+    if (typeof previewRevision !== 'string' || previewRevision !== expectedRevision) {
+      const error = new Error('Project rename preview is invalid or out of date.');
+      error.code = 'ATLAS_STATE_CONFLICT';
+      throw error;
+    }
+    if (normalizedName === expectedName) throw new Error('Choose a different Project name.');
+    const updatedAt = timestamp();
+    const detail = this.ledger.projects.renameName({
+      projectId: projectIdValue,
+      name: normalizedName,
+      expectedName,
+      expectedUpdatedAt,
+      updatedAt,
+      reason: normalizeReason(reason, 'Project rename'),
+    });
+    return {
+      project_id: projectIdValue,
+      project: detail.project,
+      aliases: detail.aliases,
+      current_path: detail.project.current_path,
+      updated_at: detail.project.updated_at,
+      semantic_only: true,
+      source_changes: [],
+      files_moved: false,
     };
   }
 

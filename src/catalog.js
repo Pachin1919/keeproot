@@ -100,7 +100,7 @@ function parseDirectText(filePath, text) {
   };
 }
 
-function normalizeSearchTerms(values = []) {
+export function normalizeSearchTerms(values = []) {
   if (!Array.isArray(values)) throw new Error('Catalog search terms must be an array.');
   const terms = [...new Set(values.map((value) => String(value).trim().normalize('NFC')).filter(Boolean))];
   if (terms.length > 12) throw new Error('Catalog search accepts at most 12 terms.');

@@ -5,6 +5,7 @@ import { Registry } from './registry.js';
 import { isPathInside } from './paths.js';
 import { captureBlob, sha256Buffer, sha256File } from './snapshots.js';
 import { withStateLock } from './state-lock.js';
+import { assertDocumentUpdatesSettled } from './storage/recovery-write-guard.js';
 import { captureProductState, expandSaveScope, productState, restoreProductState, validateProductTransition } from './round-product-state.js';
 
 const now = () => new Date().toISOString();
@@ -119,7 +120,7 @@ export class RoundRecovery {
 
   #request(action, args) {
     const allowed = ['projectId', 'requestKey', 'caller', ...(action === 'protect'
-      ? ['paths', 'boardIds', 'resourceIds', 'workIds', 'saveIds', 'saveTargets', 'label']
+      ? ['paths', 'boardIds', 'resourceIds', 'workIds', 'saveIds', 'saveTargets', 'saveTarget', 'resourceId', 'label', 'protectionBasis']
       : ['roundId', 'baseRevision', 'expectedDigest', ...(action === 'extend' ? ['paths', 'boardIds', 'resourceIds', 'workIds', 'saveIds', 'saveTargets', 'label'] : action === 'checkpoint' ? ['label'] : action === 'return' ? ['restoreId'] : ['nodeId'])])];
     if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).some((key) => !allowed.includes(key))) fail('Unknown or unsupported round request field.');
     this.#caller(args); text(args.requestKey, 'requestKey');
@@ -230,9 +231,111 @@ export class RoundRecovery {
       .map(({ state_json }) => { const r = JSON.parse(state_json); return { round_id: r.round_id, label: r.label, revision: r.revision, pending_restore: r.pending_restore, updated_at: r.updated_at }; });
   }
 
+  protectedRoundsForSave({ projectId, saveId, targetPath }) {
+    const rows = this.db.prepare(`SELECT state_json FROM recovery_rounds AS round WHERE project_id=? AND (
+      EXISTS (SELECT 1 FROM json_each(round.state_json, '$.save_ids') WHERE value=?) OR
+      EXISTS (SELECT 1 FROM json_each(round.state_json, '$.save_targets') WHERE value=?)
+    ) ORDER BY updated_at DESC LIMIT 8`).all(projectId, saveId, targetPath ?? '');
+    return rows.flatMap(({ state_json }) => {
+      try {
+        const round = JSON.parse(state_json);
+        this.#checkRoot(round);
+        return [{ round_id: round.round_id, label: round.label, revision: round.revision }];
+      } catch { return []; } // A stale Round must not prevent the Save receipt from opening.
+    });
+  }
+
+  #saveTargetBasis(projectRoot, relative, extensions = ['csv', 'xlsx']) {
+    if (typeof relative !== 'string' || !relative || path.isAbsolute(relative) || path.win32.isAbsolute(relative)) fail('Use one Project-relative Save output file.');
+    const normalized = relative.replaceAll('\\', '/');
+    if (!extensions.some((extension) => normalized.toLowerCase().endsWith(`.${extension}`))) fail(`Save output must be one ${extensions.map((extension) => extension.toUpperCase()).join(' or ')} file.`);
+    const parts = normalized.split('/');
+    if (parts.some((part) => !part || ['.', '..', '.atlas', '.git'].includes(part.toLowerCase()))) fail('Save output path is unsupported.');
+    const target = path.resolve(projectRoot, ...parts);
+    if (!isPathInside(projectRoot, target)) fail('Save output is outside this Project.');
+    const identities = [];
+    let cursor = projectRoot;
+    const rootStat = noLinks(cursor);
+    identities.push({ path: '.', dev: String(rootStat.dev), ino: String(rootStat.ino) });
+    for (const part of parts.slice(0, -1)) {
+      cursor = path.join(cursor, part);
+      const stat = noLinks(cursor);
+      if (!stat.isDirectory()) fail('Save output parent must be an existing directory.');
+      identities.push({ path: path.relative(projectRoot, cursor).split(path.sep).join('/'), dev: String(stat.dev), ino: String(stat.ino) });
+    }
+    const leaf = noLinks(target, true);
+    if (leaf) fail('Save output target must not exist.');
+    return { target: normalized, identities };
+  }
+
+  previewProtect({ projectId, workId = null, resourceId = null, label, saveTarget = null }) {
+    const project = this.#project(projectId);
+    const cleanLabel = text(label, 'label');
+    const resources = [];
+    const paths = [];
+    let work = null;
+    let selectedResources = [];
+    let slot = null;
+    if (resourceId != null) {
+      if (workId != null || !saveTarget) fail('Resource-only protection requires one Resource and one absent Save target.');
+      work = null;
+      selectedResources = [String(resourceId)];
+      const detail = this.ledger.resources.describe(resourceId);
+      if (!detail || detail.locations.length !== 1) fail('Work Source requires one active Resource location.');
+      const location = detail.locations[0];
+      if (location.status !== 'active' || location.project_id !== projectId || !isPathInside(project.root, location.path)) fail('Work Source Resource is unavailable in this Project.');
+      if (path.extname(location.path).toLowerCase() !== '.txt') fail('Module protection supports one registered .txt Resource.');
+      const relative = path.relative(project.root, location.path).split(path.sep).join('/');
+      if (!relative || relative.startsWith('../') || path.isAbsolute(relative)) fail('Work Source path is outside the Project.');
+      paths.push(relative);
+      resources.push({ resource_id: resourceId, path: relative, location: structuredClone(location) });
+      if (this.db.prepare('SELECT session_id FROM work_session_sources WHERE resource_id=? LIMIT 1').get(resourceId)) fail('Resource-only protection does not include existing Work dependencies.');
+      if (this.db.prepare('SELECT save_id FROM resource_save_links WHERE resource_id=? LIMIT 1').get(resourceId)) fail('Resource-only protection does not include existing Save dependencies.');
+      if (this.db.prepare('SELECT blocks_json FROM project_boards').all().some(({ blocks_json }) => JSON.parse(blocks_json).some((block) => block.resource_id === resourceId))) fail('Resource-only protection does not include existing Board dependencies.');
+      if (detail.relationships?.some((relation) => relation.status === 'active')) fail('Resource-only protection does not include existing Resource relationships.');
+      slot = this.#saveTargetBasis(project.root, saveTarget, ['txt']);
+    } else {
+      work = this.ledger.workSessions.byId(workId);
+      if (!work || work.project_id !== projectId || work.status !== 'open') fail('Protection requires an open Work in this Project.');
+      if (!Array.isArray(work.sources) || !work.sources.length) fail('Work has no complete Source scope to protect.');
+      selectedResources = work.sources.map((source) => source.resource_id);
+      for (const source of work.sources) {
+        const detail = this.ledger.resources.describe(source.resource_id);
+        if (!detail || detail.locations.length !== 1) fail('Work Source requires one active Resource location.');
+        const location = detail.locations[0];
+        if (location.status !== 'active' || location.project_id !== projectId || !isPathInside(project.root, location.path)) fail('Work Source Resource is unavailable in this Project.');
+        const relative = path.relative(project.root, location.path).split(path.sep).join('/');
+        if (!relative || relative.startsWith('../') || path.isAbsolute(relative)) fail('Work Source path is outside the Project.');
+        paths.push(relative);
+        resources.push({ resource_id: source.resource_id, path: relative, location: structuredClone(location) });
+      }
+      if (saveTarget != null) slot = this.#saveTargetBasis(project.root, saveTarget);
+    }
+    const scope = {
+      paths: [...new Set([...paths, ...(slot ? [slot.target] : [])])].sort(),
+      resourceIds: [...new Set(selectedResources)].sort(),
+      workIds: work ? [work.session_id] : [], boardIds: [], saveIds: [], saveTargets: slot ? [slot.target] : [],
+    };
+    const draft = { project_id: projectId, root: project.root, root_identity: project.identity,
+      paths: scope.paths, resource_ids: scope.resourceIds, work_ids: scope.workIds, board_ids: [], save_ids: [], save_targets: [] };
+    const facts = this.#facts(draft);
+    if (resourceId != null && facts.files.find((file) => file.path === resources[0].path)?.sha256 !== resources[0].location.content_hash) {
+      fail('Resource content changed since registration; review it again.');
+    }
+    const factsDigest = digest(facts);
+    const bindingDigest = digest({ projectId, root: project.root, root_identity: project.identity, scope, label: cleanLabel, save_target_basis: slot,
+      work: work ? { session_id: work.session_id, project_id: work.project_id, status: work.status, revision: work.revision, sources: work.sources } : null,
+      resources, files: facts.files, facts });
+    return { scope, label: cleanLabel, work_id: work?.session_id ?? null, work_revision: work?.revision ?? null,
+      resource_id: resourceId, sources: work?.sources ?? [], resources: resources.map(({ resource_id, path: relative }) => ({ resource_id, path: relative })),
+      files: facts.files, save_target: slot ? slot.target : null, save_target_basis: slot,
+      protection_basis: { root: project.root, root_identity: project.identity, facts_digest: factsDigest, binding_digest: bindingDigest, save_target_basis: slot } };
+  }
+
   protect(args) {
     const request = this.#request('protect', args);
     return withStateLock(this.stateDir, () => {
+      assertDocumentUpdatesSettled(this.stateDir, args.projectId);
       const project = this.#project(args.projectId);
       for (const row of this.db.prepare('SELECT state_json FROM recovery_rounds WHERE project_id=?').all(args.projectId)) {
         const other = JSON.parse(row.state_json);
@@ -243,20 +346,34 @@ export class RoundRecovery {
       for (const [key, limit] of [['resourceIds', 64], ['workIds', 20], ['saveIds', 64], ['saveTargets', 64]]) {
         if (!Array.isArray(args[key] ?? []) || (args[key] ?? []).length > limit || (args[key] ?? []).some((value) => typeof value !== 'string' || !value)) fail(`Invalid ${key} scope.`);
       }
+      if (args.resourceId && (!args.protectionBasis || !args.saveTarget || (args.resourceIds ?? []).length !== 1
+          || args.resourceIds[0] !== args.resourceId || (args.workIds ?? []).length || (args.boardIds ?? []).length
+          || (args.saveIds ?? []).length || (args.saveTargets ?? []).some((target) => target !== args.saveTarget))) {
+        fail('Resource-only protection requires a reviewed single Resource, no Work/Board/Save dependencies, and one absent TXT target.');
+      }
       const round = { round_id: id('RND'), project_id: args.projectId, root: project.root, root_identity: project.identity,
         paths: [], board_ids: [...new Set(args.boardIds ?? [])].sort(), label: text(args.label, 'label'),
         resource_ids: [...new Set(args.resourceIds ?? [])].sort(), work_ids: [...new Set(args.workIds ?? [])].sort(), save_ids: [...new Set(args.saveIds ?? [])].sort(),
         save_targets: [],
         revision: 1, head_node_id: null, nodes: [], restores: [], requests: [], pending_restore: null };
-      round.paths = args.paths.map((relative) => this.#path(round, relative).relative).sort();
+      const requestedPaths = [...new Set([...(args.paths ?? []), ...(args.saveTarget ? [args.saveTarget] : [])])];
+      round.paths = requestedPaths.map((relative) => this.#path(round, relative).relative).sort();
       if (new Set(round.paths.map((entry) => entry.toLowerCase())).size !== round.paths.length) fail('Duplicate paths are not supported.');
-      round.save_targets = [...new Set(args.saveTargets ?? [])].map((name) => {
+      round.save_targets = [...new Set([...(args.saveTargets ?? []), ...(args.saveTarget ? [args.saveTarget] : [])])].map((name) => {
         const checked = this.#path(round, name);
         if (!round.paths.includes(checked.relative) || checked.stat) fail('Save output slots must be absent files explicitly declared in paths before Save creation.');
         return checked.relative;
       });
       if (expandSaveScope(round, this.stateDir).created_save_ids.length) fail('Declare output slots before any Save exists for their paths.');
-      const baseline = this.#node(round, 'before', round.label, this.#capture(round));
+      let expectedDigest;
+      if (args.protectionBasis) {
+        const reviewed = this.previewProtect({ projectId: args.projectId, ...(args.resourceId ? { resourceId: args.resourceId } : { workId: round.work_ids[0] }), label: round.label, saveTarget: args.saveTarget ?? null });
+        const scopeMatches = digest({ paths: round.paths, resourceIds: round.resource_ids, workIds: round.work_ids, boardIds: round.board_ids, saveIds: round.save_ids, saveTargets: round.save_targets })
+          === digest(reviewed.scope);
+        if (!scopeMatches || digest(args.protectionBasis) !== digest(reviewed.protection_basis)) fail('Protection preview changed. Review the current Work again.');
+        expectedDigest = args.protectionBasis.facts_digest;
+      }
+      const baseline = this.#node(round, 'before', round.label, this.#capture(round, expectedDigest));
       round.head_node_id = baseline.node_id;
       round.requests.push({ ...request, caller: args.caller, receipt: {} });
       this.#save(round, true);
@@ -274,6 +391,7 @@ export class RoundRecovery {
   checkpoint(args) {
     const request = this.#request('checkpoint', args);
     return withStateLock(this.stateDir, () => {
+      assertDocumentUpdatesSettled(this.stateDir, args.projectId);
       const round = this.#read(args.projectId, args.roundId);
       const retry = this.#retry(round, request); if (retry) return retry;
       this.#ready(round, args);
@@ -291,6 +409,7 @@ export class RoundRecovery {
   extend(args) {
     const request = this.#request('extend', args);
     return withStateLock(this.stateDir, () => {
+      assertDocumentUpdatesSettled(this.stateDir, args.projectId);
       const round = this.#read(args.projectId, args.roundId);
       const retry = this.#retry(round, request); if (retry) return retry;
       this.#ready(round, args);
@@ -352,6 +471,7 @@ export class RoundRecovery {
   #restore(action, args) {
     const request = this.#request(action, args);
     return withStateLock(this.stateDir, () => {
+      assertDocumentUpdatesSettled(this.stateDir, args.projectId);
       const round = this.#read(args.projectId, args.roundId);
       const retry = this.#retry(round, request); if (retry) return retry;
       this.#ready(round, args);
@@ -378,6 +498,7 @@ export class RoundRecovery {
   resume(args) {
     this.#caller(args);
     return withStateLock(this.stateDir, () => {
+      assertDocumentUpdatesSettled(this.stateDir, args.projectId);
       const round = this.#read(args.projectId, args.roundId);
       const operation = round.restores.find((item) => item.restore_id === args.restoreId);
       if (!operation) fail('Recovery operation is unavailable.');

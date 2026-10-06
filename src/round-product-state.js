@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { activeSavedResourcePath, currentSavedResourceLocation } from './save-service.js';
 
 function stop(message) { const error = new Error(message); error.code = 'ATLAS_RECOVERY_CONFLICT'; throw error; }
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -42,13 +43,16 @@ export function captureProductState({ round, ledger, stateDir, resolvePath }) {
   const resources = resourceIds.map((resourceId) => {
     const detail = ledger.resources.describe(resourceId);
     const created = (round.created_resource_ids ?? []).includes(resourceId);
-    if (!detail || !(created ? ['active', 'missing'] : ['active']).includes(detail.resource.status) || detail.locations.length !== 1) stop('Recovery requires an active single-location Resource.');
-    const location = detail.locations[0];
+    const locations = detail?.locations.filter((location) => (created ? ['active', 'missing'] : ['active']).includes(location.status)) ?? [];
+    if (!detail || !(created ? ['active', 'missing'] : ['active']).includes(detail.resource.status) || locations.length !== 1) stop('Recovery requires an active single-location Resource.');
+    const location = locations[0];
     if (!(created ? ['active', 'missing'] : ['active']).includes(location.status) || location.project_id !== round.project_id || !absolutePaths.includes(path.resolve(location.path))) stop('Declare the same-Project Resource file in paths. Moved/missing Resources are unsupported.');
     const relative = round.paths[absolutePaths.indexOf(path.resolve(location.path))];
     if (!created && !resolvePath(relative).stat) stop('Missing Resource files are not supported by this recovery slice.');
     if (db.prepare('SELECT save_id FROM resource_save_links WHERE resource_id=?').all(resourceId).some((link) => !saveIds.includes(link.save_id))) stop('Declare the Save output dependency explicitly.');
-    if (detail.relationships.some((relation) => relation.status === 'active' && (relation.evidence?.save_id && !saveIds.includes(relation.evidence.save_id) || relation.target_kind !== 'project' || relation.target_id !== round.project_id))) stop('Resource has an uncovered Save or cross-Project relationship.');
+    if (detail.relationships.some((relation) => relation.status === 'active' && (relation.evidence?.save_id && !saveIds.includes(relation.evidence.save_id)
+      || !(relation.target_kind === 'project' && relation.target_id === round.project_id
+        || relation.target_kind === 'resource' && relation.type === 'linked_to' && resourceIds.includes(relation.target_id) && relation.evidence?.project_id === round.project_id)))) stop('Resource has an uncovered Save or cross-Project relationship.');
     const consumers = db.prepare('SELECT session_id FROM work_session_sources WHERE resource_id=?').all(resourceId);
     if (consumers.some((item) => !workIds.includes(item.session_id))) stop('Resource is used by an uncovered Work. Include every affected Work explicitly.');
     const boards = db.prepare('SELECT id,project_id,blocks_json FROM project_boards').all();
@@ -72,13 +76,17 @@ export function captureProductState({ round, ledger, stateDir, resolvePath }) {
     if (!Array.isArray(saved.items)) stop('Save journal is invalid.');
     const includesPath = (value) => typeof value === 'string' && absolutePaths.some((item) => item.toLowerCase() === path.resolve(value).toLowerCase());
     for (const item of saved.items) {
-      const sourceItems = [item.source, ...(item.source?.sources ?? [])].filter(Boolean);
-      const inputPaths = (item.inputs ?? item.prepare_request?.inputs ?? []).map((input) => item.prepare_request?.root && input.relative_path ? path.resolve(item.prepare_request.root, input.relative_path) : null);
+      const linkedResource = item.resource_id ?? db.prepare('SELECT resource_id FROM resource_save_links WHERE save_id=?').get(item.save_id)?.resource_id;
+      const currentProjectId = currentSavedResourceLocation(db, linkedResource)?.project_id ?? item.project?.id;
+      const activePath = (resourceId, oldPath) => activeSavedResourcePath(db, currentProjectId, resourceId, oldPath);
+      const targetPath = activePath(item.resource_id, item.target?.path);
+      const sourceItems = [item.source, ...(item.source?.sources ?? [])].filter(Boolean).map((source) => ({ ...source, path: activePath(source.resource_id, source.path) }));
+      const inputPaths = (item.inputs ?? item.prepare_request?.inputs ?? []).map((input) => item.prepare_request?.root && input.relative_path ? activePath(null, path.resolve(item.prepare_request.root, input.relative_path)) : null);
       const reservedTarget = item.prepare_request?.root && item.prepare_request?.target
         ? path.resolve(item.prepare_request.root, item.prepare_request.target) : null;
       if (saveIds.includes(item.save_id)) {
-        if (item.project?.id !== round.project_id || item.status !== 'executed' || !item.resource_id
-            || !resourceIds.includes(item.resource_id) || !includesPath(item.target?.path)) stop('Selected Save requires an executed same-Project result with its Resource and file declared.');
+        if (currentProjectId !== round.project_id || item.status !== 'executed' || !item.resource_id
+            || !resourceIds.includes(item.resource_id) || !includesPath(targetPath)) stop('Selected Save requires an executed same-Project result with its Resource and file declared.');
         if (item.parameters?.work_session_id && !workIds.includes(item.parameters.work_session_id)) stop('Declare the selected Save Work dependency.');
         if (sourceItems.some((source) => source.path && !includesPath(source.path) || source.resource_id && !resourceIds.includes(source.resource_id))
             || inputPaths.some((input) => !includesPath(input))) stop('Declare every selected Save input file and Source Resource.');
@@ -89,7 +97,7 @@ export function captureProductState({ round, ledger, stateDir, resolvePath }) {
         continue;
       }
       if (workIds.includes(item.parameters?.work_session_id) || resourceIds.includes(item.resource_id)
-          || includesPath(item.target?.path) || includesPath(reservedTarget) || sourceItems.some((source) => resourceIds.includes(source.resource_id) || includesPath(source.path)) || inputPaths.some(includesPath)) stop('Protected scope has a Save dependency; its receipt and files have not been changed.');
+          || includesPath(targetPath) || includesPath(reservedTarget) || sourceItems.some((source) => resourceIds.includes(source.resource_id) || includesPath(source.path)) || inputPaths.some(includesPath)) stop('Protected scope has a Save dependency; its receipt and files have not been changed.');
     }
   }
   if (saves.length !== saveIds.length) stop('Selected Save is unavailable.');

@@ -5,6 +5,7 @@ const files = [
   new URL('./styles/layout.css', import.meta.url),
   new URL('./styles/components.css', import.meta.url),
   new URL('./styles/round-timeline.css', import.meta.url),
+  new URL('./styles/workspace.css', import.meta.url),
 ];
 
 export function uiStyles() {

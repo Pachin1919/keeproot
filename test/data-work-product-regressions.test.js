@@ -783,14 +783,22 @@ test('V19-02 relinked Resource reports moved reconciliation and can use-current'
 });
 
 test('V19-02 saved result freshness distinguishes pinned and followed Source policy', (t) => {
-  const root = temporaryDirectory(t); const resultPath = write(path.join(root, 'Results', 'output.csv'), 'name\nresult\n'); const fingerprint = contentFileFingerprint(resultPath);
-  const base = { result_path: resultPath, result_fingerprint: { sha256: fingerprint.sha256 }, output_status: 'verified' };
-  const pinned = savedResultFreshness({ ...base, version_policy: 'pinned_version' }, { sourceFreshness: { status: 'needs_review' } });
+  const root = temporaryDirectory(t);
+  const resultPath = write(path.join(root, 'Results', 'output.csv'), 'name\nresult\n');
+  const sourcePath = write(path.join(root, 'source.csv'), 'name\nold\n');
+  const sourceFingerprint = contentFileFingerprint(sourcePath);
+  const base = { result_path: resultPath, result_fingerprint: contentFileFingerprint(resultPath), output_status: 'verified',
+    sources: [{ path: sourcePath, fingerprint: sourceFingerprint, version_policy: 'follow_latest' }] };
+  fs.writeFileSync(sourcePath, 'name\nnew\n');
+  const pinned = savedResultFreshness({ ...base, version_policy: 'pinned_version' });
   assert.equal(pinned.label, 'Pinned result'); assert.equal(pinned.status, 'pinned'); assert.equal(pinned.version_policy, 'pinned_version');
-  const followed = savedResultFreshness({ ...base, version_policy: 'follow_latest' }, { sourceFreshness: { status: 'needs_review' } });
+  const followed = savedResultFreshness({ ...base, version_policy: 'follow_latest' });
   assert.equal(followed.label, 'Sources need review'); assert.equal(followed.status, 'needs_review'); assert.equal(followed.version_policy, 'follow_latest');
   assert.equal(sourceVersionPolicy([{ version_policy: 'pinned_version' }, { version_policy: 'follow_latest' }]), 'mixed');
-  const mixed = savedResultFreshness(base, { sourceFreshness: { status: 'fresh' }, versionPolicy: 'mixed' });
+  const mixed = savedResultFreshness({ ...base, version_policy: 'mixed', sources: [
+    { path: sourcePath, fingerprint: sourceFingerprint, version_policy: 'pinned_version' },
+    { path: sourcePath, fingerprint: contentFileFingerprint(sourcePath), version_policy: 'follow_latest' },
+  ] });
   assert.equal(mixed.label, 'Mixed source policy'); assert.equal(mixed.status, 'fresh'); assert.equal(mixed.version_policy, 'mixed');
 });
 
@@ -885,7 +893,10 @@ test('V18-04 Step 4 binds Desktop Prepare and Preview to the current revision', 
   });
   assert.equal(stalePreview.status, 303);
   assert.equal(f.registry.ledger.workSessions.byId(session.session_id).preview, null);
-  assert.match(await (await fetch(workUrl)).text(), /Work changed|Refresh/u);
+  const refreshedHtml = await (await fetch(workUrl)).text();
+  const warning = refreshedHtml.match(/class="callout warn"[^>]*>([^<]{1,500})</u)?.[1];
+  assert.ok(warning, 'The stale Work revision should display a bounded warning callout.');
+  assert.match(warning, /The Work revision changed; reload this Work before continuing\./u);
 });
 
 test('V18-04 Step 4 Host execution commands require a current base revision', (t) => {
@@ -1152,7 +1163,7 @@ test('multi-source Work saves one verified result and preserves Recipe, lineage,
   const review = await fetch(`${workUrl}/save/review`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, project_id: created.project_id, folder: 'Results', file_name: 'combined.csv', format: 'csv' }), redirect: 'manual' });
   assert.equal(review.status, 303); assert.match(review.headers.get('location'), /\/save\/review\?/u);
   const reviewUrl = new URL(review.headers.get('location'), server.workspace_url); const reviewPage = await fetch(reviewUrl); assert.equal(reviewPage.status, 200); assert.match(await reviewPage.text(), /2 rows · 3 columns/u);
-  const reviewedCandidate = { stage_id: reviewUrl.searchParams.get('stage_id'), revision: reviewUrl.searchParams.get('revision'), candidate_sha256: reviewUrl.searchParams.get('candidate_sha256') };
+  const reviewedCandidate = { stage_id: reviewUrl.searchParams.get('stage_id'), revision: reviewUrl.searchParams.get('revision'), candidate_sha256: reviewUrl.searchParams.get('candidate_sha256'), preview_revision: reviewUrl.searchParams.get('preview_revision'), target: reviewUrl.searchParams.get('target') };
   const confirmParams = (fileName, format, candidate) => new URLSearchParams({ csrf, project_id: created.project_id, folder: 'Results', file_name: fileName, format, ...candidate });
 
   const existingTarget = path.join(projectRoot, 'Results', 'combined.csv'); fs.writeFileSync(existingTarget, 'external result\n');
@@ -1162,20 +1173,20 @@ test('multi-source Work saves one verified result and preserves Recipe, lineage,
 
   const renamedReview = await fetch(`${workUrl}/save/review`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, project_id: created.project_id, folder: 'Results', file_name: 'combined-final.csv', format: 'csv' }), redirect: 'manual' });
   assert.equal(renamedReview.status, 303); assert.equal(exportCount, 1);
-  const renamedUrl = new URL(renamedReview.headers.get('location'), server.workspace_url); const renamedCandidate = { stage_id: renamedUrl.searchParams.get('stage_id'), revision: renamedUrl.searchParams.get('revision'), candidate_sha256: renamedUrl.searchParams.get('candidate_sha256') };
+  const renamedUrl = new URL(renamedReview.headers.get('location'), server.workspace_url); const renamedCandidate = { stage_id: renamedUrl.searchParams.get('stage_id'), revision: renamedUrl.searchParams.get('revision'), candidate_sha256: renamedUrl.searchParams.get('candidate_sha256'), preview_revision: renamedUrl.searchParams.get('preview_revision'), target: renamedUrl.searchParams.get('target') };
   const xlsxReview = await fetch(`${workUrl}/save/review`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, project_id: created.project_id, folder: 'Results', file_name: 'other.xlsx', format: 'xlsx' }), redirect: 'manual' });
   assert.equal(xlsxReview.status, 303); assert.equal(exportCount, 2);
   const staleCandidate = await fetch(`${workUrl}/save/confirm`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: confirmParams('combined-final.csv', 'csv', renamedCandidate), redirect: 'manual' });
   assert.equal(staleCandidate.status, 303); assert.match(staleCandidate.headers.get('location'), /\/save$/u); assert.equal(readSavedWorkState(stateDir).items.some((item) => item.status === 'executed'), false);
   const finalReview = await fetch(`${workUrl}/save/review`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, project_id: created.project_id, folder: 'Results', file_name: 'combined-final.csv', format: 'csv' }), redirect: 'manual' });
   assert.equal(finalReview.status, 303); assert.equal(exportCount, 3);
-  const finalUrl = new URL(finalReview.headers.get('location'), server.workspace_url); const finalCandidate = { stage_id: finalUrl.searchParams.get('stage_id'), revision: finalUrl.searchParams.get('revision'), candidate_sha256: finalUrl.searchParams.get('candidate_sha256') };
+  const finalUrl = new URL(finalReview.headers.get('location'), server.workspace_url); const finalCandidate = { stage_id: finalUrl.searchParams.get('stage_id'), revision: finalUrl.searchParams.get('revision'), candidate_sha256: finalUrl.searchParams.get('candidate_sha256'), preview_revision: finalUrl.searchParams.get('preview_revision'), target: finalUrl.searchParams.get('target') };
   const staleRevision = await fetch(`${workUrl}/save/confirm`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: confirmParams('combined-final.csv', 'csv', { ...finalCandidate, revision: String(Number(finalCandidate.revision) + 1) }), redirect: 'manual' });
   assert.equal(staleRevision.status, 303); assert.match(staleRevision.headers.get('location'), /\/save$/u); assert.equal(readSavedWorkState(stateDir).items.some((item) => item.status === 'executed'), false);
   const confirmed = await fetch(`${workUrl}/save/confirm`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: confirmParams('combined-final.csv', 'csv', finalCandidate), redirect: 'manual' });
   assert.equal(confirmed.status, 303); assert.match(confirmed.headers.get('location'), /\/saved\?work_id=SAV-/u);
   const saves = readSavedWorkState(stateDir).items.filter((item) => item.save_id); const executed = saves.find((item) => item.status === 'executed');
-  assert.equal(saves.filter((item) => item.status === 'failed').length, 1); assert.ok(executed); assert.equal(executed.source.sources.length, 2); assert.deepEqual(executed.source.recipe, session.recipe);
+  assert.equal(saves.filter((item) => item.status === 'failed').length, 0); assert.equal(saves.length, 1); assert.ok(executed); assert.equal(executed.source.sources.length, 2); assert.deepEqual(executed.source.recipe, session.recipe);
   assert.deepEqual(executed.inputs.map((item) => item.relative_path), ['Project One/Data/first.csv', 'Project One/Data/second.csv']);
   const derivedSave = intake.show(executed.save_id); assert.equal(derivedSave.inputs.length, 2); assert.equal(derivedSave.lineage.length, 2);
   for (const sourcePath of [firstPath, secondPath]) {
@@ -1385,7 +1396,7 @@ test('Project Resources renders a local Project tree instead of category cards',
   assert.match(html, />Facebook</u);
   assert.match(html, /july-cleaned\.csv/u);
   assert.match(html, /Known relationships/u);
-  assert.match(html, /aria-current="page"><a href="\/projects\/project-1\/resources" title="Resources"/u);
+  assert.match(html, /<a href="\/projects\/project-1\/resources" title="Materials" data-resources-nav aria-current="page">/u);
   assert.doesNotMatch(html, />Files<\/span>/u);
   assert.match(html, /Not yet worked in Atlas/u);
   assert.match(html, /data-project-folder data-folder-path="Data" data-folder-open="true"/u);
@@ -2302,8 +2313,9 @@ test('Import Selection Set saves through Intake and opens the exact Resource', a
     projectId: 'project-1', relativePath: 'Data/report.txt', resourceId: 'RES-test-1',
   });
   const terminalQueuePage = await fetch(new URL(importHref, server.workspace_url));
-  assert.equal(terminalQueuePage.status, 200);
-  assert.match(await terminalQueuePage.text(), /report\.txt/u);
+  const terminalQueueHtml = await terminalQueuePage.text();
+  assert.equal(terminalQueuePage.status, 200, terminalQueueHtml.slice(-2000));
+  assert.match(terminalQueueHtml, /report\.txt/u);
   assert.equal(fs.readFileSync(path.join(projectRoot, 'Data', 'report.txt'), 'utf8'), 'local report');
   const importedWork = readRecentWorkState(stateDir).items.find((item) => item.file_path === path.join(projectRoot, 'Data', 'report.txt'));
   assert.match(importedWork.project_transfer.run_id, /^SAV-/u);
@@ -2657,7 +2669,7 @@ test('Settings exposes distinct workspace themes and migrates the legacy blue ac
   assert.match(preferenceHtmlAttributes(migrated), /data-reduce-motion="false"/u);
 
   const html = renderSettingsView({ preferences: migrated, runtime: {} }, { csrfToken: 'csrf', returnHref: '/activity' });
-  for (const theme of ['Archive Signal', 'Post-Internet Plum', 'Gallery Grid']) assert.match(html, new RegExp(theme, 'u'));
+  for (const theme of ['Workspace', 'Post-Internet Plum', 'Gallery Grid']) assert.match(html, new RegExp(theme, 'u'));
   assert.match(html, /<dialog[^>]+data-overlay-autostart[^>]+data-overlay-dirty-protect/u);
   assert.match(html, /data-overlay-return-href="\/activity"/u);
   assert.match(html, /data-overlay-initial-focus/u);
@@ -3209,10 +3221,11 @@ test('Project Relink verifies a moved folder through the existing Registry recov
 function serverServices(registry) {
   const ids = new Map();
   const resourceControl = {
-    ledger: { db: { prepare: () => ({ get: () => ({ id: 'test-project' }) }) } },
+    ledger: { resources: { activeLocationsForResourceInProject: () => [] }, db: { prepare: () => ({ get: () => ({ id: 'test-project' }) }) } },
     identify({ filePath }) { const key = path.resolve(filePath); if (!ids.has(key)) ids.set(key, `RES-test-${ids.size + 1}`); return { resource_id: ids.get(key), locations: [], relationships: [] }; },
     recordSave({ saveId, target }) { const identified = this.identify({ filePath: target.path }); return { resource_id: identified.resource_id, relationships: [] }; },
     projectResources: () => [],
+    listLinkedResourceSuggestions: () => [],
     dispose() {},
   };
   return {
@@ -3255,7 +3268,7 @@ test('Projects route remains available when one registered folder is missing', a
 test('Resource visibility route refreshes only scoped facts for resource_id focus', async (t) => {
   const root = temporaryDirectory(t); const stateDir = path.join(root, 'state'); const projectRoot = path.join(root, 'project'); write(path.join(projectRoot, 'Data', 'disk.md'), 'disk');
   const project = { id: 'project-a', name: 'Project A', status: 'active' }; const calls = [];
-  const resourceControl = { ledger: { db: { prepare: () => ({ get: () => ({ id: 'project-a' }) }) } }, identify: () => ({ resource_id: 'RES-test' }), recordSave: () => ({ resource_id: 'RES-test', relationships: [] }), dispose() {}, projectResources(projectId, options) { calls.push({ projectId, options }); return [{ resource_id: 'RES-a', resource: { display_name: 'A reference', status: 'active' }, locations: [], relationships: [], relationship_to_project: 'used_by', relationship_label: 'Used by', path: 'C:/external/a.md' }]; } };
+  const resourceControl = { listLinkedResourceSuggestions: () => [], ledger: { resources: { activeLocationsForResourceInProject: () => [] }, db: { prepare: () => ({ get: () => ({ id: 'project-a' }) }) } }, identify: () => ({ resource_id: 'RES-test' }), recordSave: () => ({ resource_id: 'RES-test', relationships: [] }), dispose() {}, projectResources(projectId, options) { calls.push({ projectId, options }); return [{ resource_id: 'RES-a', resource: { display_name: 'A reference', status: 'active' }, locations: [], relationships: [], relationship_to_project: 'used_by', relationship_label: 'Used by', path: 'C:/external/a.md' }]; } };
   const registry = { list: () => [project], show: () => ({ ...project, location: { root_path: projectRoot, relative_path: '' } }), resolvePath: () => ({ project: null }) };
   const server = await startAtlasUiServer({ stateDir, ...serverServices(registry), resourceControl }); t.after(async () => { await server.close(); });
   const focused = await (await fetch(`${server.workspace_url}projects/project-a/resources?resource_id=RES-a`)).text(); assert.match(focused, /RES-a/u); assert.deepEqual(calls[0], { projectId: 'project-a', options: { refresh: true } });
@@ -3270,7 +3283,19 @@ test('Resource recovery actions route executes only scoped, CSRF-verified core a
   const page = await (await fetch(`${server.workspace_url}projects/${a.project_id}/resources?resource_id=${missing.resource_id}`)).text(); const csrf = page.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1]; assert.ok(csrf);
   const post = (action, values, csrfValue = csrf) => fetch(`${server.workspace_url}projects/${a.project_id}/resources/actions/${action}`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf: csrfValue, ...values }), redirect: 'manual' });
   const kept = await post('keep', { resource_id: missing.resource_id }); assert.equal(kept.status, 303, await kept.text()); assert.match(kept.headers.get('location') ?? '', new RegExp(`resource_id=${missing.resource_id}`, 'u')); assert.equal(resourceControl.describe(missing.resource_id).resource.status, 'missing'); assert.equal(resourceControl.describe(missing.resource_id).actions.at(-1).action_type, 'keep_record');
-  const registered = await fetch(server.desktop_picker.registration_url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-atlas-desktop-token': server.desktop_picker.token }, body: new URLSearchParams({ file_path: replacement, kind: 'file', mode: 'single' }) }); const selection = await registered.json(); const relinked = await post('relink', { resource_id: missing.resource_id, selection_id: selection.selection_id }); assert.equal(relinked.status, 303, await relinked.text()); assert.equal(resourceControl.describe(missing.resource_id).locations.find((item) => item.status === 'active').path, path.resolve(replacement)); assert.equal(fs.readFileSync(replacement, 'utf8'), 'replacement');
+  const registered = await fetch(server.desktop_picker.registration_url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-atlas-desktop-token': server.desktop_picker.token }, body: new URLSearchParams({ file_path: replacement, kind: 'file', mode: 'single' }) }); const selection = await registered.json(); const outsideRejected = await post('relink', { resource_id: missing.resource_id, selection_id: selection.selection_id });
+  assert.equal(outsideRejected.status, 400); assert.match(await outsideRejected.text(), /outside this Project/u);
+  assert.equal(resourceControl.describe(missing.resource_id).locations.some(item => item.status === 'active'), false);
+  const insideReplacement = write(path.join(aRoot, 'Data', 'replacement.md'), 'old');
+  const insideRegistration = await fetch(server.desktop_picker.registration_url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-atlas-desktop-token': server.desktop_picker.token }, body: new URLSearchParams({ file_path: insideReplacement, kind: 'file', mode: 'single' }) });
+  const insideSelection = await insideRegistration.json();
+  const preview = await post('relink', { resource_id: missing.resource_id, selection_id: insideSelection.selection_id });
+  assert.equal(preview.status, 200); const previewHtml = await preview.text();
+  const previewDigest = previewHtml.match(/name="preview_digest" value="([a-f0-9]{64})"/u)?.[1]; assert.ok(previewDigest);
+  const requestKey = previewHtml.match(/name="request_key" value="([^"]+)"/u)?.[1]; assert.ok(requestKey);
+  assert.equal(resourceControl.describe(missing.resource_id).locations.some(item => item.status === 'active'), false);
+  const relinked = await post('relink-confirm', { resource_id: missing.resource_id, selection_id: insideSelection.selection_id, preview_digest: previewDigest, request_key: requestKey });
+  assert.equal(relinked.status, 303, await relinked.text()); assert.equal(resourceControl.describe(missing.resource_id).locations.find((item) => item.status === 'active').path, path.resolve(insideReplacement)); assert.equal(fs.readFileSync(insideReplacement, 'utf8'), 'old'); assert.equal(fs.readFileSync(replacement, 'utf8'), 'replacement');
   const forgot = await post('forget', { resource_id: first.resource_id, relationship_id: forgotten.id }); assert.equal(forgot.status, 303); const removedResponse = await post('remove-reference', { resource_id: second.resource_id, relationship_id: removed.id }); assert.equal(removedResponse.status, 303); assert.equal(resourceControl.ledger.resources.relationshipById(forgotten.id).status, 'forgotten'); assert.equal(resourceControl.ledger.resources.relationshipById(removed.id).status, 'removed'); assert.equal(fs.readFileSync(reference, 'utf8'), 'reference'); assert.equal(fs.readFileSync(removedReference, 'utf8'), 'removed');
   const storedRejected = await post('remove-reference', { resource_id: stored.resource_id, relationship_id: storedRelation.id }); assert.equal(storedRejected.status, 400); assert.equal(resourceControl.ledger.resources.relationshipById(storedRelation.id).status, 'active'); const foreignRejected = await post('forget', { resource_id: foreign.resource_id, relationship_id: foreignRelation.id }); assert.equal(foreignRejected.status, 400); assert.equal(resourceControl.ledger.resources.relationshipById(foreignRelation.id).status, 'active'); const actionCount = resourceControl.describe(missing.resource_id).actions.length; const badCsrf = await post('keep', { resource_id: missing.resource_id }, 'bad'); assert.equal(badCsrf.status, 403); const expired = await post('relink', { resource_id: missing.resource_id, selection_id: 'SEL-00000000000000000000000000000000' }); assert.equal(expired.status, 400); assert.equal(resourceControl.describe(missing.resource_id).actions.length, actionCount);
 });

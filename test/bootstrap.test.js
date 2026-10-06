@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { Bootstrap } from '../src/bootstrap.js';
+import { Registry } from '../src/registry.js';
 import { sha256File } from '../src/snapshots.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -246,6 +248,88 @@ test('Initialize requires reviews and writes outputs outside the Vault', (t) => 
   const environment = JSON.parse(fs.readFileSync(path.join(initialized.output_dir, 'environment.json'), 'utf8'));
   assert.ok(environment.projects.length > 0);
   assert.equal(initialized.registered_projects, environment.projects.length);
+});
+
+test('initialized Bootstrap Projects connect to their reviewed local folders without changing Vault files', (t) => {
+  const { vault, stateDir } = setup('bootstrap-project-connect');
+  const bootstrap = openBootstrap(t, stateDir);
+  const before = vaultFingerprint(vault);
+  const scan = bootstrap.scan({ root: vault, scanMode: 'structure' });
+  for (const prediction of bootstrap.show(scan.scan_id).predictions) {
+    bootstrap.review(prediction.id, {
+      decision: prediction.kind === 'project_candidate' ? 'accepted' : 'rejected',
+      reason: 'fixture_user reviewed the Project directory',
+    });
+  }
+  const initialized = bootstrap.initialize(scan.scan_id);
+  assert.ok(initialized.registered_projects > 0);
+  const first = bootstrap.connect(scan.scan_id, {
+    rootType: 'managed_library', contentPolicy: 'bounded_content', reason: 'fixture_user connected this Library',
+  });
+  const repeated = bootstrap.connect(scan.scan_id, {
+    rootType: 'managed_library', contentPolicy: 'bounded_content', reason: 'fixture_user connected this Library',
+  });
+  assert.deepEqual(repeated, first);
+  const registry = new Registry({ stateDir });
+  t.after(() => registry.dispose());
+  for (const item of first.projects) {
+    const shown = registry.show(item.project_id);
+    assert.equal(shown.location.root_path, vault);
+    assert.equal(shown.location.relative_path, item.relative_path);
+    assert.equal(shown.location.root_id, first.root_id);
+  }
+  assert.equal(vaultFingerprint(vault), before);
+});
+
+test('Bootstrap connect rejects a linked reviewed Project directory before adopting a Root', (t) => {
+  const { caseRoot, vault, stateDir } = setup('bootstrap-project-link-refused');
+  const bootstrap = openBootstrap(t, stateDir);
+  const scan = bootstrap.scan({ root: vault, scanMode: 'structure' });
+  const candidate = bootstrap.show(scan.scan_id).predictions.find((item) => item.kind === 'project_candidate');
+  assert.ok(candidate);
+  for (const prediction of bootstrap.show(scan.scan_id).predictions) {
+    bootstrap.review(prediction.id, {
+      decision: prediction.id === candidate.id ? 'accepted' : 'rejected',
+      reason: 'fixture_user reviewed the Project directory',
+    });
+  }
+  bootstrap.initialize(scan.scan_id);
+  const original = path.join(vault, ...candidate.evidence.directory.split('/'));
+  const outside = path.join(caseRoot, 'outside-project');
+  fs.renameSync(original, outside);
+  fs.symlinkSync(outside, original, process.platform === 'win32' ? 'junction' : 'dir');
+  assert.throws(() => bootstrap.connect(scan.scan_id, {
+    rootType: 'managed_library', contentPolicy: 'bounded_content', reason: 'fixture_user connect',
+  }), /symbolic link|junction/iu);
+  const registry = new Registry({ stateDir });
+  t.after(() => registry.dispose());
+  assert.equal(registry.listRoots().length, 0);
+});
+
+test('Host bootstrap connect command makes an initialized Project location readable by Registry', (t) => {
+  const { vault, stateDir } = setup('bootstrap-project-connect-cli');
+  const bootstrap = openBootstrap(t, stateDir);
+  const scan = bootstrap.scan({ root: vault, scanMode: 'structure' });
+  for (const prediction of bootstrap.show(scan.scan_id).predictions) {
+    bootstrap.review(prediction.id, {
+      decision: prediction.kind === 'project_candidate' ? 'accepted' : 'rejected',
+      reason: 'fixture_user reviewed the Project directory',
+    });
+  }
+  bootstrap.initialize(scan.scan_id);
+  const command = spawnSync(process.execPath, [path.join(projectRoot, 'bin', 'atlas.js'),
+    'bootstrap', 'connect', scan.scan_id,
+    '--type', 'managed_library', '--content-policy', 'bounded_content', '--reason', 'fixture_user connected this Library', '--json',
+  ], { cwd: projectRoot, env: { ...process.env, ATLAS_STATE_DIR: stateDir }, encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+  assert.equal(command.status, 0, command.stderr || command.stdout);
+  const receipt = JSON.parse(command.stdout);
+  assert.equal(receipt.ok, true);
+  assert.equal(receipt.data.scan_id, scan.scan_id);
+  const registry = new Registry({ stateDir });
+  t.after(() => registry.dispose());
+  for (const item of receipt.data.projects) {
+    assert.equal(registry.show(item.project_id).location.root_path, vault);
+  }
 });
 
 test('Bootstrap stores Observations, Predictions, and Labels separately', (t) => {

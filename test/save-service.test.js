@@ -8,6 +8,7 @@ import test from 'node:test';
 import { createSaveService } from '../src/save-service.js';
 import { Registry } from '../src/registry.js';
 import { createResourceControl } from '../src/resource-control.js';
+import { Bootstrap } from '../src/bootstrap.js';
 
 const testTempRoot = path.resolve('test', '.tmp');
 
@@ -42,6 +43,195 @@ test('Save Service commits one shared result shape and preserves request replay'
   assert.equal(executed.resources_href, '/projects/PRJ-1/resources?path=Data%2Fresult.md');
   assert.equal(JSON.parse(fs.readFileSync(path.join(stateDir, 'ui', 'saved-work.json'), 'utf8')).items.length, 1);
   assert.throws(() => save.prepare({ ...options, target: 'Projects/One/other.md' }), { code: 'ATLAS_STATE_CONFLICT' });
+});
+
+test('V20 Save plan binds prepare and execute to current plan and preview revisions', (t) => {
+  const caseRoot = temporary(t, 'save-v20-revisions-');
+  const vault = path.join(caseRoot, 'vault'); const stateDir = path.join(caseRoot, 'state');
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas'), { recursive: true });
+  const candidate = path.join(caseRoot, 'candidate.md'); fs.writeFileSync(candidate, '# Candidate\n');
+  const registry = new Registry({ stateDir }); const project = registry.create({ name: 'Atlas', currentPath: 'Projects/Atlas' }); registry.dispose();
+  const save = createSaveService({ stateDir });
+  try {
+  const request = {
+    root: vault, candidateFile: candidate, projectId: project.project_id,
+    target: 'Projects/Atlas/result.md', origin: 'human_written', kind: 'note', channel: 'host',
+    caller: { tool: 'test', client_run_id: 'v20-revisions' }, requestKey: 'v20-revisions',
+  };
+  const before = fs.existsSync(path.join(stateDir, 'ui', 'saved-work.json'))
+    ? fs.readFileSync(path.join(stateDir, 'ui', 'saved-work.json'), 'utf8') : null;
+  const plan = save.plan(request);
+  assert.equal(plan.status, 'ready');
+  assert.match(plan.plan_revision, /^[a-f0-9]{64}$/u);
+  assert.equal(fs.existsSync(path.join(vault, 'Projects', 'Atlas', 'result.md')), false);
+  assert.equal(fs.existsSync(path.join(stateDir, 'ui', 'saved-work.json')) ? fs.readFileSync(path.join(stateDir, 'ui', 'saved-work.json'), 'utf8') : null, before);
+  fs.writeFileSync(candidate, '# Changed candidate\n');
+  assert.throws(() => save.prepare({ ...request, expectedPlanRevision: plan.plan_revision }), { code: 'ATLAS_STATE_CONFLICT' });
+  fs.writeFileSync(candidate, '# Candidate\n');
+  const prepared = save.prepare({ ...request, expectedPlanRevision: plan.plan_revision });
+  const reviewed = save.review(prepared.save_id);
+  assert.match(reviewed.preview_revision, /^[a-f0-9]{64}$/u);
+  assert.throws(() => save.execute(prepared.save_id, { reason: 'Reviewed.' }), { code: 'ATLAS_STATE_CONFLICT' });
+  assert.equal(fs.existsSync(path.join(vault, 'Projects', 'Atlas', 'result.md')), false);
+  assert.throws(() => save.execute(prepared.save_id, { reason: 'Reviewed.', expectedPreviewRevision: '0'.repeat(64) }), { code: 'ATLAS_STATE_CONFLICT' });
+  assert.equal(fs.existsSync(path.join(vault, 'Projects', 'Atlas', 'result.md')), false);
+  const executed = save.execute(prepared.save_id, { reason: 'Reviewed.', expectedPreviewRevision: reviewed.preview_revision });
+  assert.equal(executed.status, 'executed');
+  assert.equal(fs.readFileSync(path.join(vault, 'Projects', 'Atlas', 'result.md'), 'utf8'), '# Candidate\n');
+  const replayed = save.prepare({ ...request, expectedPlanRevision: plan.plan_revision });
+  assert.equal(replayed.save_id, executed.save_id);
+  assert.equal(replayed.status, 'executed');
+  assert.throws(() => save.prepare({ ...request, expectedPlanRevision: `${plan.plan_revision.slice(0, -1)}${plan.plan_revision.endsWith('0') ? '1' : '0'}` }), /already used for a different save request/u);
+  assert.throws(() => save.prepare({ ...request, target: 'Projects/Atlas/other.md', expectedPlanRevision: plan.plan_revision }), /already used for a different save request/u);
+  fs.writeFileSync(candidate, '# Changed candidate\n');
+  assert.throws(() => save.prepare({ ...request, expectedPlanRevision: plan.plan_revision }), /already used for a different save request/u);
+  fs.writeFileSync(candidate, '# Candidate\n');
+  assert.throws(() => save.prepare({ ...request, requestKey: 'v20-revisions-new-key', expectedPlanRevision: plan.plan_revision }), { code: 'ATLAS_STATE_CONFLICT' });
+  } finally { save.dispose(); }
+});
+
+test('V20 Save Prepare rejects a plan revision when a naming rule changes before the Derived prepare lock', (t) => {
+  const caseRoot = temporary(t, 'save-v20-plan-prepare-race-');
+  const vault = path.join(caseRoot, 'vault'); const stateDir = path.join(caseRoot, 'state');
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Outputs'), { recursive: true });
+  const candidate = path.join(caseRoot, 'candidate.md'); fs.writeFileSync(candidate, '# Candidate\n');
+  const registry = new Registry({ stateDir }); const project = registry.create({ name: 'Atlas', currentPath: 'Projects/Atlas' }); registry.dispose();
+  const save = createSaveService({ stateDir });
+  try {
+    const request = {
+      root: vault, candidateFile: candidate, projectId: project.project_id,
+      target: 'Projects/Atlas/Outputs/planned-name.md', origin: 'human_written', kind: 'note', channel: 'host',
+      caller: { tool: 'test', client_run_id: 'v20-plan-prepare-race' }, requestKey: 'v20-plan-prepare-race',
+    };
+    const plan = save.plan(request);
+    assert.equal(plan.status, 'ready');
+    const originalPrepare = save.intake.prepare.bind(save.intake);
+    let activated = false;
+    save.intake.prepare = (options) => {
+      if (!activated) {
+        activated = true;
+        const proposal = save.intake.rules.propose({
+          root: vault,
+          proposal: {
+            kind: 'naming', scope: { type: 'project', project_id: project.project_id }, condition: {},
+            value: { language: 'preserve_existing', date_policy: 'semantic_only', date_format: 'YYYY-MM', rename_on_content_edit: false },
+            summary: 'Keep existing Project naming conventions.', basis: 'observed', confidence: 0.9,
+            evidence: [{ path: 'Projects/Atlas/Outputs', fact: 'Existing Project output directory observed.' }],
+          },
+        });
+        save.intake.rules.approve(proposal.rule_change_id, { reason: 'Use the reviewed naming guidance.' });
+      }
+      return originalPrepare(options);
+    };
+    assert.throws(
+      () => save.prepare({ ...request, expectedPlanRevision: plan.plan_revision }),
+      { code: 'ATLAS_STATE_CONFLICT' },
+    );
+    assert.equal(activated, true);
+    assert.equal(fs.existsSync(path.join(vault, request.target)), false);
+    const row = JSON.parse(fs.readFileSync(path.join(stateDir, 'ui', 'saved-work.json'), 'utf8')).items[0];
+    assert.equal(row.status, 'failed');
+    assert.equal(save.intake.derived.ledger.db.prepare('SELECT COUNT(*) AS count FROM runs WHERE id = ?').get(row.save_id).count, 0);
+  } finally { save.dispose(); }
+});
+
+test('V20 Save recovers an implicit-target reserving request against its original plan revision', async (t) => {
+  const caseRoot = temporary(t, 'save-v20-implicit-recovery-');
+  const vault = path.join(caseRoot, 'vault'); const stateDir = path.join(caseRoot, 'state');
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Working'), { recursive: true });
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Sources'), { recursive: true });
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Outputs'), { recursive: true });
+  const bootstrap = new Bootstrap({ stateDir });
+  const scan = bootstrap.scan({ root: vault, scanMode: 'structure' });
+  const contract = bootstrap.contract(scan.scan_id, { profileId: 'project-work' });
+  bootstrap.adoptContract(scan.scan_id, { contractId: contract.contract_id, profileId: 'project-work', reason: 'Prepare the isolated route fixture.' });
+  bootstrap.dispose();
+  const registry = new Registry({ stateDir }); const project = registry.create({ name: 'Atlas', currentPath: 'Projects/Atlas' }); registry.dispose();
+  const candidate = path.join(caseRoot, 'candidate.md'); fs.writeFileSync(candidate, '# Candidate\n');
+  const servicePath = new URL('../src/save-service.js', import.meta.url).href;
+  const options = {
+    root: vault, candidateFile: candidate, projectId: project.project_id,
+    origin: 'human_written', kind: 'note', channel: 'host',
+    caller: { tool: 'test', client_run_id: 'v20-implicit-recovery' }, requestKey: 'v20-implicit-recovery',
+  };
+  const writerScript = `import { createSaveService } from ${JSON.stringify(servicePath)};
+const save=createSaveService({stateDir:process.argv[1]});
+const options={root:process.argv[2],candidateFile:process.argv[3],projectId:process.argv[4],origin:'human_written',kind:'note',channel:'host',caller:{tool:'test',client_run_id:'v20-implicit-recovery'},requestKey:'v20-implicit-recovery'};
+const plan=save.plan(options); if(plan.status!=='ready'||!plan.target) process.exit(25);
+save.intake.prepare=()=>process.exit(23);
+save.prepare({...options,expectedPlanRevision:plan.plan_revision});`;
+  await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '--eval', writerScript, stateDir, vault, candidate, project.project_id], { windowsHide: true });
+    child.once('error', reject); child.once('exit', (code) => code === 23 ? resolve() : reject(new Error(`reservation writer exited ${code}`)));
+  });
+  const journalPath = path.join(stateDir, 'ui', 'saved-work.json');
+  const reserved = JSON.parse(fs.readFileSync(journalPath, 'utf8')).items[0];
+  assert.equal(reserved.status, 'reserving');
+  assert.equal(Object.hasOwn(options, 'target'), false);
+  assert.equal(reserved.prepare_request.target, reserved.target.relative_path);
+  assert.ok(reserved.prepare_request.expected_plan_revision);
+  const save = createSaveService({ stateDir });
+  try {
+    const recovered = save.prepare({ ...options, expectedPlanRevision: reserved.prepare_request.expected_plan_revision });
+    assert.equal(recovered.save_id, reserved.save_id);
+    assert.equal(recovered.status, 'prepared');
+    assert.equal(recovered.target.relative_path, reserved.target.relative_path);
+    assert.equal(fs.existsSync(path.join(vault, ...reserved.target.relative_path.split('/'))), false);
+  } finally { save.dispose(); }
+});
+
+test('V20 Save rechecks changed placement rules inside the Derived publication lock', (t) => {
+  const caseRoot = temporary(t, 'save-v20-locked-rule-check-');
+  const vault = path.join(caseRoot, 'vault'); const stateDir = path.join(caseRoot, 'state');
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Outputs'), { recursive: true });
+  fs.mkdirSync(path.join(vault, 'Projects', 'Atlas', 'Working'), { recursive: true });
+  const candidate = path.join(caseRoot, 'candidate.md'); fs.writeFileSync(candidate, '# Candidate\n');
+  const registry = new Registry({ stateDir }); const project = registry.create({ name: 'Atlas', currentPath: 'Projects/Atlas' }); registry.dispose();
+  const save = createSaveService({ stateDir });
+  try {
+  const request = {
+    root: vault, candidateFile: candidate, projectId: project.project_id, target: 'Projects/Atlas/Outputs/result.md',
+    origin: 'human_written', kind: 'note', channel: 'host', caller: { tool: 'test', client_run_id: 'v20-rule-lock' }, requestKey: 'v20-rule-lock',
+  };
+  const plan = save.plan(request);
+  const prepared = save.prepare({ ...request, expectedPlanRevision: plan.plan_revision });
+  const reviewed = save.review(prepared.save_id);
+  const derived = save.intake.derived;
+  const originalExecute = derived.execute.bind(derived);
+  let activated = false;
+  derived.execute = (runId, options) => {
+    if (!activated) {
+      activated = true;
+      const proposal = save.intake.rules.propose({
+        root: vault,
+        proposal: {
+          kind: 'placement', scope: { type: 'project', project_id: project.project_id }, condition: {},
+          value: { role: 'note', target_subdirectory: 'Working' }, summary: 'Route notes to Working.',
+          basis: 'observed', confidence: 0.9,
+          evidence: [{ path: 'Projects/Atlas/Outputs', fact: 'Output directory observed.' }],
+        },
+      });
+      save.intake.rules.approve(proposal.rule_change_id, { reason: 'Apply the new placement rule.' });
+    }
+    return originalExecute(runId, options);
+  };
+  assert.throws(
+    () => save.execute(prepared.save_id, { reason: 'Reviewed.', expectedPreviewRevision: reviewed.preview_revision }),
+    (error) => {
+      assert.equal(error.code, 'ATLAS_STATE_CONFLICT');
+      assert.equal(error.message, 'The effective rule context changed after Intake prepare; recompute placement.');
+      return true;
+    },
+  );
+  assert.equal(activated, true);
+  assert.equal(fs.existsSync(path.join(vault, 'Projects', 'Atlas', 'Outputs', 'result.md')), false);
+  assert.equal(save.show(prepared.save_id).status, 'prepared');
+  const conflicted = save.plan({ ...request, target: 'Projects/Atlas/Outputs/second-result.md' });
+  assert.equal(conflicted.status, 'blocked');
+  assert.equal(conflicted.proposed_target, 'Projects/Atlas/Outputs/second-result.md');
+  assert.equal(conflicted.rule_target, 'Projects/Atlas/Working/second-result.md');
+  assert.equal(conflicted.plan_revision, undefined);
+  } finally { save.dispose(); }
 });
 
 test('Save Service rejects unverified or mismatched Project paths', (t) => {
@@ -322,5 +512,26 @@ test('Save Service reconciles crash-state Resource projections without duplicate
 });
 
 test('Save Service refuses Redo after the missing Resource was relinked', (t) => {
-  const root=temporary(t,'save-redo-relink-');const vault=path.join(root,'vault');const stateDir=path.join(root,'state');const candidate=path.join(root,'candidate.md');fs.mkdirSync(path.join(vault,'Projects','Atlas'),{recursive:true});fs.writeFileSync(candidate,'candidate\n');const registry=new Registry({stateDir});const project=registry.create({name:'Atlas',currentPath:'Projects/Atlas'});registry.dispose();const save=createSaveService({stateDir});const result=save.execute(save.prepare({root:vault,candidateFile:candidate,projectId:project.project_id,target:'Projects/Atlas/result.md',origin:'agent_generated',kind:'intermediate',channel:'host',caller:{tool:'test',client_run_id:'relink'},requestKey:'relink'}).save_id,{reason:'Save.'});save.undo(result.save_id);const replacement=path.join(root,'replacement.md');fs.writeFileSync(replacement,'replacement\n');const control=createResourceControl({stateDir});control.relink({resourceId:result.resource_id,filePath:replacement,caller:{tool:'test',client_run_id:'relink'}});assert.throws(()=>save.redo(result.save_id),/Resource facts changed/u);assert.equal(fs.existsSync(path.join(vault,'Projects','Atlas','result.md')),false);assert.equal(fs.readFileSync(replacement,'utf8'),'replacement\n');assert.equal(control.describe(result.resource_id).locations.filter((l)=>l.status==='active').length,1);assert.equal(save.show(result.save_id).redo_available,true);control.dispose();save.dispose();
+  const root = temporary(t, 'save-redo-relink-'); const vault = path.join(root, 'vault');
+  const stateDir = path.join(root, 'state'); const projectPath = path.join(vault, 'Projects', 'Atlas');
+  const candidate = path.join(root, 'candidate.md'); fs.mkdirSync(projectPath, { recursive: true }); fs.writeFileSync(candidate, 'candidate\n');
+  const registry = new Registry({ stateDir });
+  const adopted = registry.adoptRoot({ rootPath: vault, rootType: 'project_workspace', contentPolicy: 'bounded_content' });
+  const project = registry.create({ name: 'Atlas', currentPath: 'Projects/Atlas' });
+  registry.attachRoot(project.project_id, { rootId: adopted.root_id, relativePath: 'Projects/Atlas', reason: 'Redo relink fixture.' });
+  registry.dispose();
+  const save = createSaveService({ stateDir }); const control = createResourceControl({ stateDir });
+  try {
+    const result = save.execute(save.prepare({ root: vault, candidateFile: candidate, projectId: project.project_id,
+      target: 'Projects/Atlas/result.md', origin: 'agent_generated', kind: 'intermediate', channel: 'host',
+      caller: { tool: 'test', client_run_id: 'relink' }, requestKey: 'relink' }).save_id, { reason: 'Save.' });
+    save.undo(result.save_id);
+    const replacement = path.join(projectPath, 'replacement.md'); fs.writeFileSync(replacement, 'candidate\n');
+    control.relink({ resourceId: result.resource_id, filePath: replacement, caller: { tool: 'test', client_run_id: 'relink' } });
+    assert.throws(() => save.redo(result.save_id), /Resource facts changed/u);
+    assert.equal(fs.existsSync(path.join(projectPath, 'result.md')), false);
+    assert.equal(fs.readFileSync(replacement, 'utf8'), 'candidate\n');
+    assert.equal(control.describe(result.resource_id).locations.filter(l => l.status === 'active').length, 1);
+    assert.equal(save.show(result.save_id).redo_available, false);
+  } finally { control.dispose(); save.dispose(); }
 });

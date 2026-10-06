@@ -5,6 +5,8 @@ import json
 import math
 import re
 import zipfile
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from datetime import date
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -264,8 +266,8 @@ def _apply(frame: pd.DataFrame, operations: dict[str, Any]) -> pd.DataFrame:
 
 def _sample(frame: pd.DataFrame, page: int, page_size: int) -> list[list[Any]]:
     start = max(0, page) * max(1, min(page_size, 100))
-    values = frame.iloc[start:start + max(1, min(page_size, 100))].where(pd.notna(frame), None).values.tolist()
-    return [[str(value) if value is not None else None for value in row] for row in values]
+    values = frame.iloc[start:start + max(1, min(page_size, 100))].values.tolist()
+    return [[None if pd.isna(value) else str(value) for value in row] for row in values]
 
 
 def _cast(frame: pd.DataFrame, column: str, target: str) -> tuple[pd.DataFrame, int]:
@@ -289,6 +291,266 @@ def _cast(frame: pd.DataFrame, column: str, target: str) -> tuple[pd.DataFrame, 
     failures = int((non_empty & pd.isna(converted)).sum())
     result[column] = converted
     return result, failures
+
+
+def _group_aggregate(frame: pd.DataFrame, step: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
+    dimension = step.get("dimension")
+    measure = step.get("measure")
+    if not isinstance(dimension, str) or not dimension or not isinstance(measure, str) or not measure:
+        raise ValueError("Group aggregate needs one dimension and one measure")
+    if dimension == measure or dimension not in frame.columns or measure not in frame.columns:
+        raise ValueError("Group aggregate must use two available, distinct fields")
+    if step.get("formula") != "sum":
+        raise ValueError("Group aggregate currently supports only sum")
+    if step.get("null_policy") != "exclude":
+        raise ValueError("Group aggregate requires the explicit exclude null policy")
+    unit = step.get("unit")
+    if not isinstance(unit, str) or not unit.strip() or len(unit.strip()) > 40:
+        raise ValueError("Group aggregate unit must contain 1 to 40 characters")
+
+    totals: dict[str, dict[str, Any]] = {}
+    excluded = 0
+    input_rows = len(frame)
+    for dimension_value, measure_value in frame[[dimension, measure]].itertuples(index=False, name=None):
+        if pd.isna(measure_value) or (isinstance(measure_value, str) and not measure_value.strip()):
+            excluded += 1
+            continue
+        try:
+            number = Decimal(str(measure_value).strip())
+        except (InvalidOperation, ValueError):
+            raise ValueError(f"Group aggregate measure contains a non-numeric value: {measure_value}") from None
+        if not number.is_finite():
+            raise ValueError("Group aggregate measure values must be finite numbers")
+        key = "" if pd.isna(dimension_value) else str(dimension_value)
+        group = totals.setdefault(key, {"value": key, "decimal_sum": Decimal(0), "rows": 0})
+        group["decimal_sum"] += number
+        group["rows"] += 1
+        if len(totals) > 500:
+            raise ValueError("Group aggregate exceeds the 500 group output limit")
+
+    groups = []
+    output_rows = []
+    grand_total = Decimal(0)
+    for group in totals.values():
+        try:
+            value = float(group["decimal_sum"])
+        except (OverflowError, ValueError):
+            raise ValueError("Group aggregate sum is outside the supported numeric range") from None
+        if not math.isfinite(value):
+            raise ValueError("Group aggregate sum is outside the supported numeric range")
+        groups.append({"value": group["value"], "sum": value, "rows": group["rows"]})
+        output_rows.append({dimension: group["value"], measure: value})
+        grand_total += group["decimal_sum"]
+    try:
+        total_value = float(grand_total)
+    except (OverflowError, ValueError):
+        raise ValueError("Group aggregate total is outside the supported numeric range") from None
+    if not math.isfinite(total_value):
+        raise ValueError("Group aggregate total is outside the supported numeric range")
+    return pd.DataFrame(output_rows, columns=[dimension, measure]), {
+        "dimension": dimension,
+        "measure": measure,
+        "formula": "sum",
+        "unit": unit.strip(),
+        "null_policy": "exclude",
+        "input_rows": input_rows,
+        "included_rows": input_rows - excluded,
+        "excluded_rows": excluded,
+        "grand_total": total_value,
+        "groups": groups,
+    }
+
+
+def _pivot_aggregate(frame: pd.DataFrame, step: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
+    row_field = step.get("row_dimension")
+    column_field = step.get("column_dimension")
+    measure = step.get("measure")
+    fields = (row_field, column_field, measure)
+    if any(not isinstance(item, str) or not item for item in fields) or len(set(fields)) != 3:
+        raise ValueError("Pivot aggregate needs three distinct fields")
+    if any(item not in frame.columns for item in fields):
+        raise ValueError("Pivot aggregate fields must be available")
+    if step.get("formula") != "sum" or step.get("null_policy") != "exclude":
+        raise ValueError("Pivot aggregate supports sum with the explicit exclude null policy")
+    unit = step.get("unit")
+    if not isinstance(unit, str) or not unit.strip() or len(unit.strip()) > 40:
+        raise ValueError("Pivot aggregate unit must contain 1 to 40 characters")
+
+    row_order: list[str] = []
+    column_order: list[str] = []
+    sums: dict[tuple[str, str], Decimal] = {}
+    row_counts: dict[str, int] = {}
+    included = excluded = 0
+    for row_value, column_value, measure_value in frame[list(fields)].itertuples(index=False, name=None):
+        row_key = "" if pd.isna(row_value) else str(row_value)
+        column_key = "" if pd.isna(column_value) else str(column_value)
+        if row_key not in row_order:
+            row_order.append(row_key)
+        if column_key not in column_order:
+            column_order.append(column_key)
+        if pd.isna(measure_value) or (isinstance(measure_value, str) and not measure_value.strip()):
+            excluded += 1
+            continue
+        try:
+            number = Decimal(str(measure_value).strip())
+        except (InvalidOperation, ValueError):
+            raise ValueError(f"Pivot aggregate measure contains a non-numeric value: {measure_value}") from None
+        if not number.is_finite():
+            raise ValueError("Pivot aggregate measure values must be finite numbers")
+        sums[(row_key, column_key)] = sums.get((row_key, column_key), Decimal(0)) + number
+        row_counts[row_key] = row_counts.get(row_key, 0) + 1
+        included += 1
+    if len(row_order) > 40 or len(column_order) > 12:
+        raise ValueError("Pivot aggregate exceeds the 40 row category by 12 column category limit")
+
+    def as_number(value: Decimal) -> float:
+        try:
+            result = float(value)
+        except (OverflowError, ValueError):
+            raise ValueError("Pivot aggregate result is outside the supported numeric range") from None
+        if not math.isfinite(result):
+            raise ValueError("Pivot aggregate result is outside the supported numeric range")
+        return result
+
+    matrix_rows = []
+    row_totals = []
+    column_sums = {key: Decimal(0) for key in column_order}
+    grand_total = Decimal(0)
+    for row_key in row_order:
+        values = [sums.get((row_key, column_key), Decimal(0)) for column_key in column_order]
+        total = sum(values, Decimal(0))
+        for key, value in zip(column_order, values):
+            column_sums[key] += value
+        grand_total += total
+        matrix_rows.append({"row": row_key, "values": [as_number(value) for value in values], "total": as_number(total)})
+        row_totals.append({"value": row_key, "sum": as_number(total), "rows": row_counts.get(row_key, 0)})
+    try:
+        total_numeric = as_number(grand_total)
+        shares = [(Decimal(item["sum"]) / grand_total * Decimal(100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if grand_total else None for item in row_totals]
+    except (InvalidOperation, ZeroDivisionError):
+        raise ValueError("Pivot aggregate percentages are outside the supported range") from None
+    ranked = sorted((Decimal(item["sum"]) for item in row_totals), reverse=True)
+    dense_rank: dict[Decimal, int] = {}
+    for amount in ranked:
+        dense_rank.setdefault(amount, len(dense_rank) + 1)
+    for index, item in enumerate(row_totals):
+        item["share_percent"] = float(shares[index]) if shares[index] is not None else None
+        item["rank"] = dense_rank[Decimal(item["sum"])]
+        matrix_rows[index]["share_percent"] = item["share_percent"]
+        matrix_rows[index]["rank"] = item["rank"]
+    column_totals = [{"value": key, "sum": as_number(column_sums[key])} for key in column_order]
+    total_label = "__TOTAL__"
+    while total_label in row_order:
+        total_label = f"_{total_label}"
+    matrix_rows.append({"row": total_label, "values": [as_number(column_sums[key]) for key in column_order], "total": total_numeric, "share_percent": 100.0 if grand_total else None, "rank": None})
+
+    # Prefixes keep generated headings distinct from source categories and metadata labels.
+    row_heading = f"row:{row_field}"
+    value_headings = [f"column:{index + 1}:{key}" for index, key in enumerate(column_order)]
+    total_heading = f"total:{measure}"
+    share_heading = "share_percent"
+    rank_heading = "dense_rank"
+    output_rows = []
+    for item in matrix_rows:
+        output_rows.append({row_heading: item["row"], **dict(zip(value_headings, item["values"])), total_heading: item["total"], share_heading: item.get("share_percent"), rank_heading: item.get("rank")})
+    output_columns = [row_heading, *value_headings, total_heading, share_heading, rank_heading]
+    return pd.DataFrame(output_rows, columns=output_columns), {
+        "row_dimension": row_field, "column_dimension": column_field, "measure": measure,
+        "formula": "sum", "unit": unit.strip(), "null_policy": "exclude",
+        "input_rows": len(frame), "included_rows": included, "excluded_rows": excluded,
+        "grand_total": total_numeric, "row_total_label": total_label,
+        "row_order": row_order, "column_order": column_order,
+        "column_totals": column_totals, "row_totals": row_totals,
+        "matrix": matrix_rows, "output_columns": output_columns,
+    }
+
+
+def _month_number(value: str) -> int:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}", value):
+        raise ValueError("Trend months must use YYYY-MM")
+    year, month = map(int, value.split("-"))
+    if month < 1 or month > 12:
+        raise ValueError("Trend month is outside the calendar")
+    return year * 12 + month - 1
+
+
+def _month_text(number: int) -> str:
+    return f"{number // 12:04d}-{number % 12 + 1:02d}"
+
+
+def _trend_aggregate(frame: pd.DataFrame, step: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
+    date_field, measure = step.get("date_field"), step.get("measure")
+    if not isinstance(date_field, str) or not date_field or not isinstance(measure, str) or not measure or date_field == measure:
+        raise ValueError("Trend needs distinct date and measure fields")
+    if date_field not in frame.columns or measure not in frame.columns:
+        raise ValueError("Trend fields must be available")
+    if step.get("formula") != "sum" or step.get("null_policy") != "exclude":
+        raise ValueError("Trend supports sum with the explicit exclude null policy")
+    unit = step.get("unit")
+    if not isinstance(unit, str) or not unit.strip() or len(unit.strip()) > 40:
+        raise ValueError("Trend unit must contain 1 to 40 characters")
+    start = _month_number(step.get("start_month"))
+    current_start = _month_number(step.get("current_start_month"))
+    end = _month_number(step.get("end_month"))
+    previous_length = current_start - start
+    current_length = end - current_start + 1
+    if previous_length < 1 or previous_length > 12 or current_length < 1 or current_length > 12 or previous_length != current_length or previous_length + current_length > 24:
+        raise ValueError("Trend requires adjacent equal periods of 1 to 12 months each")
+
+    monthly = {number: Decimal(0) for number in range(start, end + 1)}
+    included = empty = out_of_range = 0
+    for date_value, measure_value in frame[[date_field, measure]].itertuples(index=False, name=None):
+        text = str(date_value) if not pd.isna(date_value) else ""
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            raise ValueError("Trend dates must use exact YYYY-MM-DD date-only values")
+        try:
+            parsed_date = date.fromisoformat(text)
+        except ValueError:
+            raise ValueError("Trend contains an invalid calendar date") from None
+        month = parsed_date.year * 12 + parsed_date.month - 1
+        if measure_value is not None and not pd.isna(measure_value) and not (isinstance(measure_value, str) and not measure_value.strip()):
+            try:
+                number = Decimal(str(measure_value).strip())
+            except (InvalidOperation, ValueError):
+                raise ValueError(f"Trend measure contains a non-numeric value: {measure_value}") from None
+            if not number.is_finite():
+                raise ValueError("Trend measure values must be finite numbers")
+        else:
+            number = None
+        if month < start or month > end:
+            out_of_range += 1
+            continue
+        if number is None:
+            empty += 1
+            continue
+        monthly[month] += number
+        included += 1
+
+    def numeric(value: Decimal) -> float:
+        try:
+            result = float(value)
+        except (OverflowError, ValueError):
+            raise ValueError("Trend total is outside the supported numeric range") from None
+        if not math.isfinite(result):
+            raise ValueError("Trend total is outside the supported numeric range")
+        return result
+
+    previous_total = sum((monthly[number] for number in range(start, current_start)), Decimal(0))
+    current_total = sum((monthly[number] for number in range(current_start, end + 1)), Decimal(0))
+    delta = current_total - previous_total
+    growth = (delta / previous_total * Decimal(100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if previous_total else None
+    month_numbers = list(range(start, end + 1))
+    monthly_totals = [{"month": _month_text(number), "sum": numeric(monthly[number])} for number in month_numbers]
+    result = pd.DataFrame([{"month": item["month"], f"sum:{measure}": item["sum"]} for item in monthly_totals], columns=["month", f"sum:{measure}"])
+    return result, {
+        "date_field": date_field, "measure": measure, "formula": "sum", "unit": unit.strip(), "null_policy": "exclude",
+        "start_month": _month_text(start), "current_start_month": _month_text(current_start), "end_month": _month_text(end),
+        "previous_period": {"start_month": _month_text(start), "end_month": _month_text(current_start - 1), "total": numeric(previous_total)},
+        "current_period": {"start_month": _month_text(current_start), "end_month": _month_text(end), "total": numeric(current_total)},
+        "delta": numeric(delta), "growth_percent": float(growth) if growth is not None else None,
+        "included_rows": included, "excluded_empty_rows": empty, "out_of_range_rows": out_of_range,
+        "monthly_totals": monthly_totals,
+    }
 
 
 def _multi_work(request: dict[str, Any], action: str, output_path: str | None) -> dict[str, Any]:
@@ -338,6 +600,9 @@ def _multi_work(request: dict[str, Any], action: str, output_path: str | None) -
         raise ValueError("Recipe combine must be concatenate or join")
 
     conversion_failures: dict[str, int] = {}
+    aggregation = None
+    pivot_aggregation = None
+    trend_aggregation = None
     for step in steps:
         operation = step.get("operation")
         if operation in {"source-column", "validate"}:
@@ -369,6 +634,28 @@ def _multi_work(request: dict[str, Any], action: str, output_path: str | None) -
             if not columns or any(column not in result.columns for column in columns):
                 raise ValueError("Deduplicate needs available fields")
             result = result.drop_duplicates(subset=columns)
+        elif operation == "group-aggregate":
+            if action == "details":
+                measure = step.get("measure")
+                if measure not in result.columns:
+                    raise ValueError("Group aggregate measure is unavailable for details")
+                result = result[result[measure].map(lambda value: not (pd.isna(value) or isinstance(value, str) and not value.strip()))]
+                break
+            if aggregation is not None or pivot_aggregation is not None or trend_aggregation is not None:
+                raise ValueError("Recipe supports one aggregate operation")
+            result, aggregation = _group_aggregate(result, step)
+        elif operation == "pivot-aggregate":
+            if action == "details":
+                break
+            if aggregation is not None or pivot_aggregation is not None or trend_aggregation is not None:
+                raise ValueError("Recipe supports one aggregate operation")
+            result, pivot_aggregation = _pivot_aggregate(result, step)
+        elif operation == "trend-aggregate":
+            if action == "details":
+                break
+            if aggregation is not None or pivot_aggregation is not None or trend_aggregation is not None:
+                raise ValueError("Recipe supports one aggregate operation")
+            result, trend_aggregation = _trend_aggregate(result, step)
         elif operation == "sort":
             column = step.get("column")
             if column not in result.columns:
@@ -383,18 +670,32 @@ def _multi_work(request: dict[str, Any], action: str, output_path: str | None) -
     null_cells = int(result.isna().sum().sum())
     duplicate_rows = int(result.fillna("").astype(str).duplicated().sum()) if len(result) else 0
     validation = {"input_rows": sum(item["rows"] for item in source_results), "output_rows": len(result), "null_cells": null_cells, "duplicate_rows": duplicate_rows, "conversion_failures": conversion_failures}
-    page_size = max(1, min(int(request.get("page_size", 50)), 100))
+    page_size = max(1, min(int(request.get("detail_limit", request.get("page_size", 50))), 100))
+    detail_offset = max(0, int(request.get("detail_offset", 0))) if action == "details" else 0
     response = {
         "processor": {"version": PROCESSOR_VERSION},
         "source": {"sha256": sources[0]["sha256"]},
         "sources": source_results,
         "recipe": recipe,
         "columns": [str(name) for name in result.columns],
-        "rows": _sample(result, 0, page_size),
+        "rows": _sample(result, 0, page_size) if action != "details" else [[None if pd.isna(value) else str(value) for value in row] for row in result.iloc[detail_offset:detail_offset + page_size].values.tolist()],
         "preview": {"sampled": True, "rows_shown": min(page_size, len(result)), "total_rows": len(result)},
         "result_summary": {"rows": len(result), "columns": len(result.columns)},
         "validation": validation,
     }
+    if action == "details":
+        next_offset = detail_offset + len(response["rows"])
+        response["details"] = {
+            "offset": detail_offset, "limit": page_size, "total": len(result),
+            "next_offset": next_offset if next_offset < len(result) else None,
+            "complete": next_offset >= len(result),
+        }
+    if aggregation is not None:
+        response["aggregation"] = aggregation
+    if pivot_aggregation is not None:
+        response["pivot_aggregation"] = pivot_aggregation
+    if trend_aggregation is not None:
+        response["trend_aggregation"] = trend_aggregation
     if action == "export":
         if not output_path:
             raise ValueError("Atlas needs a local staging file for this result")

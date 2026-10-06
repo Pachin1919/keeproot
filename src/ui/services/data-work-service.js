@@ -552,10 +552,76 @@ export function createDataWorkService({
     if (selected.length && selected.length !== fields.length) steps.push({ operation: 'select', columns: selected });
     const deduplicate = [...new Set(String(input.deduplicate_columns ?? '').split(',').map((item) => item.trim()).filter(Boolean).map((item) => field(item, 'Deduplicate field')))];
     if (deduplicate.length) steps.push({ operation: 'deduplicate', columns: deduplicate });
-    if (input.sort_column) steps.push({ operation: 'sort', column: field(input.sort_column, 'Sort field'), direction: input.sort_direction === 'desc' ? 'desc' : 'asc' });
+    const aggregateDimension = field(input.aggregate_dimension, 'Aggregate dimension');
+    const aggregateMeasure = field(input.aggregate_measure, 'Aggregate measure');
+    const priorFocus = (value.recipe?.steps ?? []).find((step) => step.focus === true);
+    if (priorFocus && priorFocus.column === aggregateDimension
+      && value.preview?.aggregation?.groups?.some((group) => String(group.value) === String(priorFocus.value))) {
+      steps.push({ ...priorFocus });
+    }
+    if (Boolean(aggregateDimension) !== Boolean(aggregateMeasure)) throw new Error('Choose both a group dimension and a numeric measure.');
+    const pivotRow = field(input.pivot_row_dimension, 'Pivot row dimension');
+    const pivotColumn = field(input.pivot_column_dimension, 'Pivot column dimension');
+    const pivotMeasure = field(input.pivot_measure, 'Pivot measure');
+    const hasPivot = Boolean(pivotRow || pivotColumn || pivotMeasure);
+    const trendDate = field(input.trend_date_field, 'Trend date field');
+    const trendMeasure = field(input.trend_measure, 'Trend measure');
+    const hasTrend = Boolean(trendDate || trendMeasure);
+    if ((hasPivot || hasTrend) && aggregateDimension || hasPivot && hasTrend) throw new Error('Group, pivot, and trend aggregates are mutually exclusive.');
+    if (hasPivot && (!pivotRow || !pivotColumn || !pivotMeasure)) throw new Error('Choose row, column, and measure fields for the pivot.');
+    if (hasPivot && new Set([pivotRow, pivotColumn, pivotMeasure]).size !== 3) throw new Error('Pivot row, column, and measure fields must be distinct.');
+    if (aggregateDimension) {
+      const formula = String(input.aggregate_formula ?? '');
+      const unit = String(input.aggregate_unit ?? '').trim();
+      const nullPolicy = String(input.aggregate_null_policy ?? '');
+      if (formula !== 'sum') throw new Error('Group aggregate currently supports only sum.');
+      if (nullPolicy !== 'exclude') throw new Error('Choose the explicit exclude null policy.');
+      if (!unit || unit.length > 40) throw new Error('Aggregate unit must contain 1 to 40 characters.');
+      if (selected.length && (!selected.includes(aggregateDimension) || !selected.includes(aggregateMeasure))) throw new Error('Selected output fields must include the aggregate dimension and measure.');
+      steps.push({ operation: 'group-aggregate', dimension: aggregateDimension, measure: aggregateMeasure, formula, unit, null_policy: nullPolicy });
+    }
+    if (hasPivot) {
+      const formula = String(input.pivot_formula ?? '');
+      const unit = String(input.pivot_unit ?? '').trim();
+      const nullPolicy = String(input.pivot_null_policy ?? '');
+      if (formula !== 'sum') throw new Error('Pivot currently supports only sum.');
+      if (nullPolicy !== 'exclude') throw new Error('Choose the explicit exclude null policy for the pivot.');
+      if (!unit || unit.length > 40) throw new Error('Pivot unit must contain 1 to 40 characters.');
+      if (selected.length && [pivotRow, pivotColumn, pivotMeasure].some((name) => !selected.includes(name))) throw new Error('Selected output fields must include all pivot fields.');
+      if (input.rename_column) throw new Error('Pivot output headings are generated from the selected dimensions and cannot be renamed in this Recipe.');
+      if (input.sort_column) steps.push({ operation: 'sort', column: field(input.sort_column, 'Sort field'), direction: input.sort_direction === 'desc' ? 'desc' : 'asc' });
+      steps.push({ operation: 'pivot-aggregate', row_dimension: pivotRow, column_dimension: pivotColumn, measure: pivotMeasure, formula, unit, null_policy: nullPolicy });
+    }
+    if (hasTrend) {
+      if (!trendDate || !trendMeasure) throw new Error('Choose both a date field and a numeric measure for the trend.');
+      if (trendDate === trendMeasure) throw new Error('Trend date and measure fields must be distinct.');
+      const formula = String(input.trend_formula ?? '');
+      const unit = String(input.trend_unit ?? '').trim();
+      const nullPolicy = String(input.trend_null_policy ?? '');
+      const startMonth = String(input.trend_start_month ?? '').trim();
+      const currentStartMonth = String(input.trend_current_start_month ?? '').trim();
+      const endMonth = String(input.trend_end_month ?? '').trim();
+      const monthIndex = (value) => {
+        if (!/^\d{4}-(0[1-9]|1[0-2])$/u.test(value)) throw new Error('Trend months must use YYYY-MM.');
+        const [year, month] = value.split('-').map(Number);
+        return year * 12 + month - 1;
+      };
+      const start = monthIndex(startMonth); const currentStart = monthIndex(currentStartMonth); const end = monthIndex(endMonth);
+      const previousLength = currentStart - start; const currentLength = end - currentStart + 1;
+      if (previousLength < 1 || previousLength > 12 || currentLength < 1 || currentLength > 12 || previousLength !== currentLength || previousLength + currentLength > 24) throw new Error('Trend needs adjacent equal periods of 1 to 12 months each.');
+      if (formula !== 'sum') throw new Error('Trend currently supports only sum.');
+      if (nullPolicy !== 'exclude') throw new Error('Choose the explicit exclude null policy for the trend.');
+      if (!unit || unit.length > 40) throw new Error('Trend unit must contain 1 to 40 characters.');
+      if (selected.length && [trendDate, trendMeasure].some((name) => !selected.includes(name))) throw new Error('Selected output fields must include the trend date and measure fields.');
+      if (input.rename_column) throw new Error('Trend output headings are fixed for the selected months and cannot be renamed in this Recipe.');
+      if (input.sort_column) steps.push({ operation: 'sort', column: field(input.sort_column, 'Sort field'), direction: input.sort_direction === 'desc' ? 'desc' : 'asc' });
+      steps.push({ operation: 'trend-aggregate', date_field: trendDate, measure: trendMeasure, formula, start_month: startMonth, current_start_month: currentStartMonth, end_month: endMonth, unit, null_policy: nullPolicy });
+    }
+    if (input.sort_column && !hasPivot && !hasTrend) steps.push({ operation: 'sort', column: field(input.sort_column, 'Sort field'), direction: input.sort_direction === 'desc' ? 'desc' : 'asc' });
     if (input.rename_column) {
       const from = field(input.rename_column, 'Rename field'); const to = String(input.rename_to ?? '').trim();
       if (!to) throw new Error('Enter the renamed field.');
+      if (hasPivot || hasTrend) throw new Error('Aggregate output headings cannot be renamed in this Recipe.');
       if (to !== from && (fields.includes(to) || to === sourceColumn)) throw new Error('The renamed field must not duplicate another result field.');
       steps.push({ operation: 'rename', from, to });
     }
@@ -563,7 +629,7 @@ export function createDataWorkService({
     discardPersistentStage(id);
     return persistentSession(repository.setRecipe(id, { schema: 'atlas.table-recipe.v1', version: Number(value.recipe?.version ?? 0) + 1, combine, steps }, isoNow(), baseRevision).session_id);
   };
-  const executePersistent = async (id, action, extension = '.csv', { baseRevision = null } = {}) => {
+  const executePersistent = async (id, action, extension = '.csv', { baseRevision = null, detailOffset = 0, detailLimit = 20 } = {}) => {
     let value = await validateSources(id);
     if (baseRevision != null) {
       assertRevision(id, baseRevision);
@@ -577,7 +643,7 @@ export function createDataWorkService({
     const requestPath = path.join(path.resolve(stateDir), 'tmp', 'work', `${id}-r${value.revision}.json`);
     fs.mkdirSync(path.dirname(requestPath), { recursive: true });
     const sources = value.sources.map((item) => ({ source_key: item.source_key, resource_id: item.resource_id, path: item.file_path, name: item.name, sheet: item.sheet, sha256: item.fingerprint.sha256 }));
-    fs.writeFileSync(requestPath, JSON.stringify({ sources, mapping: value.mapping, recipe: value.recipe, page_size: 50 }), 'utf8');
+    fs.writeFileSync(requestPath, JSON.stringify({ sources, mapping: value.mapping, recipe: value.recipe, page_size: 50, detail_offset: detailOffset, detail_limit: detailLimit }), 'utf8');
     let outputPath = null;
     if (action === 'export') {
       const normalized = extension === '.xlsx' ? '.xlsx' : '.csv';
@@ -590,6 +656,7 @@ export function createDataWorkService({
       if (current.sha256 !== item.sha256) { const error = new Error(`Source changed while Atlas was executing this Recipe: ${item.name}`); error.code = 'ATLAS_STATE_CONFLICT'; throw error; }
     }
     assertRevision(id, value.revision);
+    if (action === 'details') return result;
     if (action === 'preview') {
       repository.setPreview(id, result, value.revision, isoNow());
       return persistentSession(id);
@@ -598,8 +665,60 @@ export function createDataWorkService({
     return persistentStages.get(id);
   };
   const previewPersistent = (id, options = {}) => executePersistent(id, 'preview', '.csv', options);
+  const focusAggregate = async (id, { category = null, clear = false, baseRevision = null, guard = null } = {}) => {
+    await validateSources(id);
+    assertRevision(id, baseRevision);
+    const value = persistentSession(id);
+    if (!value?.preview || value.preview_revision !== value.revision || !value.preview.aggregation) throw stateConflict('Preview the current group aggregate before selecting a category.');
+    const aggregation = value.preview.aggregation;
+    const existing = (value.recipe?.steps ?? []).find((step) => step.focus === true);
+    if (clear && !existing) return { ...value, focus: null };
+    let selected = null;
+    if (!clear) {
+      selected = String(category ?? '');
+      if (selected.length > 256 || !aggregation.groups.some((group) => String(group.value) === selected)) throw stateConflict('Choose a category from the complete current aggregate Preview.');
+    }
+    const steps = (value.recipe?.steps ?? []).filter((step) => step.focus !== true);
+    if (!clear) {
+      const aggregateIndex = steps.findIndex((step) => step.operation === 'group-aggregate');
+      if (aggregateIndex < 0) throw stateConflict('Category focus is available only for a group-sum Recipe.');
+      steps.splice(aggregateIndex, 0, { operation: 'filter', column: aggregation.dimension, operator: selected === '' ? 'is_empty' : 'equals', value: selected, focus: true });
+    }
+    const recipe = { ...(value.recipe ?? {}), schema: 'atlas.table-recipe.v1', version: Number(value.recipe?.version ?? 0) + 1, steps };
+    discardPersistentStage(id);
+    const updated = repository.setRecipe(id, recipe, isoNow(), baseRevision, guard);
+    const focused = persistentSession(updated.session_id);
+    return { ...focused, focus: clear ? null : { field: aggregation.dimension, value: selected } };
+  };
+  const readAggregateDetails = async (id, { offset = 0, limit = 20, baseRevision = null } = {}) => {
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1000000) throw new Error('Details offset must be an integer from 0 to 1000000.');
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new Error('Details limit must be an integer from 1 to 50.');
+    await validateSources(id);
+    assertRevision(id, baseRevision);
+    const value = persistentSession(id);
+    if (!value?.preview || value.preview_revision !== value.revision || !value.preview.aggregation) throw stateConflict('Preview the current group aggregate before reading its processed input rows.');
+    const focus = (value.recipe?.steps ?? []).find((step) => step.focus === true);
+    if (!focus || focus.operation !== 'filter' || !((focus.operator === 'equals' && focus.value !== '') || (focus.operator === 'is_empty' && focus.value === '')) || focus.column !== value.preview.aggregation.dimension) throw stateConflict('Select a category from the current group aggregate before reading details.');
+    const result = await executePersistent(id, 'details', '.csv', { baseRevision: value.revision, detailOffset: offset, detailLimit: limit });
+    assertRevision(id, value.revision);
+    const current = persistentSession(id);
+    if (current.preview_revision !== value.preview_revision || current.sources.some((item) => item.status !== 'ready')) throw stateConflict('The Work Preview or Source changed while reading details.');
+    const pagination = result.details ?? {};
+    return {
+      session_id: id, project_id: current.project_id, revision: current.revision,
+      preview_revision: current.preview_revision, focus: { field: focus.column, value: focus.value },
+      columns: result.columns ?? [], rows: result.rows ?? [],
+      offset: pagination.offset ?? offset, limit: pagination.limit ?? limit, total: pagination.total ?? 0,
+      next_offset: pagination.next_offset ?? null, complete: pagination.complete === true,
+      sources: current.sources.map((item) => ({ resource_id: item.resource_id, sha256: item.fingerprint?.sha256 ?? null })),
+    };
+  };
   const stagePersistent = (id, extension, options = {}) => executePersistent(id, 'export', extension, options);
-  const persistentStage = (id) => persistentStages.get(id) ?? null;
+  const persistentStage = (id) => {
+    const value = persistentStages.get(id);
+    if (value && value.revision !== repository?.byId(id)?.revision) { discardPersistentStage(id); return null; }
+    return value ?? null;
+  };
   const clearPersistentStage = (id) => discardPersistentStage(id);
   const recordSave = (id, saveId) => persistentSession(repository.setLatestSave(id, saveId, isoNow()).session_id);
   const sessions = new Map();
@@ -672,5 +791,5 @@ export function createDataWorkService({
   const stage = async (id) => { const value = session(id); if (!value) throw new Error('This Data Work session is no longer available.'); if (value.staged_path && value.staged && fs.existsSync(value.staged_path)) return value.preview; return invoke(value, 'export', { exportStage: true }); };
   const clearStage = (id) => { const value = session(id); if (!value) return; invalidateStage(value); };
   const attachProject = (id, project) => { const value = session(id); if (!value) return null; value.project = project; return value; };
-  return { projectSession, createProjectSession, reuseProjectSession, currentProjectSession, openProjectSessions, discoverProjectSessions, assertRevision, replaceSources, addSource, removeSource, validateSources, prepareSources, reconcileSource, reconcileSources, selectSourceSheet, confirmMapping, updateRecipe, previewPersistent, stagePersistent, persistentStage, clearPersistentStage, recordSave, begin, session, selectSheet, change, page, stage, clearStage, attachProject, cleanup, expire };
+  return { projectSession, createProjectSession, reuseProjectSession, currentProjectSession, openProjectSessions, discoverProjectSessions, assertRevision, replaceSources, addSource, removeSource, validateSources, prepareSources, reconcileSource, reconcileSources, selectSourceSheet, confirmMapping, updateRecipe, previewPersistent, focusAggregate, readAggregateDetails, stagePersistent, persistentStage, clearPersistentStage, recordSave, begin, session, selectSheet, change, page, stage, clearStage, attachProject, cleanup, expire };
 }

@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Ledger } from './ledger.js';
+import { Registry, realProjectDirectory } from './registry.js';
 import { isPathInside, normalizeRoot, toPortablePath } from './paths.js';
 import {
   ARTIFACT_ROLES,
@@ -1625,6 +1626,149 @@ export class Bootstrap {
     };
     this.ledger.finishBootstrapInitialize(scanId, receipt, initializedAt);
     return receipt;
+  }
+
+  previewConnect(scanId, { registry: registryInput = null } = {}) {
+    const detail = this.show(scanId);
+    if (detail.scan.status !== 'initialized') {
+      throw stateConflict('Review and Initialize this Bootstrap scan before connecting its Projects.');
+    }
+    const root = normalizeRoot(detail.scan.root_path);
+    if (root.localeCompare(detail.scan.root_path, undefined, { sensitivity: 'accent' }) !== 0) {
+      throw stateConflict('The scanned Library Root changed. Create a new Bootstrap scan.');
+    }
+    const accepted = detail.predictions.filter((prediction) =>
+      prediction.kind === 'project_candidate' && prediction.review?.decision === 'accepted');
+    if (!accepted.length) throw stateConflict('This initialized scan has no accepted Project directories to connect.');
+
+    const ownedRegistry = registryInput ?? new Registry({ stateDir: this.stateDir });
+    try {
+      const rootEquals = (left, right) => path.resolve(left).localeCompare(
+        path.resolve(right), undefined, { sensitivity: 'accent' },
+      ) === 0;
+      const roots = ownedRegistry.listRoots();
+      const existingRoot = roots.find((item) => rootEquals(item.current_path, root)) ?? null;
+      const overlappingRoot = roots.find((item) => !rootEquals(item.current_path, root)
+        && (isPathInside(path.resolve(item.current_path), root) || isPathInside(root, path.resolve(item.current_path))));
+      let rootType = 'workspace_container';
+      let contentPolicy = 'structure_only';
+      let rootId = null;
+      let blockedReason = null;
+      if (overlappingRoot) blockedReason = `The scanned Root overlaps an adopted Workspace Root: ${overlappingRoot.id}.`;
+      if (existingRoot) {
+        const rootDetail = ownedRegistry.showRoot(existingRoot.id);
+        const value = rootDetail?.root ?? rootDetail;
+        rootId = value.id ?? existingRoot.id;
+        rootType = value.root_type ?? value.rootType ?? value.type ?? existingRoot.root_type ?? existingRoot.rootType ?? null;
+        contentPolicy = value.content_policy ?? value.contentPolicy ?? existingRoot.content_policy ?? null;
+        if ((value.governance_status ?? existingRoot.governance_status) !== 'adopted') {
+          blockedReason = 'The existing Workspace Root is not adopted.';
+        }
+        if (!rootType || !contentPolicy) blockedReason = 'The existing Workspace Root settings are unavailable.';
+      }
+
+      const mappings = new Map(this.ledger.db.prepare(`
+        SELECT prediction_id, project_id FROM project_sources WHERE scan_run_id = ?
+      `).all(scanId).map((row) => [row.prediction_id, row.project_id]));
+      const projects = accepted.map((prediction) => {
+        const relativePath = prediction.evidence?.directory;
+        const projectId = mappings.get(prediction.id) ?? null;
+        let project = null;
+        let location = null;
+        let projectBlockedReason = null;
+        if (!relativePath || !projectId) projectBlockedReason = 'The initialized Project identity is unavailable.';
+        if (!projectBlockedReason) {
+          try {
+            realProjectDirectory(root, relativePath);
+            const projectDetail = ownedRegistry.show(projectId);
+            project = projectDetail.project;
+            if (project.status !== 'active' || project.current_path !== relativePath) {
+              projectBlockedReason = 'The initialized Project identity or reviewed directory changed.';
+            } else {
+              location = projectDetail.location;
+              if (location && (!rootEquals(location.root_path, root) || location.relative_path !== relativePath)) {
+                projectBlockedReason = 'The Project already has a different local location.';
+              }
+            }
+          } catch (error) {
+            projectBlockedReason = String(error?.message ?? error);
+          }
+        }
+        return {
+          project_id: projectId,
+          name: project?.name ?? path.posix.basename(relativePath ?? 'Project'),
+          relative_path: relativePath ?? null,
+          connection_status: projectBlockedReason ? 'blocked' : location ? 'connected' : 'pending',
+          blocked_reason: projectBlockedReason,
+        };
+      });
+      const projectBlock = projects.find((item) => item.connection_status === 'blocked');
+      const status = blockedReason || projectBlock ? 'blocked'
+        : projects.some((item) => item.connection_status === 'pending') ? 'pending' : 'connected';
+      return {
+        schema: 'atlas-bootstrap-connect-preview.v1',
+        scan_id: scanId,
+        scan_status: detail.scan.status,
+        scan_fingerprint: detail.scan.fingerprint,
+        initialized_at: detail.scan.initialized_at,
+        root_path: root,
+        root_id: rootId,
+        root_type: rootType,
+        content_policy: contentPolicy,
+        projects,
+        status,
+        can_connect: status !== 'blocked',
+        blocked_reason: blockedReason ?? projectBlock?.blocked_reason ?? null,
+        source_changes: [],
+      };
+    } finally {
+      if (!registryInput) ownedRegistry.dispose();
+    }
+  }
+
+  connect(scanId, { rootType, contentPolicy, reason } = {}) {
+    if (!rootType || !contentPolicy || !String(reason ?? '').trim()) {
+      throw new Error('Connecting Bootstrap Projects requires rootType, contentPolicy, and reason.');
+    }
+    const detail = this.show(scanId);
+    if (detail.scan.status !== 'initialized') {
+      throw stateConflict('Review and Initialize this Bootstrap scan before connecting its Projects.');
+    }
+    const root = normalizeRoot(detail.scan.root_path);
+    if (root.localeCompare(detail.scan.root_path, undefined, { sensitivity: 'accent' }) !== 0) {
+      throw stateConflict('The scanned Library Root changed. Create a new Bootstrap scan.');
+    }
+    const accepted = detail.predictions.filter((prediction) =>
+      prediction.kind === 'project_candidate' && prediction.review?.decision === 'accepted');
+    if (!accepted.length) throw new Error('This initialized scan has no accepted Project directories to connect.');
+    const registry = new Registry({ stateDir: this.stateDir });
+    try {
+      const projects = accepted.map((prediction) => {
+        const relativePath = prediction.evidence?.directory;
+        realProjectDirectory(root, relativePath);
+        const project = this.ledger.ensureProjectFromBootstrapPrediction(prediction.id, detail.scan.initialized_at ?? timestamp()).project;
+        if (project.current_path !== relativePath) {
+          throw stateConflict(`The reviewed Project directory changed after Initialize: ${project.id}.`);
+        }
+        const location = registry.show(project.id).location;
+        if (location && (location.root_path.localeCompare(root, undefined, { sensitivity: 'accent' }) !== 0
+          || location.relative_path !== relativePath)) {
+          throw stateConflict(`The Project already has a different local location: ${project.id}.`);
+        }
+        return { project_id: project.id, relative_path: relativePath };
+      });
+      const adopted = registry.adoptRoot({ rootPath: root, rootType, contentPolicy });
+      for (const project of projects) {
+        registry.attachRoot(project.project_id, {
+          rootId: adopted.root_id,
+          relativePath: project.relative_path,
+          reason: String(reason).trim(),
+        });
+      }
+      return { schema: 'atlas-bootstrap-connect.v1', scan_id: scanId, root_id: adopted.root_id, projects, source_changes: [] };
+    } finally {
+      registry.dispose();
+    }
   }
 
   dispose() {

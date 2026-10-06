@@ -421,12 +421,15 @@ export class Derived {
     caller = {},
     runId: requestedRunId = null,
     trustedInputs = null,
+    internalPreflight = null,
   }) {
     const root = normalizeRoot(rootInput);
     if (isPathInside(root, this.stateDir)) {
       throw new Error(`Atlas state directory must be outside the Derived root: ${this.stateDir}`);
     }
-    const receipt = withStateLock(this.stateDir, () => this.#prepare({
+    const receipt = withStateLock(this.stateDir, () => {
+      internalPreflight?.();
+      return this.#prepare({
       root,
       inputs,
       target,
@@ -445,7 +448,8 @@ export class Derived {
       caller,
       requestedRunId,
       trustedInputs,
-    }));
+      });
+    });
     if (candidateFile) {
       new RuntimeStorage({ stateDir: this.stateDir, ledger: this.ledger })
         .markCaptured(candidateFile, receipt.run_id);
@@ -734,11 +738,11 @@ export class Derived {
     });
   }
 
-  execute(runId) {
-    return withStateLock(this.stateDir, () => this.#execute(runId));
+  execute(runId, { internalPreflight = null } = {}) {
+    return withStateLock(this.stateDir, () => this.#execute(runId, internalPreflight));
   }
 
-  #execute(runId) {
+  #execute(runId, internalPreflight = null) {
     const detail = this.preview(runId);
     if (detail.execution_receipt) {
       const targetPath = resolveCurrentTarget(detail.run.root_path, detail.candidate.target_path);
@@ -799,6 +803,7 @@ export class Derived {
       throw new Error('Derived target already exists or was claimed after preview; approval is stale.');
     }
     if (observedTarget === null) {
+      internalPreflight?.(detail);
       const started = this.ledger.startDerivedExecution(runId, timestamp(), publishOwnership(targetPath));
       const publishTemp = started.ownership?.temp_path;
       if (!publishTemp || path.dirname(publishTemp) !== path.dirname(targetPath)) throw new Error('Derived publish ownership is invalid.');

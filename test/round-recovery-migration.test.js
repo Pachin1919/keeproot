@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
-import { Ledger } from '../src/ledger.js';
+import { Ledger, LATEST_SCHEMA_VERSION } from '../src/ledger.js';
 
 test('round recovery migration preserves v30 Boards and a pre-migration backup', (t) => {
   fs.mkdirSync('test/.tmp', { recursive: true });
@@ -16,10 +16,10 @@ test('round recovery migration preserves v30 Boards and a pre-migration backup',
   initial.db.close();
   const migrated = new Ledger(root);
   try {
-    assert.equal(migrated.db.prepare('PRAGMA user_version').get().user_version, 31);
+    assert.equal(migrated.db.prepare('PRAGMA user_version').get().user_version, LATEST_SCHEMA_VERSION);
     assert.equal(migrated.boards.byId(board.board_id).title, 'Keep me');
     assert.deepEqual(migrated.db.prepare('SELECT * FROM recovery_rounds').all(), []);
-    const backup = new DatabaseSync(path.join(root, 'backups/ledger-pre-migration-v30-to-v31.sqlite'), { readOnly: true });
+    const backup = new DatabaseSync(path.join(root, `backups/ledger-pre-migration-v30-to-v${LATEST_SCHEMA_VERSION}.sqlite`), { readOnly: true });
     try {
       assert.equal(backup.prepare('PRAGMA user_version').get().user_version, 30);
       assert.equal(backup.prepare('SELECT title FROM project_boards WHERE id=?').get(board.board_id).title, 'Keep me');

@@ -1,3 +1,24 @@
+let readerSelectionTimer = null;
+function navigateResourceReader(href) {
+  window.clearTimeout(readerSelectionTimer);
+  const url = new URL(href, window.location.origin);
+  if (url.origin === window.location.origin && /^\/projects\/[^/]+\/resources\/read$/u.test(url.pathname)) window.location.assign(url.href);
+}
+// A short delay preserves the existing single-click inspector navigation while allowing double-click reading.
+document.addEventListener('click', event => {
+  const selection = event.target.closest?.('[data-reader-selection]');
+  const row = selection?.closest('[data-reader-href]');
+  if (!row || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0 || event.detail === 0) return;
+  event.preventDefault();
+  window.clearTimeout(readerSelectionTimer);
+  readerSelectionTimer = window.setTimeout(() => window.location.assign(selection.href), 260);
+});
+document.addEventListener('dblclick', event => {
+  const row = event.target.closest?.('[data-reader-href]');
+  if (!row || row.hasAttribute('data-open-resource') || event.target.closest?.('input, button, form, label, a:not([data-reader-selection])')) return;
+  event.preventDefault(); navigateResourceReader(row.dataset.readerHref);
+});
+
 const configurations = {
   app: {
     property: '--app-rail-width',
@@ -274,6 +295,7 @@ document.querySelectorAll('[data-resource-workspace]').forEach((workspace) => {
     return parent?.querySelector(':scope > [data-folder-select]') ?? null;
   };
   const openResource = (row) => {
+    if (row.dataset.readerHref) { navigateResourceReader(row.dataset.readerHref); return; }
     const action = tree.dataset.openAction;
     const csrf = tree.dataset.csrf;
     const relativePath = row.dataset.resourcePath;
@@ -738,6 +760,7 @@ function closeAtlasOverlay(dialog) {
   dialog.close();
   const returnHref = dialog.dataset.overlayReturnHref;
   if (returnHref) {
+    if (dialog.classList.contains('settings-overlay')) storageSet('sessionStorage', 'atlas-ui-settings-return', returnHref);
     window.location.assign(returnHref);
     return;
   }
@@ -788,6 +811,13 @@ if (currentLocation?.pathname !== '/settings') {
       : '/projects';
     link.href = `/settings?return_to=${encodeURIComponent(returnHref)}`;
   });
+  const returnFocusHref = storageGet('sessionStorage', 'atlas-ui-settings-return');
+  if (returnFocusHref) {
+    storageRemove('sessionStorage', 'atlas-ui-settings-return');
+    if (returnFocusHref === `${currentLocation?.pathname}${currentLocation?.search ?? ''}`) {
+      document.querySelector('[data-settings-nav]')?.focus({ preventScroll: true });
+    }
+  }
 }
 
 document.addEventListener('keydown', (event) => {
@@ -877,6 +907,17 @@ if (document.documentElement?.dataset?.technicalIds === 'shown') {
     details.open = true;
   });
 }
+
+// These controls reveal existing Project forms without starting an operation.
+document.querySelectorAll('[data-project-disclosure]').forEach((button) => {
+  button.addEventListener('click', () => {
+    const section = document.getElementById(button.dataset.projectDisclosure);
+    if (!section?.matches('details.project-disclosure')) return;
+    section.open = true;
+    section.scrollIntoView({ block: 'start', behavior: 'auto' });
+    section.querySelector('input:not([type="hidden"]), select, textarea')?.focus({ preventScroll: true });
+  });
+});
 
 document.querySelectorAll('[data-toggle-rail]').forEach((button) => {
   button.addEventListener('click', () => {
@@ -993,6 +1034,7 @@ async function desktopPickerMethod(method) {
 async function activateDesktopPickerControls() {
   const controls = [...document.querySelectorAll('[data-requires-desktop-picker]')];
   if (!controls.length) return;
+  if (pickerNotice?.dataset.desktopPickerEnabled === 'false') return;
   const readyMethod = await desktopPickerMethod('picker_ready');
   let ready = false;
   if (readyMethod) {
@@ -1194,3 +1236,50 @@ document.addEventListener('submit', (event) => {
 
 const workDraftConflict = document.querySelector('#work-draft-conflict');
 workDraftConflict?.focus?.();
+
+const readerSurface = document.querySelector('[data-resource-reader]');
+if (readerSurface) {
+  const files = readerSurface.querySelector('#reader-files');
+  const source = readerSurface.querySelector('#reader-source');
+  const content = readerSurface.querySelector('#reader-content');
+  const filesToggle = readerSurface.querySelector('[data-reader-files-toggle]');
+  const sourceToggle = readerSurface.querySelector('[data-reader-source-toggle]');
+  const focusToggle = readerSurface.querySelector('[data-reader-focus-toggle]');
+  const setPanel = (panel, control, visible) => {
+    panel.hidden = !visible;
+    control.setAttribute('aria-expanded', String(visible));
+    readerSurface.classList.toggle(panel === files ? 'reader-files-open' : 'reader-source-open', visible);
+  };
+  const compactReader = window.matchMedia('(max-width: 760px)');
+  setPanel(files, filesToggle, !compactReader.matches);
+  setPanel(source, sourceToggle, false);
+  let focusMode = false;
+  const setFocus = enabled => {
+    focusMode = enabled;
+    focusToggle.setAttribute('aria-expanded', String(enabled));
+    focusToggle.setAttribute('aria-pressed', String(enabled));
+    readerSurface.classList.toggle('reader-focus-mode', enabled);
+    setPanel(files, filesToggle, !enabled && !compactReader.matches);
+    setPanel(source, sourceToggle, false);
+    if (enabled) content.focus({ preventScroll: true });
+  };
+  filesToggle.addEventListener('click', () => {
+    const show = focusMode || files.hidden;
+    if (focusMode) setFocus(false);
+    setPanel(files, filesToggle, show);
+    if (compactReader.matches && !files.hidden) setPanel(source, sourceToggle, false);
+  });
+  sourceToggle.addEventListener('click', () => {
+    if (focusMode) setFocus(false);
+    setPanel(source, sourceToggle, source.hidden);
+    if (compactReader.matches && !source.hidden) setPanel(files, filesToggle, false);
+  });
+  focusToggle.addEventListener('click', () => setFocus(!focusMode));
+  readerSurface.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    if (focusMode) { setFocus(false); focusToggle.focus(); }
+    else if (!source.hidden) { setPanel(source, sourceToggle, false); sourceToggle.focus(); }
+    else if (compactReader.matches && !files.hidden) { setPanel(files, filesToggle, false); filesToggle.focus(); }
+  });
+  compactReader.addEventListener('change', () => { if (!focusMode) setPanel(files, filesToggle, !compactReader.matches); });
+}

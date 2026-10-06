@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { assertRecoveryWritable } from '../recovery-write-guard.js';
 
 function json(value) {
   return JSON.stringify(value);
@@ -56,6 +57,7 @@ export class ProjectRepository {
   }
 
   update(projectId, { name, currentPath, aliases, status, reason, updatedAt }) {
+    assertRecoveryWritable(this.db, { projectId });
     return this.transaction(() => {
       const project = this.get(projectId);
       if (currentPath !== project.current_path) {
@@ -85,7 +87,33 @@ export class ProjectRepository {
     });
   }
 
+  renameName({ projectId, name, expectedName, expectedUpdatedAt, updatedAt }) {
+    assertRecoveryWritable(this.db, { projectId });
+    return this.transaction(() => {
+      const project = this.get(projectId);
+      if (project.name !== expectedName || project.updated_at !== expectedUpdatedAt) {
+        const error = new Error('Project changed after the rename preview; review the current name again.');
+        error.code = 'ATLAS_STATE_CONFLICT';
+        throw error;
+      }
+      const result = this.db.prepare(`
+        UPDATE projects SET name = ?, updated_at = ?
+        WHERE id = ? AND name = ? AND updated_at = ?
+      `).run(name, updatedAt, projectId, expectedName, expectedUpdatedAt);
+      if (Number(result.changes) !== 1) {
+        const error = new Error('Project changed after the rename preview; review the current name again.');
+        error.code = 'ATLAS_STATE_CONFLICT';
+        throw error;
+      }
+      this.db.prepare(`
+        INSERT OR IGNORE INTO project_aliases(project_id, alias, created_at) VALUES (?, ?, ?)
+      `).run(projectId, expectedName, updatedAt);
+      return this.getDetail(projectId);
+    });
+  }
+
   merge(sourceIds, targetId, effectiveAt) {
+    for (const projectId of new Set([...sourceIds, targetId])) assertRecoveryWritable(this.db, { projectId });
     return this.transaction(() => {
       this.get(targetId);
       for (const sourceId of sourceIds) {

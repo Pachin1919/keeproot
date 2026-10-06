@@ -196,7 +196,7 @@ test('Home model and view cover fallbacks, change states, and empty-card rules',
   const rendered = renderProjectHomeView({ ...baseArgs, empty_project: false, continue_item: current, other_work: [previous], pinned: [], changes: { state: 'not_checked', items: [] }, recent_results: [] }, { csrfToken: 'x' }); assert.match(rendered, /<h1>P<\/h1>/u); assert.doesNotMatch(rendered, /CURRENT WORK|Continue where you left off/u); assert.match(rendered, /PREVIOUS WORK/u); assert.match(rendered, /Continue work/u); assert.match(rendered, /Resources/u); assert.match(rendered, /Boards/u); assert.match(rendered, /Reuse/u);
   assert.equal((rendered.match(/class="action-button" href="\/work\/DWT-current"/gu) ?? []).length, 1);
   assert.match(rendered, /<details class="project-home-work-details"><summary>Work details<\/summary>[\s\S]*Recipe 2/u);
-  const localized = renderProjectHomeView({ ...baseArgs, continue_item: { ...current, position: 'Saved result ready', notice: 'Attention is required' }, pinned: [{ title: 'Input.csv', kind: 'resource', id: 'r', status: 'verified' }], changes: { state: 'not_checked', scope_label: 'Tracked Project Resources', items: [] }, recent_results: [{ title: 'Saved.csv', detail: 'Output matches the verified saved result', kind: 'result', id: 'SAV-1', href: '/saves/SAV-1', status: 'verified' }] }, { locale: 'zh-CN' }); assert.match(localized, /项目主页/u); assert.match(localized, /资源/u); assert.match(localized, /看板/u);
+  const localized = renderProjectHomeView({ ...baseArgs, continue_item: { ...current, position: 'Saved result ready', notice: 'Attention is required' }, pinned: [{ title: 'Input.csv', kind: 'resource', id: 'r', status: 'verified' }], changes: { state: 'not_checked', scope_label: 'Tracked Project Resources', items: [] }, recent_results: [{ title: 'Saved.csv', detail: 'Output matches the verified saved result', kind: 'result', id: 'SAV-1', href: '/saves/SAV-1', status: 'verified' }] }, { locale: 'zh-CN' }); assert.match(localized, /项目主页/u); assert.match(localized, /资源/u); assert.match(localized, /成果与交付/u); assert.match(localized, /href="\/projects\/p\/boards"/u);
   assert.match(localized, /继续工作/u);
   assert.match(localized, /状态: 结果已保存/u); assert.match(localized, /尚未检查/u); assert.match(localized, /Atlas 尚未检查此范围。 已跟踪的项目资源/u); assert.match(localized, /检查已跟踪的资源/u); assert.match(localized, /最近结果/u); assert.match(localized, /输出与已验证的保存结果一致。/u); assert.match(localized, /已验证/u); assert.match(localized, />固定<\/button>/u);
   assert.match(localized, /Attention is required[\s\S]*<details class="project-home-work-details">/u);
@@ -266,4 +266,12 @@ test('Project Home keeps Work Missing actionable while archived ordinary records
   });
   assert.equal(archivedResult.recent_results.length, 0);
   assert.equal(archivedResult.changes.items.length, 0);
+});
+
+
+test('UI refuses Fetch-restricted port 6679 before opening the listener', async (t) => {
+  const f = projectFixture(t);
+  await assert.rejects(async () => {
+    f.server = await startAtlasUiServer({ stateDir: f.stateDir, ...serverServicesFor(f.registry), resourceControl: f.resourceControl, port: 6679 });
+  }, /port 6679.*blocks/u);
 });
