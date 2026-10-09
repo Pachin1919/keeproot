@@ -92,6 +92,7 @@ const NAV_ICON_SVG = Object.freeze({
   rules: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="rules"><path d="M2.5 5l1.25 1.25L6 3.75M2.5 10l1.25 1.25L6 8.75M2.5 15l1.25 1.25L6 13.75M9 5h8M9 10h8M9 15h8"/></svg>',
   activity: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="activity"><path d="M2.75 10h3l1.75-4.25 3 8.5 1.75-4.25h5.5"/><path d="M2.75 3.5v13h14.5"/></svg>',
   import: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="import"><path d="M3 11.25h3l1.25 2h5.5l1.25-2h3v4.5H3z"/><path d="M10 3v7M7.5 7.5 10 10l2.5-2.5"/></svg>',
+  toolbox: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true" data-icon="toolbox"><rect x="2.5" y="6" width="15" height="11" rx="1.5"/><path d="M7 6V3h6v3M2.5 10.5h15M8 10v3h4v-3"/></svg>',
   settings: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="settings"><path d="M8.5 2.5h3l.5 2 1.3.8 2-.6 1.5 2.6-1.5 1.5v1.5l1.5 1.5-1.5 2.6-2-.6-1.3.8-.5 2h-3l-.5-2-1.3-.8-2 .6-1.5-2.6 1.5-1.5V8.8L3.2 7.3l1.5-2.6 2 .6L8 4.5z"/><circle cx="10" cy="9.6" r="2.4"/></svg>',
 });
 
@@ -157,6 +158,7 @@ export function renderNav(current, {
         { current: 'Projects', label: t('nav.projects'), icon: 'projects', href: withProjectHint(projectsHref) },
         { current: 'Activity', label: t('nav.activity'), icon: 'activity', href: withProjectHint('/activity') },
         { current: 'Import', label: t('nav.import'), icon: 'import', href: withProjectHint(importHref) },
+        { current: 'Toolbox', label: t('toolbox.title'), icon: 'toolbox', href: withProjectHint('/toolbox') },
         { current: 'Settings', label: t('nav.settings'), icon: 'settings', href: withProjectHint(settingsHref ?? '/settings') },
       ]
     : [{ current: 'Snapshot', label: t('nav.snapshot'), icon: 'activity', href: null }];

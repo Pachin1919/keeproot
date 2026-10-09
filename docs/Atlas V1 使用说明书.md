@@ -44,7 +44,17 @@ Uninstall retains state, demo samples and results. This command does not delete 
 
 ## Reading and appearance
 
-Double-click a supported registered file or select it and click Read. Complex editing is under More → External edit. Focused reading hides the side panels. Settings offers local UI/reading fonts, font size, line spacing and application scale from 85% to 125%. Saving exits Settings and returns to the originating page.
+Double-click a supported registered file or select it and click Read. Markdown and text have an Edit text action in the same reading workspace; table materials have Process and analyse table. Complex editing is under More → External edit. Focused reading hides the side panels. Settings offers local UI/reading fonts, font size, line spacing and application scale from 85% to 125%. Saving exits Settings and returns to the originating page.
+
+### Toolbox
+
+Open Toolbox in the left navigation. Choose a Project, select registered CSV/XLSX materials, then choose Combine and clean, Group and sum, Pivot table, or Monthly trend. Start new Work or explicitly reuse compatible existing Work. Prepare sources and confirm column alignment; the selected tool's settings open next. Choose fields and a unit label (for example amount or count), save the recipe, preview, then Save to a new result file. Group and sum over the demo's combined result can produce North 120, South 80, total 200. Selecting a tool does not infer fields or silently execute it.
+
+### Edit while reading
+
+For MD/TXT, click Edit text, change the body, then Preview changes. The current file remains unchanged at preview. Save this text applies the displayed version to the same Resource; Undo text edit restores the earlier bytes when no later change conflicts. Cancel does not save the draft; the browser may ask before leaving unsaved text.
+
+This editor accepts UTF-8 files up to 256 KiB, including empty text, and preserves the original BOM and uniform LF/CRLF endings. Serialized journal capacity can impose a smaller practical limit. Mixed line endings, links/aliases, identity changes, external edits and pending recovery can block writing. It uses the existing supported Windows transactional writer. PDF/DOCX/image layout editing is external; table processing produces a new result. Prepare AI handoff is a separate action for related Table Work and does not start an AI session or grant account/Hook permissions.
 
 | Material | View and limitations |
 |---|---|

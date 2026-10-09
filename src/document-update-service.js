@@ -93,6 +93,21 @@ function requestKeyId(projectId, caller, requestKey) {
 
 function requestDigest(value) { return sha256(JSON.stringify(value)); }
 
+function manualNewlines(text) {
+  const rest = text.replaceAll('\r\n', '');
+  if (rest.includes('\r') || (text.includes('\r\n') && rest.includes('\n'))) throw conflict('Manual editing refuses mixed newline endings. Normalize them in an external editor first.');
+  return text.includes('\r\n') ? 'crlf' : 'lf';
+}
+
+function manualBody(text, policy, hasBom) {
+  if (typeof text !== 'string' || text.startsWith('\uFEFF') || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(text)) throw conflict('Manual editor text must be BOM-free valid UTF-8 text.');
+  manualNewlines(text);
+  const normalized = text.replaceAll('\r\n', '\n');
+  const raw = (hasBom ? '\uFEFF' : '') + (policy === 'crlf' ? normalized.replaceAll('\n', '\r\n') : normalized);
+  if (Buffer.byteLength(raw, 'utf8') > MAX_MARKDOWN_BYTES) throw conflict('Manual output exceeds the text file byte limit.');
+  return raw;
+}
+
 export class DocumentUpdateService {
   constructor({ stateDir, registry, resourceControl, saveService, writer = documentUpdateWrite, operationHook = () => {} }) {
     if (!stateDir || !registry || !resourceControl || !saveService) {
@@ -239,7 +254,11 @@ export class DocumentUpdateService {
     return {resource_id:l.resource_id,location_id:l.id,project_id:l.project_id,path:path.resolve(l.path),file_identity:{dev:String(stat.dev),ino:String(stat.ino)}};
   }
 
-  #typedSource(projectId,source) {
+  #typedSource(projectId,source,{allowManual=false}={}) {
+    if(source.kind==='manual_edit') {
+      if(!allowManual || source.origin!=='manual_editor' || Object.keys(source).length!==2 || Object.keys(source).some(key=>!['kind','origin'].includes(key)))throw conflict('Manual source requires an exact manual-editor source paired with a whole-text preview.');
+      return source;
+    }
     if(!source.kind)return this.#source(projectId,source.save_id);
     const basis=this.#basis(source);const project=this.registry.show(projectId);
     if(project.project.status!=='active'||project.location?.root_id!==basis.root_id||path.resolve(project.location.root_path)!==basis.root_path)throw conflict('Selected document must belong to an active Project in the movement Root.');
@@ -248,8 +267,8 @@ export class DocumentUpdateService {
     return source;
   }
 
-  #checkSource(projectId,source) {
-    const current=this.#typedSource(projectId,source);
+  #checkSource(projectId,source,options={}) {
+    const current=this.#typedSource(projectId,source,options);
     if(requestDigest(current)!==requestDigest(source))throw conflict('Document Update source changed.');
   }
 
@@ -291,7 +310,123 @@ export class DocumentUpdateService {
     };
   }
 
+  #manualGuards(projectId, resourceId, ownUpdateId = null) {
+    assertRecoveryWritable(this.registry.ledger.db, { projectId, resourceId });
+    const directory = this.#storeDirectory();
+    const files = fs.readdirSync(directory).filter(name => !name.endsWith('.tmp'));
+    if (files.length > 10000) throw conflict('Document Update pending inspection exceeds its record limit.');
+    let total = 0;
+    for (const file of files) {
+      if (!/^UPD-[a-f0-9]{32}\.json$/u.test(file)) throw conflict('Document Update journal contains an unknown record.');
+      total += fs.lstatSync(path.join(directory,file)).size;
+      if (total > 32 * 1024 * 1024) throw conflict('Document Update pending inspection exceeds its byte limit.');
+      const row = this.#readRecord(file.slice(0,-5));
+      if (row.update_id !== ownUpdateId && (row.project_id === projectId || row.resource_id === resourceId || row.source?.affected_project_ids?.includes(projectId)) && (row.pending || row.status === 'pending_recovery')) throw conflict('Recover the pending text update before manual editing.');
+    }
+  }
+
+  #manualResource(projectId, resourceId, expectedFileId = null) {
+    const current = this.#resource(projectId, resourceId);
+    const db = this.registry.ledger.db;
+    const locations = db.prepare("SELECT id,path FROM resource_locations WHERE resource_id=? AND status='active'").all(resourceId);
+    const aliases = db.prepare(`SELECT id FROM resource_locations WHERE status='active' AND ${process.platform === 'win32' ? 'lower(path)=lower(?)' : 'path=?'}`).all(current.path);
+    if (locations.length !== 1 || aliases.length !== 1 || aliases[0].id !== current.location_id || fs.lstatSync(current.path).nlink !== 1) throw conflict('Manual editing requires one global active Resource location without aliases or hard links.');
+    const newline = manualNewlines(current.text);
+    const inspected = this.writer({ mode: 'inspect', root: current.root_path, target: current.path, expectedSha256: current.sha256, ...(expectedFileId ? { expectedFileId } : {}) });
+    if (inspected.sha256 !== current.sha256 || inspected.bytes !== current.bytes || inspected.text !== (current.has_bom ? '\uFEFF' : '') + current.text || !inspected.file_id) throw conflict('Manual text identity or bytes changed during inspection.');
+    const rootStat=fs.lstatSync(current.root_path,{bigint:true});
+    return { ...current, file_id: inspected.file_id, newline_policy: newline, raw_text: inspected.text,
+      root_id:this.registry.show(projectId).location.root_id, root_identity:`${rootStat.dev}:${rootStat.ino}` };
+  }
+
+  #manualCapacity(record) {
+    const check = value => { if (Buffer.byteLength(`${JSON.stringify(value,null,2)}\n`,'utf8') > MAX_STATE_BYTES) throw conflict('Manual serialized preview, decision or recovery state exceeds its storage limit.'); };
+    check(record);
+    const projected = structuredClone(record);
+    projected.decision ??= { kind: 'accept-suggestion', decided_at: new Date().toISOString(), based_on_revision: record.revision, current_sha256: record.baseline.sha256, candidate: record.proposed };
+    projected.manual_confirmation ??= { key: '0'.repeat(32), digest: '0'.repeat(64), preview_revision: record.revision };
+    check(projected);
+    const pending = { kind: 'execute', operation_id: `RACT-${crypto.randomUUID()}`, key: '0'.repeat(32), digest: '0'.repeat(64), target: record.resource.path, root: record.resource.root_path, file_id: record.resource.file_id, before: record.baseline, after: record.proposed, caller: record.caller, created_at: new Date().toISOString() };
+    projected.operation_requests ??= {}; projected.operation_requests[pending.key] = { digest: pending.digest, operation_id: pending.operation_id, status: 'pending' };
+    projected.pending = pending; projected.status = 'pending_recovery'; projected.revision += 2; check(projected);
+    projected.execution = { operation_id: pending.operation_id, file_id: pending.file_id, before: pending.before, after: pending.after };
+    projected.pending = null; projected.status = 'applied'; projected.revision++;
+    projected.operation_requests[pending.key] = { ...projected.operation_requests[pending.key], status: 'applied', receipt: { ...pending, before: undefined, after: undefined, before_sha256: pending.before.sha256, after_sha256: pending.after.sha256, before_bytes: pending.before.bytes, after_bytes: pending.after.bytes } }; check(projected);
+    // Retain enough room for exact-byte Undo's pending before/after journal too.
+    projected.pending = { ...pending, kind: 'undo', before: pending.after, after: pending.before }; check(projected);
+  }
+
+  inspectManual({ projectId, resourceId }) {
+    this.#manualGuards(projectId, resourceId);
+    const current = this.#manualResource(projectId, resourceId);
+    return { project_id: projectId, resource_id: resourceId, relative_path: current.relative_path,
+      baseline: { sha256: current.sha256, bytes: current.bytes, text: current.text },
+      limits: { text_bytes: MAX_MARKDOWN_BYTES, markdown_bytes: MAX_MARKDOWN_BYTES, block_utf8_bytes: MAX_BLOCK_BYTES },
+      editing: { supported: true, max_utf8_bytes: MAX_MARKDOWN_BYTES, has_bom: current.has_bom, newline_policy: current.newline_policy },
+      identity: { location_id: current.location_id, file_id: current.file_id }, references: this.#references(projectId,resourceId) };
+  }
+
+  prepareManual(input) {
+    if(!input || typeof input!=='object' || Array.isArray(input) || Object.keys(input).some(key=>!['projectId','resourceId','expectedSha256','expectedFileId','text','requestKey','caller'].includes(key)))throw conflict('Manual preview accepts only inspected identity, full text and caller fields; source and patch are assigned by Atlas.');
+    const { projectId,resourceId,expectedSha256,expectedFileId,text,requestKey,caller }=input;
+    const normalizedCaller = validateCaller(caller,requestKey);
+    if(normalizedCaller.tool.length>128 || normalizedCaller.client_run_id.length>128 || requestKey.length>256)throw conflict('Manual caller and request key exceed their metadata limits.');
+    if (!/^[a-f0-9]{64}$/u.test(expectedSha256 ?? '') || typeof expectedFileId !== 'string' || !expectedFileId || expectedFileId.length > 128 || typeof text !== 'string') throw conflict('Manual preview requires the inspected Hash, file identity and full text.');
+    if(Buffer.byteLength(text,'utf8')>MAX_MARKDOWN_BYTES)throw conflict(`Manual draft exceeds the ${MAX_MARKDOWN_BYTES} UTF-8 byte limit.`);
+    const payload = requestDigest({ projectId,resourceId,expectedSha256,expectedFileId,text });
+    const updateId = `UPD-${requestKeyId(projectId,normalizedCaller,requestKey.trim())}`;
+    this.#storeDirectory();
+    return withStateLock(this.stateDir, () => {
+      if (fs.existsSync(this.#stateFile(updateId))) {
+        const existing = this.#readRecord(updateId);
+        if (existing.source?.kind !== 'manual_edit' || existing.request_digest !== payload) throw conflict('Manual preview request key was used for different facts.');
+        return this.show(updateId,{projectId});
+      }
+      this.#manualGuards(projectId,resourceId);
+      const current = this.#manualResource(projectId,resourceId,expectedFileId);
+      if (current.sha256 !== expectedSha256) throw conflict('Manual text changed after inspection; reload and compare the draft.');
+      const raw = manualBody(text,current.newline_policy,current.has_bom);
+      if (raw === current.raw_text) return { status:'no_change',project_id:projectId,resource_id:resourceId,sha256:current.sha256,current:{sha256:current.sha256} };
+      const at = new Date().toISOString();
+      const record = { schema:'atlas.document-update.v1', update_id:updateId, project_id:projectId, resource_id:resourceId, revision:1, status:'preview_ready', created_at:at, updated_at:at, caller:normalizedCaller, request_key:requestKey.trim(), request_digest:payload,
+        resource:{relative_path:current.relative_path,location_id:current.location_id,path:current.path,root_path:current.root_path,file_id:current.file_id,root_id:current.root_id,root_identity:current.root_identity},
+        source:{kind:'manual_edit',origin:'manual_editor'}, editing:{has_bom:current.has_bom,newline_policy:current.newline_policy},
+        baseline:{sha256:current.sha256,bytes:current.bytes,text:current.raw_text}, patch:{kind:'whole_text'},
+        proposed:{sha256:sha256(Buffer.from(raw,'utf8')),bytes:Buffer.byteLength(raw,'utf8'),text:raw}, prepared_current:{sha256:current.sha256,bytes:current.bytes}, decision:null,decision_requests:{} };
+      this.#manualCapacity(record); this.#writeRecord(updateId,record,{create:true}); return this.#present(record,current);
+    });
+  }
+
+  confirmManual(updateId,options) {
+    if(!options || typeof options!=='object' || Array.isArray(options) || Object.keys(options).some(key=>!['projectId','expectedRevision','expectedCurrentSha256','expectedProposedSha256','requestKey','caller'].includes(key)))throw conflict('Manual confirmation accepts only displayed revision, Hash and caller fields.');
+    const { projectId,expectedRevision,expectedCurrentSha256,expectedProposedSha256,requestKey,caller }=options;
+    const normalizedCaller = validateCaller(caller,requestKey);
+    if(normalizedCaller.tool.length>128 || normalizedCaller.client_run_id.length>128 || requestKey.length>256)throw conflict('Manual caller and request key exceed their metadata limits.');
+    const key = requestKeyId(projectId,normalizedCaller,requestKey.trim());
+    const digest = requestDigest({ updateId,projectId,expectedRevision,expectedCurrentSha256,expectedProposedSha256 });
+    return withStateLock(this.stateDir,()=>{
+      const record = this.#readRecord(updateId);
+      if(record.project_id!==projectId || record.source?.kind!=='manual_edit' || record.patch.kind!=='whole_text')throw conflict('Manual confirmation requires its Project manual preview.');
+      this.#checkSource(projectId,record.source,{allowManual:true});
+      if(record.manual_confirmation){
+        if(record.manual_confirmation.key!==key || record.manual_confirmation.digest!==digest)throw conflict('Manual confirmation facts or request key changed; reload the preview.');
+        if(record.pending)return this.show(updateId,{projectId});
+        if(record.status==='applied'||record.status==='undone')return this.show(updateId,{projectId});
+        throw conflict('Manual confirmation was not applied. Create a new preview; no write is retried.');
+      }
+      if(record.pending || record.revision!==expectedRevision || record.status!=='preview_ready' || record.baseline.sha256!==expectedCurrentSha256 || record.proposed.sha256!==expectedProposedSha256)throw conflict('Manual preview revision or displayed Hash changed; reload before Save.');
+      this.#manualGuards(projectId,record.resource_id,updateId);
+      const current=this.#manualResource(projectId,record.resource_id,record.resource.file_id);
+      if(current.path!==record.resource.path || current.root_path!==record.resource.root_path || current.location_id!==record.resource.location_id || current.root_id!==record.resource.root_id || current.root_identity!==record.resource.root_identity || current.sha256!==expectedCurrentSha256)throw conflict('Manual Resource location, identity or current text changed.');
+      record.manual_confirmation={key,digest,preview_revision:expectedRevision};
+      record.decision={kind:'accept-suggestion',decided_at:new Date().toISOString(),based_on_revision:expectedRevision,current_sha256:current.sha256,candidate:record.proposed};
+      record.revision++; record.updated_at=new Date().toISOString(); this.#manualCapacity(record); this.#writeRecord(updateId,record);
+      return this.#mutateLocked('execute',updateId,{projectId,expectedRevision:record.revision,expectedCurrentSha256,expectedFileId:record.resource.file_id,requestKey,caller:normalizedCaller,manualConfirmed:true});
+    });
+  }
+
   prepare(input) {
+    if(input.source?.kind==='manual_edit' || input.patch?.kind==='whole_text')throw conflict('Manual whole-text previews require prepareManual.');
     if(input.source)return this.#prepareLinks(input);
     if(input.patch?.kind==='link_repair')throw conflict('Link repair requires a movement source.');
     const { projectId, resourceId, expectedSha256, oldText, newText, sourceSaveId, requestKey, caller }=input;
@@ -355,21 +490,21 @@ export class DocumentUpdateService {
     const conflictInfo = !current
       ? { kind: 'resource_unavailable', reason: 'The current text Resource is unavailable.' }
       : current.sha256 === expectedHash ? null
-        : ['append','link_repair'].includes(record.patch.kind) ? { kind: 'independent_change', reason: 'The text changed after the preview; review the current text before deciding.' }
+        : ['append','link_repair','whole_text'].includes(record.patch.kind) ? { kind: 'independent_change', reason: 'The text changed after the preview; review the current text before deciding.' }
           : occurrences(current.text, record.patch.old_text) === 1
             ? { kind: 'independent_change', reason: 'The current text changed outside the selected block; review all three versions.' }
             : occurrences(current.text, record.patch.old_text) === 0
               ? { kind: 'block_changed_or_missing', reason: 'The selected old block changed or is missing in the current text.' }
               : { kind: 'block_ambiguous', reason: 'The selected old block is no longer unique in the current text.' };
-    let sourceInfo={};if(record.source.kind){try{this.#checkSource(record.project_id,record.source);sourceInfo={source_status:'current',source_conflict:null};}catch(error){sourceInfo={source_status:/unavailable|ENOENT|no such|not found/iu.test(error.message)?'unavailable':'changed',source_conflict:{reason:String(error.message).slice(0,500)}};}}
+    let sourceInfo={};if(record.source.kind){try{this.#checkSource(record.project_id,record.source,{allowManual:record.patch.kind==='whole_text'});sourceInfo={source_status:'current',source_conflict:null};}catch(error){sourceInfo={source_status:/unavailable|ENOENT|no such|not found/iu.test(error.message)?'unavailable':'changed',source_conflict:{reason:String(error.message).slice(0,500)}};}}
     return {
       update_id: record.update_id, project_id: record.project_id, resource_id: record.resource_id,
       revision: record.revision, status: record.pending ? 'pending_recovery' : conflictInfo ? 'conflict' : record.status,
       resource: record.resource, source: record.source, ...sourceInfo,
-      baseline: record.baseline, proposed: record.proposed,
+      baseline: this.#editorFact(record,record.baseline), proposed: this.#editorFact(record,record.proposed),
       current: current ? { sha256: current.sha256, bytes: current.bytes, text: current.text } : null,
       conflict: conflictInfo, decision: record.decision,
-      candidate: record.decision?.candidate ?? null,
+      candidate: record.decision?.candidate ? this.#editorFact(record,record.decision.candidate) : null,
       pending: record.pending ? { operation_id: record.pending.operation_id, kind: record.pending.kind } : null,
       execution: record.execution ?? null, recovery: record.recovery ?? null,
       change: this.#change(record, current),
@@ -378,12 +513,14 @@ export class DocumentUpdateService {
     };
   }
 
+  #editorFact(record,fact) { return record.patch.kind==='whole_text' && record.editing?.has_bom ? {...fact,text:fact.text.replace(/^\uFEFF/u,'')} : fact; }
+
   show(updateId, { projectId }) {
     const record = this.#readRecord(updateId);
     if (record.project_id !== projectId) throw conflict('Document Update does not belong to this Project.');
     let current = null;
     try {
-      const snapshot = this.#resource(projectId, record.resource_id);
+      const snapshot = record.patch.kind==='whole_text' ? this.#manualResource(projectId,record.resource_id,record.resource.file_id) : this.#resource(projectId, record.resource_id);
       if (snapshot.location_id !== record.resource.location_id || snapshot.relative_path !== record.resource.relative_path) {
         throw conflict('The Resource location changed after this Document Update was prepared.');
       }
@@ -405,6 +542,7 @@ export class DocumentUpdateService {
     return withStateLock(this.stateDir, () => {
       const record = this.#readRecord(updateId);
       if (record.project_id !== projectId) throw conflict('Document Update does not belong to this Project.');
+      if(record.patch.kind==='whole_text')throw conflict('Whole-text manual edits require confirmManual, not block decisions.');
       if(record.patch.kind==='link_repair'&&decision==='revise')throw conflict('Link repair accepts only keep-current or accept-suggestion.');
       if(decision!=='keep-current'||!record.source.kind)this.#checkSource(projectId,record.source);
       if (record.pending || ['applied', 'undone'].includes(record.status)) throw conflict('This Document Update requires recovery or a new preview before another decision.');
@@ -513,6 +651,7 @@ export class DocumentUpdateService {
   }
 
   #change(record, current) {
+    if(record.patch.kind==='whole_text')return {kind:'whole_text',origin:'manual_editor',decision:record.decision?.kind??null};
     if(record.patch.kind==='link_repair')return {kind:'link_repair',edits:record.patch.edits,skipped:record.patch.skipped,decision:record.decision?.kind??null};
     let confirmed = record.decision?.kind === 'accept-suggestion' ? record.patch.suggested_text
       : record.decision?.kind === 'revise' ? record.decision.revised_text ?? null : null;
@@ -541,15 +680,22 @@ export class DocumentUpdateService {
 
   #bound(record, projectId, { requireSource = true } = {}) {
     if (record.project_id !== projectId) throw conflict('Document Update does not belong to this Project.');
+    if((record.source?.kind==='manual_edit')!==(record.patch.kind==='whole_text'))throw conflict('Manual source and whole-text patch must be paired.');
     assertRecoveryWritable(this.resourceControl.ledger.db, { projectId, resourceId: record.resource_id });
     const current = this.#resource(projectId, record.resource_id);
+    if(record.patch.kind==='whole_text') {
+      this.#checkSource(projectId,record.source,{allowManual:true});
+      this.#manualGuards(projectId,record.resource_id,record.update_id);
+      const manual=this.#manualResource(projectId,record.resource_id,record.resource.file_id);
+      if(manual.root_id!==record.resource.root_id || manual.root_identity!==record.resource.root_identity)throw conflict('Manual Resource Root identity changed.');
+    }
     if (current.location_id !== record.resource.location_id || current.relative_path !== record.resource.relative_path
       || record.resource.path && current.path !== record.resource.path
       || record.resource.root_path && current.root_path !== record.resource.root_path) {
       throw conflict('Document Update Resource location or root changed.');
     }
     if (requireSource) {
-      this.#checkSource(projectId,record.source);
+      this.#checkSource(projectId,record.source,{allowManual:record.patch.kind==='whole_text'});
     }
     return current;
   }
@@ -569,6 +715,12 @@ export class DocumentUpdateService {
         } });
     });
     this.operationHook('after-ledger', { operation_id: pending.operation_id });
+    Object.assign(record,this.#finalRecord(record,pending));
+    this.#writeRecord(record.update_id, record);
+  }
+
+  #finalRecord(input,pending) {
+    const record=structuredClone(input);
     if (pending.kind === 'execute') record.execution = {
       operation_id: pending.operation_id, file_id: pending.file_id, before: pending.before, after: pending.after,
     };
@@ -580,19 +732,20 @@ export class DocumentUpdateService {
       before_bytes: pending.before.bytes, after_bytes: pending.after.bytes, file_id: pending.file_id,
     };
     record.pending = null; record.revision += 1; record.updated_at = new Date().toISOString();
-    this.#writeRecord(record.update_id, record);
+    return record;
   }
 
   #mutate(kind, updateId, { projectId, expectedRevision, expectedCurrentSha256, requestKey, caller }) {
     return withStateLock(this.stateDir, () => this.#mutateLocked(kind, updateId, { projectId, expectedRevision, expectedCurrentSha256, requestKey, caller }));
   }
 
-  #mutateLocked(kind, updateId, { projectId, expectedRevision, expectedCurrentSha256, requestKey, caller, expectedFileId = null }) {
+  #mutateLocked(kind, updateId, { projectId, expectedRevision, expectedCurrentSha256, requestKey, caller, expectedFileId = null, manualConfirmed = false }) {
     const normalizedCaller = validateCaller(caller, requestKey);
     const key = requestKeyId(projectId, normalizedCaller, requestKey.trim());
     const digest = requestDigest({ kind, updateId, projectId, expectedRevision, expectedCurrentSha256 });
       const record = this.#readRecord(updateId);
       if (record.project_id !== projectId) throw conflict('Document Update does not belong to this Project.');
+      if(record.patch.kind==='whole_text' && kind==='execute' && !manualConfirmed)throw conflict('Manual whole-text Save requires confirmManual.');
       const previous = record.operation_requests?.[key];
       if (previous) {
         if (previous.digest !== digest) throw conflict('This Document Update operation key was used for different facts.');
@@ -622,6 +775,9 @@ export class DocumentUpdateService {
       record.resource.path = current.path; record.resource.root_path = current.root_path;
       record.operation_requests ??= {}; record.operation_requests[key] = { digest, operation_id: pending.operation_id, status: 'pending' };
       record.pending = pending; record.status = 'pending_recovery'; record.revision += 1;
+      if(record.patch.kind==='whole_text') {
+        for(const value of [record,this.#finalRecord(record,pending)])if(Buffer.byteLength(`${JSON.stringify(value,null,2)}\n`,'utf8')>MAX_STATE_BYTES)throw conflict('Manual pending or final serialized state exceeds its storage limit.');
+      }
       this.#writeRecord(updateId, record);
       this.operationHook('before-write', { operation_id: pending.operation_id });
       const result = this.writer({ mode: 'replace', root: pending.root, target: pending.target,
@@ -716,7 +872,7 @@ export class DocumentUpdateService {
     const entries = [];
     for (const file of files) {
       const record = this.#readRecord(file.slice(0, -5));
-      if (record.project_id !== projectId || record.pending || record.status !== 'preview_ready' || !['accept-suggestion', 'revise'].includes(record.decision?.kind)) continue;
+      if (record.patch.kind==='whole_text' || record.project_id !== projectId || record.pending || record.status !== 'preview_ready' || !['accept-suggestion', 'revise'].includes(record.decision?.kind)) continue;
       let shown;
       try { shown = this.show(record.update_id, { projectId }); } catch { continue; }
       if (shown.current?.sha256 !== record.decision.current_sha256) continue;
@@ -749,6 +905,7 @@ export class DocumentUpdateService {
       const manifest = selections.map(selection => {
         const updateId = selection.updateId;
         const record = this.#readRecord(updateId);
+        if(record.patch.kind==='whole_text')throw conflict('Manual whole-text edits cannot enter batch execution.');
         if (record.pending || record.status !== 'preview_ready' || !['accept-suggestion', 'revise'].includes(record.decision?.kind)) throw conflict('Only accepted or revised current suggestions can enter a batch.');
         if (record.revision !== selection.expectedRevision || record.decision.current_sha256 !== selection.expectedCurrentSha256
           || record.decision.candidate.sha256 !== selection.expectedCandidateSha256) throw conflict('The displayed batch selection changed; review the current suggestions again.');

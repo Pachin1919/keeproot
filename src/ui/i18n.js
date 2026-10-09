@@ -3,6 +3,7 @@ import { WORK_MESSAGES } from './work-messages.js';
 import { RESOURCE_MESSAGES } from './resource-messages.js';
 import { SETTINGS_MESSAGES } from './settings-messages.js';
 import { FILE_WORK_MESSAGES } from './file-work-messages.js';
+import { TOOLBOX_MESSAGES } from './toolbox-messages.js';
 import { WORKSPACE_MESSAGES } from './workspace-messages.js';
 // UI chrome only. Do not pass Project names, file names, IDs, protocol values, or user content to this dictionary.
 export const UI_LOCALES = Object.freeze(['en', 'zh-CN']);
@@ -237,6 +238,7 @@ const MESSAGES = Object.freeze({
     ...SETTINGS_MESSAGES.en,
     ...FILE_WORK_MESSAGES.en,
     ...WORKSPACE_MESSAGES.en,
+    ...TOOLBOX_MESSAGES.en,
     'resources.relink_preview_title': 'Review same-Project relink',
     'resources.relink_preview_help': 'Confirm only when the selected file has the same SHA-256 as the missing Resource version.',
     'resources.relink_old_path': 'Recorded missing path',
@@ -1477,6 +1479,7 @@ const MESSAGES = Object.freeze({
     ...SETTINGS_MESSAGES['zh-CN'],
     ...FILE_WORK_MESSAGES['zh-CN'],
     ...WORKSPACE_MESSAGES['zh-CN'],
+    ...TOOLBOX_MESSAGES['zh-CN'],
     'resources.relink_preview_title': '核对同项目重新定位',
     'resources.relink_preview_help': '仅当所选文件的 SHA-256 与缺失资源最后记录的版本相同时确认。',
     'resources.relink_old_path': '原缺失路径',
