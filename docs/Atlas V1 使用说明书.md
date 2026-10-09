@@ -16,6 +16,14 @@ Open the local address printed by the terminal. If the page is English, choose S
 
 The prepared sample contains two fictional CSV sources and a stored recipe. Save a new filename in `02_成果`, then read the result. It contains three values: 100, 80 and 20. Their arithmetic sum is 200; the recipe does not create a total row. Sources and earlier results are retained. Default filename format switching replaces the known extension rather than appending a second one.
 
+## Try a simple analysis
+
+The prepared sample demonstrates combining and deduplicating, so it does not show an analysis summary by default. In Table Work, reuse the sample work to create a separate work, retain its column alignment and `id` deduplication, then choose grouped sum in the processing recipe. Use `region` as the dimension, `amount` as the measure, `sum` as the formula and an explicit unit. Set Sort field to No sort because `id` is not part of the grouped output. Save Recipe, then Preview before saving a new filename.
+
+For the sample's three retained rows, the expected grouped result is North/北区 **120**, South/南区 **80**, total **200**. Empty-value exclusion and the number of included/excluded rows are shown with the result. Pivot and monthly trend have their own recipe controls and need the corresponding category/date columns; the prepared sample has no date column, so it cannot demonstrate monthly trend.
+
+Changing the recipe changes a Work revision. The preview is not the saved result; save and read the new CSV/XLSX to check the delivered file. See [implemented operations and limits](<./Atlas 技术作品与企业评审说明.md#python-processing>) before asking a Host to run an analysis.
+
 ## Stop, reopen, upgrade and uninstall
 
 Ctrl+C stops the HTML server. Reopen the same sample:

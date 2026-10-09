@@ -9,7 +9,8 @@ Current version: **2.0.0-preview.1**. This is preview source, not a stable relea
 ## What you can try
 
 - Browse and read Markdown, text, images, PDF, DOCX and CSV/XLSX in the workspace.
-- Combine table sources, preview a saved processing recipe and save a new verified result.
+- Run a Python table-processing recipe: align columns, combine sources, filter, convert types, deduplicate and sort; preview and save the full result.
+- Calculate grouped sums, two-axis pivot totals/shares/ranks, and monthly totals with period growth. [Processing implementation and limits](<docs/Atlas 技术作品与企业评审说明.md#python-processing>).
 - Reuse a work configuration with explicitly selected new sources; review source changes.
 - Follow recorded source/result relationships, compose a Board and export supported content.
 - Capture supported public pages or selected conversation exports; review local updates.

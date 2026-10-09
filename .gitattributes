@@ -1,0 +1,4 @@
+# Exclude bundled upstream implementations from GitHub language statistics.
+# Project-authored Runtime, processing and test code keep their actual language.
+assets/pdfjs/** linguist-vendored
+src/vendor/markdown-it/** linguist-vendored
