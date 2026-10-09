@@ -161,6 +161,29 @@ class DesktopBridge:
         return {"ready": bool(self._window and self.registration_url and self.token)}
 
 
+def _configure_native_zoom(window: object) -> None:
+    """Keep WebView2 at 100%; the UI supplies the bounded display scale.
+
+    pywebview 6.2.1 enables WebView2 zoom even when zoomable=False. Its
+    documented native.webview access lets us set the actual engine policy.
+    Window events run on worker threads, so native changes use Invoke.
+    """
+    native = window.native
+
+    def apply() -> None:
+        view = native.webview
+        if view.CoreWebView2 is None:
+            raise RuntimeError("WebView2 is not ready for the display scale policy.")
+        view.CoreWebView2.Settings.IsZoomControlEnabled = False
+        view.ZoomFactor = 1.0
+
+    if native.InvokeRequired:
+        from System import Action
+        native.Invoke(Action(apply))
+    else:
+        apply()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if bool(args.picker_registration_url) != bool(args.picker_token):
@@ -181,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
         resizable=True,
         background_color="#f4f6f5",
         text_select=True,
-        zoomable=True,
+        zoomable=False,
         js_api=bridge,
     )
     bridge._window = window
@@ -190,6 +213,14 @@ def main(argv: list[str] | None = None) -> int:
         print("ATLAS_DESKTOP_UI_READY", flush=True)
 
     window.events.shown += shown
+
+    def loaded() -> None:
+        try:
+            _configure_native_zoom(window)
+        except Exception as error:
+            print(f"ATLAS_DESKTOP_ZOOM_POLICY_ERROR: {error}", file=sys.stderr, flush=True)
+
+    window.events.loaded += loaded
     try:
         webview.start(
             gui="edgechromium",

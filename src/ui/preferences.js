@@ -9,6 +9,10 @@ export const UI_PREFERENCE_DEFAULTS = Object.freeze({
   accent: 'green',
   contrast: 'high',
   text_size: 'comfortable',
+  ui_scale: 100,
+  font_family: 'system',
+  reading_font: 'inherit',
+  reading_spacing: 'comfortable',
   density: 'comfortable',
   project_rail_width: 282,
   app_rail_width: 228,
@@ -22,6 +26,9 @@ const ALLOWED = Object.freeze({
   accent: new Set(['green', 'vermilion', 'amber']),
   contrast: new Set(['standard', 'high']),
   text_size: new Set(['compact', 'comfortable', 'large']),
+  font_family: new Set(['system', 'sans']),
+  reading_font: new Set(['inherit', 'serif', 'mono']),
+  reading_spacing: new Set(['compact', 'comfortable', 'spacious']),
   density: new Set(['compact', 'comfortable']),
   context_card_delay: new Set(['fast', 'normal', 'deliberate']),
 });
@@ -35,12 +42,17 @@ function boundedInteger(value, fallback, minimum, maximum) {
 export function normalizeUiPreferences(input = {}) {
   const defaults = UI_PREFERENCE_DEFAULTS;
   const accent = input.accent === 'blue' ? 'vermilion' : input.accent;
+  const scale = typeof input.ui_scale === 'number' || typeof input.ui_scale === 'string' && /^[+-]?\d+$/u.test(input.ui_scale.trim()) ? Number(input.ui_scale) : NaN;
   return {
     locale: normalizeUiLocale(input.locale),
     theme: ALLOWED.theme.has(input.theme) ? input.theme : defaults.theme,
     accent: ALLOWED.accent.has(accent) ? accent : defaults.accent,
     contrast: ALLOWED.contrast.has(input.contrast) ? input.contrast : defaults.contrast,
     text_size: ALLOWED.text_size.has(input.text_size) ? input.text_size : defaults.text_size,
+    ui_scale: Number.isSafeInteger(scale) ? Math.min(125, Math.max(85, scale)) : defaults.ui_scale,
+    font_family: ALLOWED.font_family.has(input.font_family) ? input.font_family : defaults.font_family,
+    reading_font: ALLOWED.reading_font.has(input.reading_font) ? input.reading_font : defaults.reading_font,
+    reading_spacing: ALLOWED.reading_spacing.has(input.reading_spacing) ? input.reading_spacing : defaults.reading_spacing,
     density: ALLOWED.density.has(input.density) ? input.density : defaults.density,
     project_rail_width: boundedInteger(input.project_rail_width, defaults.project_rail_width, 220, 420),
     app_rail_width: boundedInteger(input.app_rail_width, defaults.app_rail_width, 68, 360),
@@ -91,6 +103,11 @@ export function preferenceHtmlAttributes(preferences) {
     `data-accent="${value.accent}"`,
     `data-contrast="${value.contrast}"`,
     `data-text-size="${value.text_size}"`,
+    `data-ui-scale="${value.ui_scale}"`,
+    `style="--ui-scale:${value.ui_scale / 100}"`,
+    `data-font-family="${value.font_family}"`,
+    `data-reading-font="${value.reading_font}"`,
+    `data-reading-spacing="${value.reading_spacing}"`,
     `data-density="${value.density}"`,
     `data-context-delay="${contextDelay}"`,
     `data-reduce-motion="${value.reduce_motion ? 'true' : 'false'}"`,

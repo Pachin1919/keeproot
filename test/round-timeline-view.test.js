@@ -54,7 +54,7 @@ test('round preview keeps recorded state visible without file changes and names 
   assert.match(translatedError, /你查看期间此回档已发生变化。请重新预览。/u);
   assert.match(translatedError, /Action stopped\. Round revision changed\. Read the current round again\./u);
   const unknownError = renderRoundTimelineView({ ...model(), error: 'Action stopped. Host detail is unavailable.', error_message: 'Host detail is unavailable.' }, { csrfToken: 'csrf', locale: 'zh-CN' });
-  assert.match(unknownError, /Atlas 无法继续此回档。/u);
+  assert.match(unknownError, /Keeproot 无法继续此回档。/u);
   assert.match(unknownError, /Action stopped\. Host detail is unavailable\./u);
 });
 

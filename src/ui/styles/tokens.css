@@ -42,14 +42,27 @@
   --shadow-soft: 0 12px 34px rgb(62 47 28 / 10%);
   --radius-surface: 12px;
   --radius-control: 8px;
-  --font-sans: "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  --font-sans: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI Variable", "Segoe UI", sans-serif;
+  --ui-scale: 1;
+  --viewport-height: calc(100dvh / var(--ui-scale));
+  --viewport-width: calc(100vw / var(--ui-scale));
+  --status-safe: #45694e;
+  --status-safe-soft: #e1eddf;
   --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
   --font-size-base: 16px;
   --font-size-work: 14px;
   --font-size-small: 13px;
   --font-size-micro: 11px;
   --font-size-section: 17px;
+  --reading-font: var(--font-sans);
+  --reading-line-height: 1.75;
 }
+
+html[data-font-family="sans"] { --font-sans: "Microsoft YaHei UI", "Microsoft YaHei", Aptos, Calibri, "Noto Sans CJK SC", sans-serif; }
+html[data-reading-font="serif"] { --reading-font: Georgia, "Noto Serif CJK SC", "Source Han Serif SC", SimSun, serif; }
+html[data-reading-font="mono"] { --reading-font: var(--font-mono); }
+html[data-reading-spacing="compact"] { --reading-line-height: 1.55; }
+html[data-reading-spacing="spacious"] { --reading-line-height: 1.95; }
 
 html[data-theme="graphite"] {
   --canvas: #bdb0b5;
@@ -109,16 +122,16 @@ html[data-theme="warm_charcoal"] {
 }
 html[data-contrast="standard"] { --muted: #81776c; --line: #bbb09f; }
 html[data-accent="vermilion"] {
-  --accent: #b94b38;
-  --accent-strong: #7f3025;
-  --accent-soft: #efd3ca;
-  --accent-line: #b85a47;
+  --accent: #476781;
+  --accent-strong: #2d4b65;
+  --accent-soft: #e2eaf1;
+  --accent-line: #8ca4b8;
 }
 html[data-accent="amber"] {
-  --accent: #b98612;
-  --accent-strong: #765407;
-  --accent-soft: #eee0ad;
-  --accent-line: #ae831f;
+  --accent: #795b79;
+  --accent-strong: #593e5b;
+  --accent-soft: #eee4ee;
+  --accent-line: #b299b4;
 }
 html[data-text-size="compact"] {
   --font-size-base: 14px;

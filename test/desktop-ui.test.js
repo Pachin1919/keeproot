@@ -33,14 +33,16 @@ function fakeDesktopInstallProcess({ failInstall = false } = {}) {
       return { status: 0, stdout: '', stderr: '' };
     }
     if (args[0] === '-m' && args[1] === 'pip') {
+      assert.ok(args.includes('pdfplumber==0.11.10'), 'managed installation must include the existing spatial PDF dependency');
       return failInstall
         ? { status: 1, stdout: '', stderr: 'simulated install failure' }
         : { status: 0, stdout: '', stderr: '' };
     }
     if (args[0] === '-c') {
+      assert.match(args[1], /import pdfplumber/u, 'doctor must verify the spatial PDF runtime');
       return {
         status: 0,
-        stdout: JSON.stringify({ pywebview: '6.2.1', pandas: '3.0.1', pypdf: '6.14.2' }),
+        stdout: JSON.stringify({ pywebview: '6.2.1', pandas: '3.0.1', pypdf: '6.14.2', pdfplumber: '0.11.10' }),
         stderr: '',
       };
     }
@@ -85,8 +87,8 @@ test('Desktop UI install upgrades the managed environment with table dependencie
   });
 
   assert.equal(result.status, 'ready');
-  assert.equal(result.component_version, '0.2.0');
-  assert.deepEqual(result.dependencies, { pywebview: '6.2.1', pandas: '3.0.1', pypdf: '6.14.2' });
+  assert.equal(result.component_version, '0.2.1');
+  assert.deepEqual(result.dependencies, { pywebview: '6.2.1', pandas: '3.0.1', pypdf: '6.14.2', pdfplumber: '0.11.10' });
   assert.equal(fs.readFileSync(path.join(fixture.componentRoot, 'storage', 'window.json'), 'utf8'), 'keep');
   assert.equal(fs.readFileSync(fixture.python, 'utf8'), 'fake-python');
 });
@@ -171,6 +173,7 @@ test('Desktop client checks the requested picker method independently', async ()
     Date,
     HTMLFormElement: FakeForm,
     document: {
+      documentElement: { dataset: {}, style: { getPropertyValue: () => '', getPropertyPriority: () => '' } },
       body: { append: (item) => { processingStatus = item; } },
       createElement: () => ({ className: '', attributes: {}, setAttribute(name, value) { this.attributes[name] = value; } }),
       addEventListener: (name, listener) => { if (name === 'submit') submitListener = listener; },

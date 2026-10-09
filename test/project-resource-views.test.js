@@ -817,7 +817,7 @@ test('Desktop shows and accepts an externally changed image Resource version', a
   fs.writeFileSync(imagePath, Buffer.from('second-image-version'));
   const control = createResourceControl({ stateDir: f.stateDir, ledger: f.registry.ledger }); const server = await startAtlasUiServer({ stateDir: f.stateDir, registry: f.registry, rules: {}, runtime: {}, projectRoot: f.root, installationRoot: f.root, resourceControl: control }); t.after(async () => { await server.close(); control.dispose(); f.service.dispose(); f.registry.dispose(); fs.rmSync(f.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); });
   const base = `${server.workspace_url}projects/${f.a.project_id}`; const page = await (await fetch(`${base}/resources?resource_id=${first.resource_id}`)).text();
-  assert.match(page, /Changed outside Atlas|Changed since Atlas last used it/u); assert.match(page, /Accept current file version/u);
+  assert.match(page, /Changed outside Keeproot|Changed since Keeproot last used it/u); assert.match(page, /Accept current file version/u);
   const csrf = page.match(/name="csrf" value="([a-f0-9]+)"/u)?.[1]; const currentVersion = page.match(/name="expected_current_version" value="([a-f0-9]+)"/u)?.[1]; assert.ok(currentVersion);
   const accepted = await fetch(`${base}/resources/actions/accept-current`, { method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, resource_id: first.resource_id, expected_current_version: currentVersion }) }); assert.equal(accepted.status, 303);
   assert.equal(control.projectResource(f.a.project_id, first.resource_id, { refresh: true }).external_change.status, 'unchanged');

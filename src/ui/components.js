@@ -1,5 +1,6 @@
 
 import { translateUi } from './i18n.js';
+import { UI_BRAND_MARK, UI_DISPLAY_NAME } from './brand.js';
 
 export function escapeHtml(value) {
   return String(value ?? '')
@@ -87,9 +88,11 @@ export function renderUiClientScript(interactive) {
 const NAV_ICON_SVG = Object.freeze({
   projects: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="projects"><path d="M2.75 5.75h5l1.5 1.75h8v8.75H2.75z"/><path d="M2.75 7.5h14.5"/><path d="M6 10.5h2.5M6 13h2.5"/></svg>',
   resources: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="resources"><path d="M5.25 3.25h7l2.5 2.5v10.5H5.25z"/><path d="M12.25 3.25v2.5h2.5M7.5 9h5M7.5 12h5M4 6.5v10.25h8.25"/></svg>',
+  boards: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="boards"><rect x="2.5" y="3" width="15" height="14" rx="1.5"/><path d="M7.5 3v14M12.5 3v14M4.5 6h1M9.5 6h1M14.5 6h1M4.5 9h1M9.5 9h1"/></svg>',
+  rules: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="rules"><path d="M2.5 5l1.25 1.25L6 3.75M2.5 10l1.25 1.25L6 8.75M2.5 15l1.25 1.25L6 13.75M9 5h8M9 10h8M9 15h8"/></svg>',
   activity: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="activity"><path d="M2.75 10h3l1.75-4.25 3 8.5 1.75-4.25h5.5"/><path d="M2.75 3.5v13h14.5"/></svg>',
   import: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="import"><path d="M3 11.25h3l1.25 2h5.5l1.25-2h3v4.5H3z"/><path d="M10 3v7M7.5 7.5 10 10l2.5-2.5"/></svg>',
-  settings: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="settings"><circle cx="10" cy="10" r="2.5"/><path d="M10 3.25v1.5M10 15.25v1.5M16.75 10h-1.5M4.75 10h-1.5M14.77 5.23l-1.06 1.06M6.29 13.71l-1.06 1.06M14.77 14.77l-1.06-1.06M6.29 6.29 5.23 5.23"/></svg>',
+  settings: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="settings"><path d="M8.5 2.5h3l.5 2 1.3.8 2-.6 1.5 2.6-1.5 1.5v1.5l1.5 1.5-1.5 2.6-2-.6-1.3.8-.5 2h-3l-.5-2-1.3-.8-2 .6-1.5-2.6 1.5-1.5V8.8L3.2 7.3l1.5-2.6 2 .6L8 4.5z"/><circle cx="10" cy="9.6" r="2.4"/></svg>',
 });
 
 function renderNavIcon(name) {
@@ -104,16 +107,16 @@ export function renderTopbar({ section, project = null, resource = null, status 
     : `<strong>${escapeHtml(projectName)}</strong>`;
   const context = project
     ? `<span class="topbar-context">${projectLabel}${resource ? `<small>${escapeHtml(resource)}</small>` : ''}</span>`
-    : `<span class="topbar-context"><strong>${escapeHtml(section ?? 'Atlas')}</strong></span>`;
+    : `<span class="topbar-context"><strong>${escapeHtml(section ?? UI_DISPLAY_NAME)}</strong></span>`;
   return `<header class="topbar" data-current-project-id="${escapeHtml(project?.id ?? '')}" data-current-resource-path="${escapeHtml(resource ?? '')}">
-    <div class="topbar-identity"><span class="label">Atlas Desktop</span>${context}</div>
+    <div class="topbar-identity"><span class="label">${UI_DISPLAY_NAME} Desktop</span>${context}</div>
     <button class="topbar-search" type="button" data-overlay-open="atlas-search" aria-haspopup="dialog" aria-label="${escapeHtml(t('topbar.search'))}"><span class="nav-icon" aria-hidden="true">&#xE721;</span><span>${escapeHtml(t('topbar.search'))}</span><kbd>Ctrl K</kbd></button>
     <span class="status status-safe topbar-status">${escapeHtml(status ?? t('topbar.on_device'))}</span>
   </header>
   <dialog class="atlas-overlay search-overlay" id="atlas-search" data-atlas-overlay aria-labelledby="atlas-search-title">
     <div class="overlay-card">
       <div class="overlay-heading"><div><span class="label">${escapeHtml(t('topbar.find_local_work'))}</span><h2 id="atlas-search-title">${escapeHtml(t('topbar.search'))}</h2></div><button class="overlay-close" type="button" data-overlay-close aria-label="${escapeHtml(t('topbar.close_search'))}">×</button></div>
-      <form class="search-form" method="get" action="/search"><label for="atlas-search-query">${escapeHtml(t('topbar.search_label'))}</label><div><input id="atlas-search-query" name="q" type="search" autocomplete="off" required data-overlay-initial-focus><button class="action-button" type="submit">${escapeHtml(t('topbar.search_action'))}</button></div></form>
+      <form class="search-form" method="get" action="/search">${project?.id ? `<input type="hidden" name="project_id" value="${escapeHtml(project.id)}">` : ''}<label for="atlas-search-query">${escapeHtml(t('topbar.search_label'))}</label><div><input id="atlas-search-query" name="q" type="search" autocomplete="off" required data-overlay-initial-focus><button class="action-button" type="submit">${escapeHtml(t('topbar.search_action'))}</button></div></form>
       <p class="muted">${escapeHtml(t('topbar.search_lede'))}</p>
     </div>
   </dialog>`;
@@ -128,52 +131,55 @@ export function renderNav(current, {
   locale = 'en',
   languageCatalog = null,
   projectSection = null,
+  project = null,
+  projectUnavailable = false,
+  projectReturnContext = false,
 } = {}) {
   const t = (key) => translateUi(locale, key, languageCatalog);
   const projectsHref = workspaceHref || '/projects';
-  const projectBase = resourcesHref?.match(/^(\/projects\/[^/?#]+)(?:\/|$)/u)?.[1];
+  const projectBase = project?.id ? `/projects/${encodeURIComponent(project.id)}` : null;
+  const withProjectHint = (href) => {
+    if (!projectBase || !href) return href;
+    const url = new URL(href, 'http://atlas.local');
+    url.searchParams.set('project_id', project.id);
+    return `${url.pathname}${url.search}${url.hash}`;
+  };
   const currentProjectSection = projectSection ?? (current === 'Resources' ? 'materials' : null);
-  const projectNavigation = interactive && projectBase ? `<nav class="project-navigation" aria-label="${escapeHtml(t('workspace.project_navigation'))}"><span class="nav-section-label">${escapeHtml(t('workspace.project_navigation'))}</span><ul class="nav-list">${[
+  const projectNavigation = interactive ? `<nav class="project-navigation" data-project-context="${escapeHtml(project?.id ?? (projectUnavailable ? 'unavailable' : 'none'))}" aria-label="${escapeHtml(t('workspace.project_navigation'))}"><span class="nav-section-label">${escapeHtml(t(projectReturnContext ? 'workspace.return_context' : 'workspace.project_navigation'))}</span>${projectBase ? `<a class="project-nav-name" href="${escapeHtml(projectBase)}" title="${escapeHtml(project.name ?? project.id)}">${escapeHtml(project.name ?? project.id)}</a><a class="project-nav-switch" href="/projects" data-project-switch>${escapeHtml(t('workspace.switch_project'))}</a>` : `<a class="project-nav-switch" href="/projects" data-project-switch>${escapeHtml(t('workspace.choose_project'))}</a><p class="project-nav-help">${escapeHtml(t(projectUnavailable ? 'workspace.project_unavailable' : 'workspace.project_choose_help'))}</p>`}<ul class="nav-list">${[
     ['overview', projectBase, 'projects'],
-    ['materials', resourcesHref, 'resources'],
-    ['results', `${projectBase}/boards`, 'resources'],
+    ['materials', projectBase ? `${projectBase}/resources` : null, 'resources'],
+    ['results', projectBase ? `${projectBase}/boards` : null, 'boards'],
     ['recovery', `${projectBase}/rounds`, 'activity'],
-    ['rules', `${projectBase}/rules`, 'settings'],
-  ].map(([key, href, icon]) => `<li class="nav-item${currentProjectSection === key ? ' is-current-project' : ''}"><a href="${escapeHtml(href)}" title="${escapeHtml(t(`workspace.${key}`))}"${key === 'materials' ? ' data-resources-nav' : ''}${currentProjectSection === key ? ' aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${renderNavIcon(icon)}</span><span class="nav-label">${escapeHtml(t(`workspace.${key}`))}</span></a></li>`).join('')}</ul></nav>` : '';
+    ['rules', `${projectBase}/rules`, 'rules'],
+  ].map(([key, href, icon]) => `<li class="nav-item${projectBase && currentProjectSection === key ? ' is-current-project' : ''}">${projectBase ? `<a href="${escapeHtml(href)}" title="${escapeHtml(t(`workspace.${key}`))}"${key === 'materials' ? ' data-resources-nav' : ''}${currentProjectSection === key ? ' aria-current="page"' : ''}>` : `<span class="nav-link nav-link-disabled" aria-disabled="true" title="${escapeHtml(t('workspace.project_choose_help'))}">`}<span class="nav-icon" aria-hidden="true">${renderNavIcon(icon)}</span><span class="nav-label">${escapeHtml(t(`workspace.${key}`))}</span>${projectBase ? '</a>' : '</span>'}</li>`).join('')}</ul></nav>` : '';
   const items = interactive
     ? [
-        { current: 'Projects', label: t('nav.projects'), icon: 'projects', href: projectsHref },
-        {
-          current: 'Resources', label: t('nav.resources'),
-          icon: 'resources',
-          href: resourcesHref ?? projectsHref,
-          title: resourcesHref ? t('nav.resources') : t('nav.resources_choose_project'),
-        },
-        { current: 'Activity', label: t('nav.activity'), icon: 'activity', href: '/activity' },
-        { current: 'Import', label: t('nav.import'), icon: 'import', href: importHref },
-        ...(settingsHref ? [{ current: 'Settings', label: t('nav.settings'), icon: 'settings', href: settingsHref }] : []),
+        { current: 'Projects', label: t('nav.projects'), icon: 'projects', href: withProjectHint(projectsHref) },
+        { current: 'Activity', label: t('nav.activity'), icon: 'activity', href: withProjectHint('/activity') },
+        { current: 'Import', label: t('nav.import'), icon: 'import', href: withProjectHint(importHref) },
+        { current: 'Settings', label: t('nav.settings'), icon: 'settings', href: withProjectHint(settingsHref ?? '/settings') },
       ]
     : [{ current: 'Snapshot', label: t('nav.snapshot'), icon: 'activity', href: null }];
+  const renderNavItem = (item) => `<li class="nav-item"${item.current === current && !(projectBase && currentProjectSection) ? ' aria-current="page"' : ''}>${item.href
+    ? `<a href="${escapeHtml(item.href)}" title="${escapeHtml(item.title ?? item.label)}"${item.current === 'Settings' ? ' data-settings-nav' : ''}><span class="nav-icon" aria-hidden="true">${renderNavIcon(item.icon)}</span><span class="nav-label">${escapeHtml(item.label)}</span></a>`
+    : `<span class="nav-link nav-link-disabled" aria-disabled="true" title="${escapeHtml(item.label)}"><span class="nav-icon" aria-hidden="true">${renderNavIcon(item.icon)}</span><span class="nav-label">${escapeHtml(item.label)}</span></span>`}</li>`;
   const clientMessages = Object.fromEntries(['resources_title', 'sort_ascending', 'sort_descending', 'close_settings_confirm', 'choose_folder', 'project', 'file', 'working', 'processing']
     .map((key) => [key, t(`client.${key}`)]));
   return `<aside class="sidebar" id="atlas-primary-nav" data-atlas-primary-nav data-ui-client-messages="${escapeHtml(JSON.stringify(clientMessages))}">
-    <div class="brand"><span class="brand-mark">A</span><span class="brand-copy">Atlas<small>Workspace</small></span></div>
+    <div class="brand"><span class="brand-mark">${UI_BRAND_MARK}</span><span class="brand-copy">${UI_DISPLAY_NAME}<small>Workspace</small></span></div>
     <nav aria-label="${escapeHtml(t('nav.primary'))}">
       <ul class="nav-list">
-        ${items.filter((item) => !projectBase || item.current !== 'Resources').map((item) => (
-    `<li class="nav-item"${item.current === current && !(projectBase && current === 'Projects') ? ' aria-current="page"' : ''}>${item.href
-      ? `<a href="${escapeHtml(item.href)}" title="${escapeHtml(item.title ?? item.label)}"${item.current === 'Resources' ? ' data-resources-nav' : ''}${item.current === 'Settings' ? ' data-settings-nav' : ''}><span class="nav-icon" aria-hidden="true">${renderNavIcon(item.icon)}</span><span class="nav-label">${escapeHtml(item.label)}</span></a>`
-      : `<span class="nav-link nav-link-disabled"${item.current === 'Resources' ? ' data-resources-nav' : ''} aria-disabled="true" title="${escapeHtml(item.current === 'Resources' ? t('nav.resources_choose_project') : item.label)}"><span class="nav-icon" aria-hidden="true">${renderNavIcon(item.icon)}</span><span class="nav-label">${escapeHtml(item.label)}</span></span>`}</li>`
-  )).join('')}
+        ${items.filter((item) => item.current !== 'Settings').map(renderNavItem).join('')}
       </ul>
     </nav>
     ${projectNavigation}
     ${interactive ? `<button class="rail-toggle" type="button" data-toggle-rail data-collapse-label="${escapeHtml(t('nav.collapse'))}" data-expand-label="${escapeHtml(t('nav.expand'))}" aria-label="${escapeHtml(t('nav.collapse'))}" aria-expanded="true"><span aria-hidden="true">‹</span></button>` : ''}
     <div class="sidebar-signature" aria-label="Pachin Studio · Local Workspace">
       <div class="signature-art" aria-hidden="true"><img class="signature-calligraphy" src="/ui/pachin-calligraphy.png" alt=""><img class="signature-seal" src="/ui/pachin-seal.png" alt=""></div>
-      <div class="signature-copy"><strong>PACHIN STUDIO</strong><span>LOCAL WORKSPACE</span></div>
+      <div class="signature-copy"><strong>Pachin Studio</strong></div>
     </div>
     <div class="sidebar-foot">${interactive ? renderStatusGuide(locale, languageCatalog) : ''}<span class="device-state"><span class="status-dot"></span><span class="device-state-copy">${escapeHtml(t('nav.on_device'))}</span></span></div>
+    ${interactive ? `<nav class="sidebar-settings" aria-label="${escapeHtml(t('nav.settings'))}"><ul class="nav-list">${items.filter((item) => item.current === 'Settings').map(renderNavItem).join('')}</ul></nav>` : ''}
   </aside>${interactive ? `<div class="rail-resizer app-rail-resizer" role="separator" aria-label="${escapeHtml(t('nav.resize'))}" aria-orientation="vertical" aria-valuemin="68" aria-valuemax="360" tabindex="0" data-rail="app"></div>` : ''}`;
 }
 

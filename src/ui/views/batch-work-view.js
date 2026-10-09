@@ -1,3 +1,4 @@
+import { UI_DISPLAY_NAME } from '../brand.js';
 import { escapeHtml, renderNav, renderTopbar, renderUiClientScript } from '../components.js';
 import { uiStyles } from '../styles.js';
 import { normalizeUiLocale, translateUi } from '../i18n.js';
@@ -14,7 +15,7 @@ function shell(content, options) {
   const title = translateUi(options.locale, 'import.title', options.languageCatalog);
   const pickerMessages = Object.fromEntries(['picker_unavailable', 'picker_retry', 'picker_add_retry', 'register_failed', 'add_failed']
     .map((key) => [key, translateUi(options.locale, `import.${key}`, options.languageCatalog)]));
-  return `<!doctype html><html lang="${normalizeUiLocale(options.locale)}" ${options.htmlAttributes ?? ''}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Atlas ${escapeHtml(title)}</title><style>${uiStyles()}</style>${renderUiClientScript(true)}</head><body data-import-messages="${escapeHtml(JSON.stringify(pickerMessages))}"><div class="app-shell" style="${escapeHtml(options.railStyle ?? '')}">${renderNav('Import', { interactive: true, workspaceHref: '/projects', settingsHref: options.settingsHref, locale: options.locale, languageCatalog: options.languageCatalog })}<div class="workspace">${renderTopbar({ section: title, locale: options.locale, languageCatalog: options.languageCatalog })}<main class="page">${content}</main></div></div></body></html>`;
+  return `<!doctype html><html lang="${normalizeUiLocale(options.locale)}" ${options.htmlAttributes ?? ''}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${UI_DISPLAY_NAME} ${escapeHtml(title)}</title><style>${uiStyles()}</style>${renderUiClientScript(true)}</head><body data-import-messages="${escapeHtml(JSON.stringify(pickerMessages))}"><div class="app-shell" style="${escapeHtml(options.railStyle ?? '')}">${renderNav('Import', { ...options, project: options.project, interactive: true, workspaceHref: '/projects', settingsHref: options.settingsHref, locale: options.locale, languageCatalog: options.languageCatalog })}<div class="workspace">${renderTopbar({ section: title, locale: options.locale, languageCatalog: options.languageCatalog })}<main class="page">${content}</main></div></div></body></html>`;
 }
 
 function emptySelectionView(model, options = {}) {

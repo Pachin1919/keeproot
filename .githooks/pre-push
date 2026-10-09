@@ -1,0 +1,3 @@
+#!/bin/sh
+# Run locally before any publication; do not print private file contents.
+exec "${ATLAS_PUBLIC_CHECK_PYTHON:-python}" scripts/check-public-source.py

@@ -204,7 +204,7 @@ test('ChatGPT export capture selects one exact conversation, binds input bytes, 
   assert.equal(uiExecute.status, 303);
   const uiSourceDetail = await fetch(new URL(`projects/${encodeURIComponent(project.project_id)}/capture-source/${uiSaveId}`, server.workspace_url));
   assert.equal(uiSourceDetail.status, 200);
-  assert.match(await uiSourceDetail.text(), /<title>ChatGPT export source · Atlas<\/title>/u);
+  assert.match(await uiSourceDetail.text(), /<title>ChatGPT export source · Keeproot<\/title>/u);
   const uiRaw = await fetch(new URL(`projects/${encodeURIComponent(project.project_id)}/capture-source/${uiSaveId}/raw`, server.workspace_url));
   assert.equal(uiRaw.status, 200); assert.match(uiRaw.headers.get('content-type'), /application\/json/u);
   assert.equal(await uiRaw.text(), JSON.stringify(changed));

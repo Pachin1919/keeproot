@@ -27,7 +27,7 @@ test('locale interface falls back to English and keeps names and route identity 
   assert.equal(translateUi('zh-CN', 'nav.projects'), '项目');
   assert.equal(translateUi('zh-CN', 'unmapped.key'), 'unmapped.key');
   assert.equal(normalizeUiPreferences({}).locale, 'en');
-  const nav = renderNav('Resources', { locale: 'zh-CN', interactive: true, resourcesHref: '/projects/P/resources' });
+  const nav = renderNav('Resources', { locale: 'zh-CN', interactive: true, project: { id: 'P', name: 'Example' }, resourcesHref: '/projects/P/resources' });
   assert.match(nav, /aria-current="page"/u);
   assert.match(nav, /href="\/projects\/P\/resources"/u);
   assert.match(nav, />材料与阅读<\/span>/u);
@@ -60,7 +60,7 @@ test('locale interface falls back to English and keeps names and route identity 
   assert.match(importHome, /添加文件夹/u);
   assert.match(importHome, /data-import-messages=/u);
   assert.match(importHome, /data-desktop-picker-enabled="false"/u);
-  assert.match(importHome, /要选择本地文件入库，请打开已安装的 Atlas Desktop/u);
+  assert.match(importHome, /要选择本地文件入库，请打开已安装的 Keeproot Desktop/u);
   assert.match(importHome, /href="\/projects">浏览项目/u);
   const desktopImport = renderBatchWorkView({ mode: 'empty-selection', desktop_picker_enabled: true }, { locale: 'en' });
   assert.match(desktopImport, /data-desktop-picker-enabled="true"/u);
@@ -74,7 +74,7 @@ test('locale interface falls back to English and keeps names and route identity 
   const importResult = renderBatchWorkView({ mode: 'batch-result', items: [], inspected_count: 0, batch_id: 'BAT-1' }, { locale: 'zh-CN' });
   assert.match(importResult, /文件已就绪/u);
   const comparison = renderFileCompareView({ mode: 'choose', desktop_picker_enabled: false }, { locale: 'zh-CN' });
-  assert.match(comparison, /比较文件仅可在 Atlas Desktop 使用/u);
+  assert.match(comparison, /比较文件仅可在 Keeproot Desktop 使用/u);
   assert.match(comparison, /选择第一个文件/u);
   const html = renderProjectHomeView({ base: '/projects/P', project: { name: 'Original 文件名 <test>' }, empty_project: true }, { locale: 'zh-CN' });
   assert.match(html, /lang="zh-CN"/u);
@@ -144,7 +144,7 @@ test('single-file Import translates states and keeps Project, file and form iden
     reason: 'Already exists', target_path: 'C:/sample/Data/report.csv', file_name: 'report-2.csv', import_id: 'IMP-1',
     folders: [{ relative_path: 'Data' }] }, options);
   assert.match(conflict, /选择其他目标位置/u);
-  assert.match(conflict, /Atlas 无法保存到当前目标/u);
+  assert.match(conflict, /Keeproot 无法保存到当前目标/u);
   assert.match(conflict, /原始原因/u);
   assert.match(conflict, /name="file_name" value="report-2\.csv"/u);
   const failed = renderFileWorkView({ mode: 'read-failed', work, failure: { kind: 'permission', retry_supported: true } }, options);
@@ -224,7 +224,7 @@ test('Settings persists language through the real form and another server start'
   const body = new URLSearchParams({ csrf: token, locale: 'zh-CN', action: 'save', selected_theme: 'graphite', text_size: 'large', return_to: returnHref });
   const posted = await fetch(`${server.workspace_url}settings`, { method: 'POST', body, redirect: 'manual' });
   assert.equal(posted.status, 303);
-  assert.equal(new URL(posted.headers.get('location'), server.workspace_url).searchParams.get('return_to'), returnHref);
+  assert.equal(posted.headers.get('location'), returnHref);
   assert.equal(readUiPreferences(stateDir).locale, 'zh-CN');
   assert.equal(readUiPreferences(stateDir).theme, 'graphite');
   assert.equal(readUiPreferences(stateDir).text_size, 'large');
@@ -232,7 +232,7 @@ test('Settings persists language through the real form and another server start'
   server = await startAtlasUiServer({ stateDir, registry, rules: {}, runtime: {} });
   const reopened = await (await fetch(`${server.workspace_url}settings`)).text();
   assert.match(reopened, /lang="zh-CN"/u);
-  assert.match(reopened, /保存设置/u);
+  assert.match(reopened, /保存并退出/u);
   assert.match(reopened, /value="zh-CN" selected/u);
   const csrf = reopened.match(/name="csrf" value="([^"]+)"/u)[1];
   const pack = { schema: 'atlas.language-pack.v1', id: 'demo.french', locale: 'fr', name: 'Français', namespace: 'atlas', messages: { 'nav.projects': 'Projets', 'settings.title': '<Langue>' } };

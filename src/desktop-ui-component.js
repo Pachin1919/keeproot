@@ -4,11 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export const DESKTOP_UI_COMPONENT_FORMAT = 'atlas-desktop-ui-component.v1';
-export const DESKTOP_UI_COMPONENT_VERSION = '0.2.0';
+export const DESKTOP_UI_COMPONENT_VERSION = '0.2.1';
 export const DESKTOP_UI_REQUIREMENTS = Object.freeze([
   'pywebview==6.2.1',
   'pandas==3.0.1',
   'pypdf==6.14.2',
+  'pdfplumber==0.11.10',
 ]);
 const MINIMUM_PYTHON = Object.freeze({ major: 3, minor: 11 });
 
@@ -91,8 +92,9 @@ function probeModule(executable, options) {
       'import atlas_desktop',
       'import pandas',
       'import pypdf',
+      'import pdfplumber',
       'import webview',
-      'print(json.dumps({"pywebview": metadata.version("pywebview"), "pandas": metadata.version("pandas"), "pypdf": metadata.version("pypdf")}))',
+      'print(json.dumps({"pywebview": metadata.version("pywebview"), "pandas": metadata.version("pandas"), "pypdf": metadata.version("pypdf"), "pdfplumber": metadata.version("pdfplumber")}))',
     ].join('; '),
   ], { ...options, timeout: 20_000 });
   if (result.error || result.status !== 0) {

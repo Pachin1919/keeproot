@@ -11,7 +11,7 @@ import { startAtlasUiServer } from '../src/ui-server.js';
 test('CSV row candidate uses one identity in Resources review and Host readback without changing the source', async (t) => {
   const root = fs.mkdtempSync(path.resolve('test/.tmp/csv-row-candidate-ui-'));
   const priorPython = process.env.ATLAS_PYTHON;
-  if (!priorPython) process.env.ATLAS_PYTHON = path.resolve('test/.tmp/v20-01-isolated-install/desktop-ui/venv/Scripts/python.exe');
+  if (!priorPython) process.env.ATLAS_PYTHON = (process.env.ATLAS_TEST_PYTHON ?? process.env.ATLAS_CONTENT_PYTHON ?? path.resolve('test/.tmp/v20-01-isolated-install/desktop-ui/venv/Scripts/python.exe'));
   const installationRoot = path.resolve('test/.tmp/v20-01-isolated-install');
   const stateDir = path.join(root, 'state'); const workspace = path.join(root, 'workspace'); const projectRoot = path.join(workspace, 'A');
   fs.mkdirSync(projectRoot, { recursive: true }); const file = path.join(projectRoot, 'routes.csv');
@@ -23,7 +23,7 @@ test('CSV row candidate uses one identity in Resources review and Host readback 
   const resourceId = control.identify({ filePath: file, project: registry.show(project.project_id).project }).resource_id;
   const locations = createContentLocationService({ registry, resourceControl: control, installationRoot });
   const projectViews = createProjectViewService({ stateDir, registry,
-    pythonPath: path.join(installationRoot, 'desktop-ui/venv/Scripts/python.exe') });
+    pythonPath: process.env.ATLAS_TEST_PYTHON ?? process.env.ATLAS_CONTENT_PYTHON ?? path.join(installationRoot, 'desktop-ui/venv/Scripts/python.exe') });
   const property = projectViews.defineProperty({ projectId: project.project_id, name: '区域归属', kind: 'text' });
   const snapshot = locations.locateCsvRow({ projectId: project.project_id, resourceId, key: { column: '记录ID', value: '001' } });
   const batch = projectViews.submitRowPropertyCandidates({ projectId: project.project_id, propertyId: property.property_id,

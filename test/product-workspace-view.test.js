@@ -6,13 +6,15 @@ import { renderDataWorkView } from '../src/ui/views/data-work-view.js';
 
 test('Project navigation keeps the selected file and links to the same Project operations', () => {
   const selected='/projects/PRJ-example/resources?folder=资料&resource_id=RES-existing';
-  const html=renderNav('Resources',{interactive:true,resourcesHref:selected,locale:'zh-CN'});
-  assert.match(html,/aria-label="当前项目"/u);
-  assert.match(html,/href="\/projects\/PRJ-example\/resources\?folder=资料&amp;resource_id=RES-existing"[^>]*aria-current="page"/u);
+  const html=renderNav('Resources',{interactive:true,project:{id:'PRJ-example',name:'Example'},resourcesHref:selected,locale:'zh-CN'});
+  assert.match(html,/aria-label="项目工作区"/u);
+  assert.match(html,/href="\/projects\/PRJ-example\/resources"[^>]*aria-current="page"/u);
   for(const suffix of ['boards','rounds','rules']) assert.ok(html.includes(`href="/projects/PRJ-example/${suffix}"`));
   assert.ok(html.includes('href="/projects/PRJ-example"'));
   assert.equal((html.match(/data-resources-nav/gu)??[]).length,1);
-  assert.doesNotMatch(renderNav('Projects',{interactive:true,resourcesHref:'https://other.invalid/projects/PRJ-else/resources'}),/class="project-navigation"/u);
+  const unselected=renderNav('Projects',{interactive:true,resourcesHref:'https://other.invalid/projects/PRJ-else/resources'});
+  assert.match(unselected,/data-project-context="none"/u);
+  assert.doesNotMatch(unselected,/href="[^"]*PRJ-else/u);
 });
 
 test('Saved Table Work retains the Project navigation and exact Result return target', () => {
@@ -21,7 +23,7 @@ test('Saved Table Work retains the Project navigation and exact Result return ta
   const html=renderDataWorkView({mode:'saved',project,back_href:'/work/DWT-current',session:{session_id:'DWT-current',sources:[]},record:{
     project,sources:[],output_status:'verified',result_path:'成果/汇总.csv',result_summary:{rows:3,columns:2},resources_href:target,
   }},{locale:'zh-CN'});
-  assert.match(html,/aria-label="当前项目"/u);
+  assert.match(html,/aria-label="项目工作区"/u);
   assert.ok(html.includes('href="'+target.replaceAll('&','&amp;')+'"'));
   for(const suffix of ['boards','rounds','rules']) assert.ok(html.includes(`href="/projects/PRJ-example/${suffix}"`));
   assert.ok(html.includes('href="/work/DWT-current"'));

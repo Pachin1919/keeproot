@@ -1,4 +1,4 @@
-export const ATLAS_VERSION = '1.9.0-rc.1';
+export const ATLAS_VERSION = '2.0.0-preview.1';
 export const PROTOCOL_VERSION = 'atlas-cli.v1';
 export const MODULE_PROTOCOL_VERSION = 'atlas.module.v1';
 
@@ -59,6 +59,15 @@ export const CAPABILITIES = Object.freeze({
     state_outside_governed_library: true,
   },
   json_flag: '--json',
+  optional_host_integration: {
+    default_enabled: false,
+    event_entry: 'node <Runtime>/bin/atlas-host-events.js --binding <reviewed-binding.json> --json',
+    supported_hook_input: 'Codex PostToolUse with session_id, turn_id and tool_use_id',
+    precompact: 'skipped_without_unique_documented_event_identity',
+    session_surface: 'Project Handoff HTML UI; Codex App Server 0.162.0-alpha.2',
+    authority: 'explicit_operator_configuration_for_actual_process_access_and_account_use',
+    acceptance: 'real_model_turn_and_user_hook_activation_not_verified',
+  },
   workflows: {
     handoff: ['create', 'list', 'show', 'read'],
     module: ['list', 'package-preview', 'package-list', 'install', 'preview', 'save', 'enable', 'disable'],

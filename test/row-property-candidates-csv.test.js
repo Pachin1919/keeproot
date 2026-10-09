@@ -7,7 +7,7 @@ import { ResourceControl } from '../src/resource-control.js';
 import { createContentLocationService } from '../src/content-location-service.js';
 import { createProjectViewService } from '../src/project-view-service.js';
 
-const pythonPath = path.resolve('test/.tmp/v20-01-isolated-install/desktop-ui/venv/Scripts/python.exe');
+const pythonPath = (process.env.ATLAS_TEST_PYTHON ?? process.env.ATLAS_CONTENT_PYTHON ?? path.resolve('test/.tmp/v20-01-isolated-install/desktop-ui/venv/Scripts/python.exe'));
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.resolve('test/.tmp/csv-row-candidate-'));

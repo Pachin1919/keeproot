@@ -53,6 +53,7 @@ after(() => {
 function temporaryDirectory(t) {
   fs.mkdirSync(testRoot, { recursive: true });
   const directory = fs.mkdtempSync(path.join(testRoot, 'data-work-regression-'));
+  fs.mkdirSync(path.join(directory, 'state'));
   temporaryRoots.add(directory);
   return directory;
 }
@@ -95,7 +96,7 @@ test('Status guide opens outside the clipping sidebar and points back to the rel
   assert.match(guide, /status-progress">In progress/u);
   assert.match(guide, /status-safe">Normal[\s\S]*Restored/u);
   assert.match(guide, /status-warn">Waiting or attention[\s\S]*Not checked · Partial/u);
-  assert.match(guide, /status-danger">Atlas stopped[\s\S]*Rejected/u);
+  assert.match(guide, /status-danger">Keeproot stopped[\s\S]*Rejected/u);
   assert.doesNotMatch(guide, /Task page/u);
   assert.match(css, /\.status-progress::before/u);
   assert.match(css, /\.workspace-tree-state-waiting \.workspace-tree-state-dot[^}]*transform:\s*rotate\(45deg\)/u);
@@ -1398,7 +1399,7 @@ test('Project Resources renders a local Project tree instead of category cards',
   assert.match(html, /Known relationships/u);
   assert.match(html, /<a href="\/projects\/project-1\/resources" title="Materials" data-resources-nav aria-current="page">/u);
   assert.doesNotMatch(html, />Files<\/span>/u);
-  assert.match(html, /Not yet worked in Atlas/u);
+  assert.match(html, /Not yet worked in Keeproot/u);
   assert.match(html, /data-project-folder data-folder-path="Data" data-folder-open="true"/u);
   assert.match(html, /data-folder-toggle aria-expanded="true"[^>]*aria-label="Collapse Data"/u);
   assert.match(html, /href="\/projects\/project-1\/resources\?folder=Data"[^>]*data-folder-select/u);
@@ -1515,7 +1516,7 @@ test('Project Resource detail distinguishes recorded work from a disk modificati
   assert.match(html, />Used by</u);
   assert.match(html, /input to these saved results/u);
   assert.match(html, /cleaned\.csv/u);
-  assert.match(html, /Last worked<\/dt><dd>Not yet worked in Atlas<\/dd>/u);
+  assert.match(html, /Last worked<\/dt><dd>Not yet worked in Keeproot<\/dd>/u);
   assert.doesNotMatch(html, />Used to create</u);
 });
 
@@ -1542,7 +1543,7 @@ test('Project Resource detail shows a Host inspection recorded for the same Proj
   const html = renderProjectResourcesView(model, { csrfToken: 'token' });
   assert.match(html, /Last inspected by<\/dt><dd>Codex<\/dd>/u);
   assert.match(html, /Known result<\/dt><dd>1 rows · 1 fields<\/dd>/u);
-  assert.doesNotMatch(html, /Not yet worked in Atlas/u);
+  assert.doesNotMatch(html, /Not yet worked in Keeproot/u);
 });
 
 test('Project Resources keeps missing traces in context instead of a count tile', () => {
@@ -2188,7 +2189,7 @@ test('Resources exposes direct folder disclosure, adjustable panes, and native z
 
 test('Settings overlay keeps its dedicated width and reflows choices before 800 pixels', () => {
   const styles = fs.readFileSync(path.resolve('src', 'ui', 'styles', 'layout.css'), 'utf8');
-  assert.match(styles, /\.atlas-overlay\.settings-overlay \{[^}]*max-width:\s*min\(1480px, calc\(100vw - 24px\)\)/u);
+  assert.match(styles, /\.atlas-overlay\.settings-overlay \{[^}]*max-width:\s*min\(1480px, calc\(var\(--viewport-width\) - 24px\)\)/u);
   assert.match(styles, /@media \(max-width: 820px\) \{[\s\S]*?\.setting-choice-grid,[^}]*grid-template-columns:\s*1fr/u);
   assert.match(styles, /@media \(max-width: 820px\) \{[\s\S]*?\.settings-heading \{ display:\s*block/u);
 });
@@ -2711,7 +2712,7 @@ test('Saved display settings persist when returning to Files', async (t) => {
     redirect: 'manual',
   });
   assert.equal(saveResponse.status, 303);
-  assert.equal(saveResponse.headers.get('location'), '/settings?saved=1');
+  assert.equal(saveResponse.headers.get('location'), '/projects');
 
   const filesResponse = await fetch(`${server.workspace_url}files`);
   const filesHtml = await filesResponse.text();
@@ -2989,43 +2990,32 @@ test('Global Search reports bounded no-results and unavailable Project states', 
 });
 
 test('Atlas navigation uses product surfaces, aligned SVG icons, and supplied Pachin identity assets', () => {
-  const html = renderBatchWorkView({
-    mode: 'empty-selection',
-  }, { csrfToken: 'csrf', settingsHref: '/settings' });
-  assert.match(html, /data-toggle-rail/u);
-  assert.match(html, /aria-valuemin="68"/u);
-  assert.doesNotMatch(html, /class="nav-short"/u);
-  assert.match(html, /class="nav-icon"/u);
-  assert.match(html, /data-icon="projects"/u);
-  assert.match(html, /data-icon="resources"/u);
-  assert.match(html, /data-icon="activity"/u);
-  assert.match(html, /data-icon="import"/u);
-  assert.match(html, /data-icon="settings"/u);
-  assert.match(html, /stroke-linecap="round"/u);
-  assert.match(html, /\/ui\/pachin-seal\.png/u);
-  assert.match(html, /\/ui\/pachin-calligraphy\.png/u);
-  assert.match(html, /PACHIN STUDIO/u);
-  assert.match(html, /LOCAL WORKSPACE/u);
-  assert.match(html, /is-compact-app-rail/u);
-  assert.match(html, /height:\s*100dvh/u);
-  assert.match(html, /position:\s*sticky/u);
-  assert.match(html, /signature-calligraphy[^}]*height:\s*62px/u);
-  assert.match(html, /body \.brand \{[^}]*min-height:\s*86px/u);
-  assert.match(html, /body \.nav-item \{[^}]*padding:\s*0/u);
-  assert.match(html, /body \.nav-item > a, body \.nav-item > \.nav-link \{[^}]*display:\s*flex/u);
-  assert.match(html, /body \.sidebar-signature \{[^}]*flex-shrink:\s*0[^}]*min-height:\s*120px/u);
-  assert.ok(html.indexOf('>Projects<') < html.indexOf('>Resources<'));
-  assert.ok(html.indexOf('>Resources<') < html.indexOf('>Activity<'));
-  assert.ok(html.indexOf('>Activity<') < html.indexOf('>Import<'));
-  assert.match(html, /href="\/projects" title="Choose a Project to view its resources" data-resources-nav/u);
-  assert.doesNotMatch(html, /data-resources-nav[^>]*aria-disabled="true"/u);
-  const clientSource = fs.readFileSync(path.resolve('src', 'ui', 'client.js'), 'utf8');
-  assert.match(clientSource, /item\.href = rememberedProjectHref/u);
-  assert.match(html, /data-import-files[^>]*>Add files</u);
-  assert.match(html, /data-import-add-folder[^>]*>Add folder</u);
-  assert.doesNotMatch(html, />Open File</u);
-  assert.doesNotMatch(html, />Open Files</u);
-  assert.doesNotMatch(html, />Compare Files</u);
+  const html = renderBatchWorkView({ mode: 'empty-selection' }, { csrfToken: 'csrf', settingsHref: '/settings' });
+  const nav = html.slice(html.indexOf('<aside'), html.indexOf('</aside>') + 8);
+  for (const text of ['data-toggle-rail', 'aria-valuemin="68"', 'class="nav-icon"', 'stroke-linecap="round"', '/ui/pachin-seal.png', '/ui/pachin-calligraphy.png', '<strong>Pachin Studio</strong>', 'aria-label="Keeproot"']) {
+    assert.ok(nav.includes(text), text);
+  }
+  for (const icon of ['projects', 'resources', 'activity', 'import', 'settings']) {
+    assert.ok(nav.includes(`data-icon="${icon}"`), icon);
+  }
+  assert.ok(!nav.includes('class="nav-short"'));
+  assert.ok(html.includes('height: var(--viewport-height)'));
+  assert.ok(html.includes('position: sticky'));
+  const global = nav.slice(nav.indexOf('<nav aria-label='), nav.indexOf('</nav>'));
+  assert.ok(global.includes('>Projects<'));
+  assert.ok(global.includes('>Activity<'));
+  assert.ok(global.includes('>Import<'));
+  assert.ok(global.indexOf('>Projects<') < global.indexOf('>Activity<'));
+  assert.ok(global.indexOf('>Activity<') < global.indexOf('>Import<'));
+  assert.ok(!global.includes('data-resources-nav'));
+  assert.ok(nav.includes('data-project-context="none"'));
+  assert.ok(nav.includes('aria-disabled="true"'));
+  assert.ok(nav.indexOf('class="sidebar-settings"') > nav.indexOf('class="sidebar-signature"'));
+  assert.ok(html.includes('data-import-files'));
+  assert.ok(html.includes('>Add files</'));
+  assert.ok(html.includes('data-import-add-folder'));
+  assert.ok(html.includes('>Add folder</'));
+  assert.ok(!html.includes('>Open Files</'));
 });
 
 test('File results retain Remove and Undo while batch results retain Continue', () => {
@@ -3140,7 +3130,7 @@ test('Projects Home keeps an unavailable registered Project visible without an O
   assert.match(html, /Folder unavailable/u);
   assert.match(html, /This Project folder is no longer at its recorded location\./u);
   assert.match(html, /href="\/projects\/p1\/relink">Relink/u);
-  assert.match(html, /href="\/projects\/p1\/remove">Remove from Atlas/u);
+  assert.match(html, /href="\/projects\/p1\/remove">Remove from Keeproot/u);
   assert.doesNotMatch(html, /F:\\missing/u);
   assert.doesNotMatch(html, />Open</u);
 });
@@ -3162,9 +3152,9 @@ test('Unavailable Project removal archives only the Atlas record after one confi
   const server = await startAtlasUiServer({ stateDir: path.join(root, 'state'), ...serverServices(registry) });
   t.after(() => server.close());
   const home = await (await fetch(`${server.workspace_url}projects`)).text();
-  assert.match(home, /href="\/projects\/missing-project\/remove">Remove from Atlas/u);
+  assert.match(home, /href="\/projects\/missing-project\/remove">Remove from Keeproot/u);
   const review = await (await fetch(`${server.workspace_url}projects/missing-project/remove`)).text();
-  assert.match(review, /Remove Missing Project from Atlas/u);
+  assert.match(review, /Remove Missing Project from Keeproot/u);
   assert.match(review, /does not delete any local files/u);
   const csrf = review.match(/name="csrf" value="([^"]+)"/u)?.[1];
   assert.ok(csrf);

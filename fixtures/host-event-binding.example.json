@@ -1,0 +1,15 @@
+{
+  "schema": "atlas.host-event-binding.v1",
+  "enabled": false,
+  "recursion_verified": false,
+  "exclude_atlas_origin": true,
+  "input_format": "codex.hooks.v1",
+  "known_tool_names": ["apply_patch"],
+  "install_root": "REPLACE_WITH_TRUSTED_ABSOLUTE_INSTALL_ROOT",
+  "state_dir": "REPLACE_WITH_INSTALLATION_STATE_ROOT",
+  "project_id": "PRJ-REPLACE",
+  "events": {
+    "PostToolUse": {"kind": "refresh_resources", "resource_ids": ["RES-REPLACE"]}
+  },
+  "identity_notice": "Codex PostToolUse identity uses session_id + turn_id + tool_use_id. PreCompact has no unique tool/event identity and is skipped. Generic fields require explicitly labelled atlas.adapter.v1 binding. Timestamps are never an identity. This disabled example installs no hook."
+}

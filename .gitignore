@@ -1,6 +1,18 @@
 # Atlas runtime state: Ledger, WAL/SHM files, snapshots, demos, and receipts
 /.atlas/
 
+# Private development records. Already tracked history needs a separate public export.
+/AGENTS.md
+/.codex/
+/design-qa.md
+/.agents/skills/test-gap-audit/
+/docs/**
+!/docs/README.md
+!/docs/Atlas V1 产品说明书.md
+!/docs/Atlas V1 使用说明书.md
+!/docs/Atlas V1 验收指南.md
+!/docs/Atlas 技术作品与企业评审说明.md
+
 # Test and generated output
 /test/.tmp/
 /coverage/
@@ -8,6 +20,7 @@
 /.playwright-cli/
 /tmp/
 /temp/
+/preview-install/
 
 # Dependencies and project-local caches
 /node_modules/
@@ -39,6 +52,23 @@ htmlcov/
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+auth.json
+credentials.json
+secrets.json
+/.codex-home/
+/.claude/
+/.local/
+*.jsonl
+!fixtures/**/*.jsonl
+/dist/
+/releases/
+*.zip
+*.7z
+*.bak
 
 # Operating-system files
 .DS_Store

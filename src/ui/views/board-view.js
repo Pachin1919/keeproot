@@ -1,3 +1,4 @@
+import { UI_DISPLAY_NAME } from '../brand.js';
 import { escapeHtml, renderNav, renderStatus, renderTopbar, renderUiClientScript } from '../components.js';
 import { uiStyles } from '../styles.js';
 import { normalizeUiLocale, translateUi } from '../i18n.js';
@@ -14,7 +15,7 @@ const revision = (board) => `<input type="hidden" name="base_revision" value="${
 
 function shell(model, options, body, title = t('work.board')) {
   const base = model.base ?? `/projects/${encodeURIComponent(model.project.id)}`;
-  return `<!doctype html><html lang="${normalizeUiLocale(options.locale)}" ${options.htmlAttributes ?? ''}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHtml(title)} · Atlas</title><style>${uiStyles()}</style>${renderUiClientScript(true)}</head><body><div class="app-shell" style="${escapeHtml(options.railStyle ?? '')}">${renderNav('Projects', { interactive: true, workspaceHref: '/projects', resourcesHref: `${base}/resources`, projectSection: 'results', importHref: '/files', settingsHref: options.settingsHref, locale: options.locale, languageCatalog: options.languageCatalog })}<div class="workspace">${renderTopbar({ section: t('work.board'), project: model.project, ...options })}${body}</div></div></body></html>`;
+  return `<!doctype html><html lang="${normalizeUiLocale(options.locale)}" ${options.htmlAttributes ?? ''}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHtml(title)} · ${UI_DISPLAY_NAME}</title><style>${uiStyles()}</style>${renderUiClientScript(true)}</head><body><div class="app-shell" style="${escapeHtml(options.railStyle ?? '')}">${renderNav('Projects', { ...options, project: model.project, interactive: true, workspaceHref: '/projects', resourcesHref: `${base}/resources`, projectSection: 'results', importHref: '/files', settingsHref: options.settingsHref, locale: options.locale, languageCatalog: options.languageCatalog })}<div class="workspace">${renderTopbar({ section: t('work.board'), ...options, project: model.project })}${body}</div></div></body></html>`;
 }
 
 function listView(model, options) {

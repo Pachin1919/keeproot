@@ -1,5 +1,5 @@
 * { box-sizing: border-box; }
-html { background: var(--canvas); }
+html { background: var(--canvas); zoom: var(--ui-scale); }
 body {
   margin: 0;
   background: var(--canvas);
@@ -10,7 +10,7 @@ body {
   --app-rail-width: 228px;
   display: grid;
   grid-template-columns: var(--app-rail-width) 6px minmax(0, 1fr);
-  min-height: 100dvh;
+  min-height: var(--viewport-height);
 }
 .sidebar {
   background: #1b2026;
@@ -18,7 +18,7 @@ body {
   display: flex;
   flex-direction: column;
   grid-column: 1;
-  height: 100dvh;
+  height: var(--viewport-height);
   overflow-x: hidden;
   overflow-y: auto;
   padding: 22px 16px;
@@ -117,7 +117,7 @@ body {
   display: grid;
   grid-template-columns: var(--project-rail-width) 6px minmax(620px, 1fr) 304px;
   grid-template-rows: 58px minmax(0, 1fr) 44px;
-  height: 100dvh;
+  height: var(--viewport-height);
   min-height: 720px;
 }
 .studio-header {
@@ -250,8 +250,8 @@ body {
 .rules-grid ul { font-size: 12px; margin: 0; padding-left: 18px; }
 .studio-empty { color: var(--muted); display: grid; font-size: var(--font-size-work); gap: 4px; padding: 20px 8px; }
 .settings-page { max-width: 1500px; }
-.atlas-overlay.settings-overlay { max-width: min(1480px, calc(100vw - 24px)); }
-.settings-overlay-card { margin: 0; max-height: calc(100dvh - 24px); overflow: auto; width: 100%; }
+.atlas-overlay.settings-overlay { max-width: min(1480px, calc(var(--viewport-width) - 24px)); }
+.settings-overlay-card { margin: 0; max-height: calc(var(--viewport-height) - 24px); overflow: auto; width: 100%; }
 .settings-layout { align-items: start; display: grid; gap: 24px; grid-template-columns: minmax(0, 1fr) minmax(300px, 360px); }
 .settings-main { display: grid; gap: 18px; }
 .settings-side { display: grid; gap: 18px; position: sticky; top: 22px; }
@@ -288,7 +288,7 @@ body {
 }
 @media (max-width: 800px) {
   .studio-body { overflow: auto; }
-  .studio-shell { display: block; height: auto; min-height: 100dvh; }
+  .studio-shell { display: block; height: auto; min-height: var(--viewport-height); }
   .studio-header { display: grid; grid-template-columns: 1fr auto; height: auto; min-height: 58px; padding: 10px 14px; }
   .studio-title { border: 0; justify-self: end; padding: 0; }
   .global-search { grid-column: 1 / -1; }

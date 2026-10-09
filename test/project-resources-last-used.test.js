@@ -26,5 +26,5 @@ test('Resources last used includes an existing Table Work for the same Resource'
   assert.equal(model.other_files.find((item) => item.resource_id === 'RES-other')?.last_worked_at, null);
   const html = renderProjectResourcesView(model);
   assert.match(html, /<time class="workspace-resource-last-used" datetime="2026-10-02T05:23:20.011Z">/u);
-  assert.match(html, /<span class="workspace-resource-last-used">Not yet worked in Atlas<\/span>/u);
+  assert.match(html, /<span class="workspace-resource-last-used">Not yet worked in Keeproot<\/span>/u);
 });

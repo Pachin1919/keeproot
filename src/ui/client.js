@@ -53,30 +53,6 @@ const clientMessages = (() => {
 const clientText = (key, fallback, values = {}) => String(clientMessages[key] ?? fallback)
   .replace(/\{([a-z]+)\}/gu, (_, name) => String(values[name] ?? ''));
 const topbar = document.querySelector('.topbar[data-current-project-id]');
-const currentProjectId = topbar?.dataset.currentProjectId;
-const currentResourcePath = topbar?.dataset.currentResourcePath;
-if (currentProjectId) {
-  storageSet('sessionStorage', 'atlas-ui-current-project-id', currentProjectId);
-  storageSet('sessionStorage', 'atlas-ui-current-project-href', `/projects/${encodeURIComponent(currentProjectId)}/resources`);
-  if (currentResourcePath) storageSet('sessionStorage', 'atlas-ui-current-resource-path', currentResourcePath);
-}
-
-const rememberedProjectHref = storageGet('sessionStorage', 'atlas-ui-current-project-href');
-document.querySelectorAll('[data-resources-nav]').forEach((item) => {
-  if (!rememberedProjectHref) return;
-  if (item instanceof HTMLAnchorElement) {
-    item.href = rememberedProjectHref;
-    item.title = clientText('resources_title', 'Resources');
-    return;
-  }
-  const link = document.createElement('a');
-  link.href = rememberedProjectHref;
-  link.dataset.resourcesNav = '';
-  link.title = clientText('resources_title', 'Resources');
-  link.innerHTML = item.innerHTML;
-  item.replaceWith(link);
-});
-
 const dirtyDraftForms = new Set();
 // Join fields stay in the saved form but cannot affect a concatenate submission.
 document.querySelectorAll('.recipe-form').forEach((form) => {
@@ -755,9 +731,17 @@ function focusAtlasOverlay(dialog) {
 
 function closeAtlasOverlay(dialog) {
   if (!(dialog instanceof HTMLDialogElement) || !dialog.open) return;
-  if (dialog.dataset.overlayDirty === 'true' && dialog.hasAttribute('data-overlay-dirty-protect')
-    && !window.confirm(clientText('close_settings_confirm', 'Close Settings and discard unsaved display changes?'))) return;
+  if (dialog.dataset.overlayDirty === 'true' && dialog.hasAttribute('data-overlay-dirty-protect')) {
+    const confirmation = dialog.querySelector('[data-settings-discard]');
+    if (confirmation) {
+      confirmation.hidden = false;
+      confirmation.querySelector('[data-settings-keep-changes]')?.focus();
+      return;
+    }
+    if (!window.confirm(clientText('close_settings_confirm', 'Close Settings and discard unsaved display changes?'))) return;
+  }
   dialog.close();
+  if (dialog.classList.contains('settings-overlay')) restoreSettingsPreview();
   const returnHref = dialog.dataset.overlayReturnHref;
   if (returnHref) {
     if (dialog.classList.contains('settings-overlay')) storageSet('sessionStorage', 'atlas-ui-settings-return', returnHref);
@@ -788,6 +772,14 @@ document.querySelectorAll('[data-atlas-overlay]').forEach((dialog) => {
     form?.addEventListener('submit', () => { dialog.dataset.overlayDirty = 'false'; });
   }
   dialog.querySelectorAll('[data-overlay-close]').forEach((button) => button.addEventListener('click', () => closeAtlasOverlay(dialog)));
+  dialog.querySelector('[data-settings-keep-changes]')?.addEventListener('click', () => {
+    dialog.querySelector('[data-settings-discard]').hidden = true;
+    dialog.querySelector('[data-overlay-close]')?.focus();
+  });
+  dialog.querySelector('[data-settings-discard-changes]')?.addEventListener('click', () => {
+    dialog.dataset.overlayDirty = 'false';
+    closeAtlasOverlay(dialog);
+  });
   dialog.addEventListener('click', (event) => {
     if (event.target !== dialog) return;
     const box = dialog.getBoundingClientRect();
@@ -805,11 +797,13 @@ document.querySelectorAll('[data-atlas-overlay]').forEach((dialog) => {
 
 const currentLocation = window.location ?? null;
 if (currentLocation?.pathname !== '/settings') {
-  document.querySelectorAll('a[href="/settings"]').forEach((link) => {
+  document.querySelectorAll('a[href="/settings"], a[data-settings-nav]').forEach((link) => {
     const returnHref = currentLocation?.pathname
       ? `${currentLocation.pathname}${currentLocation.search ?? ''}`
       : '/projects';
-    link.href = `/settings?return_to=${encodeURIComponent(returnHref)}`;
+    const settingsUrl = new URL(link.href, currentLocation.origin);
+    settingsUrl.searchParams.set('return_to', returnHref);
+    link.href = settingsUrl.pathname + settingsUrl.search;
   });
   const returnFocusHref = storageGet('sessionStorage', 'atlas-ui-settings-return');
   if (returnFocusHref) {
@@ -1063,7 +1057,7 @@ async function chooseDesktopFile(button, method = 'pick_file') {
 importFiles?.addEventListener('click', async () => {
   const selection = await chooseDesktopFile(importFiles, 'pick_import_files');
   if (selection?.queue_id) window.location.assign(`/files/queue/${encodeURIComponent(selection.queue_id)}`);
-  else if (!['cancelled', 'unavailable'].includes(selection?.status) && pickerNotice) pickerNotice.textContent = selection?.message ?? importText('register_failed', 'Atlas could not register the selected files. Try again.');
+  else if (!['unavailable'].includes(selection?.status) && pickerNotice) pickerNotice.textContent = selection?.message ?? importText('register_failed', 'Atlas could not register the selected files. Try again.');
 });
 
 document.querySelectorAll('[data-import-add-files], [data-import-add-folder]').forEach((button) => {
@@ -1130,7 +1124,7 @@ document.querySelectorAll('[data-resource-relink-picker]').forEach((button) => {
     const form = button.closest('form[data-resource-relink-form]');
     const selection = await chooseDesktopFile(button, 'pick_file');
     if (!selection?.selection_id) {
-      if (!['cancelled', 'unavailable'].includes(selection?.status)) {
+      if (!['unavailable'].includes(selection?.status)) {
         const notice = form?.querySelector('[data-resource-relink-notice]');
         if (notice) notice.textContent = selection?.message ?? notice.dataset.registerFailed ?? 'Atlas could not register the selected file. Try again.';
       }
@@ -1191,8 +1185,31 @@ document.querySelectorAll('[data-project-folder-form]').forEach((form) => {
 });
 
 const settingsForm = document.querySelector('.settings-layout');
+const settingsPreviewAttributes = {
+  theme: 'theme', accent: 'accent', contrast: 'contrast', text_size: 'textSize',
+  density: 'density', font_family: 'fontFamily', reading_font: 'readingFont', reading_spacing: 'readingSpacing',
+  ui_scale: 'uiScale',
+};
+const settingsOriginalDataset = { ...document.documentElement.dataset };
+const settingsOriginalScale = document.documentElement.style.getPropertyValue('--ui-scale');
+function restoreSettingsPreview() {
+  for (const attribute of Object.values(settingsPreviewAttributes)) {
+    if (settingsOriginalDataset[attribute] === undefined) delete document.documentElement.dataset[attribute];
+    else document.documentElement.dataset[attribute] = settingsOriginalDataset[attribute];
+  }
+  if (settingsOriginalScale) document.documentElement.style.setProperty('--ui-scale', settingsOriginalScale);
+  else document.documentElement.style.removeProperty('--ui-scale');
+}
 const syncSettingsChoice = (input) => {
-  if (!(input instanceof HTMLInputElement) || input.type !== 'radio') return;
+  if (!(input instanceof HTMLInputElement || input instanceof HTMLSelectElement)) return;
+  const attribute = settingsPreviewAttributes[input.name];
+  if (!attribute || (input instanceof HTMLInputElement && (input.type !== 'radio' || !input.checked))) return;
+  if (input.name === 'ui_scale') {
+    const value = /^\d+$/u.test(input.value) ? Number(input.value) : 100;
+    const scale = Number.isSafeInteger(value) ? Math.min(125, Math.max(85, value)) : 100;
+    document.documentElement.dataset.uiScale = String(scale);
+    document.documentElement.style.setProperty('--ui-scale', String(scale / 100));
+  } else document.documentElement.dataset[attribute] = input.value;
   if (input.name === 'theme') {
     document.documentElement.dataset.theme = input.value;
     const selectedTheme = settingsForm?.querySelector('[data-settings-selected-theme]');
@@ -1251,11 +1268,18 @@ if (readerSurface) {
     readerSurface.classList.toggle(panel === files ? 'reader-files-open' : 'reader-source-open', visible);
   };
   const compactReader = window.matchMedia('(max-width: 760px)');
+  const singlePanelReader = window.matchMedia('(max-width: 1219px)');
+  let filesBeforeSource = false;
+  const restoreFiles = () => {
+    if (filesBeforeSource && !compactReader.matches) setPanel(files, filesToggle, true);
+    filesBeforeSource = false;
+  };
   setPanel(files, filesToggle, !compactReader.matches);
   setPanel(source, sourceToggle, false);
   let focusMode = false;
   const setFocus = enabled => {
     focusMode = enabled;
+    filesBeforeSource = false;
     focusToggle.setAttribute('aria-expanded', String(enabled));
     focusToggle.setAttribute('aria-pressed', String(enabled));
     readerSurface.classList.toggle('reader-focus-mode', enabled);
@@ -1267,19 +1291,104 @@ if (readerSurface) {
     const show = focusMode || files.hidden;
     if (focusMode) setFocus(false);
     setPanel(files, filesToggle, show);
-    if (compactReader.matches && !files.hidden) setPanel(source, sourceToggle, false);
+    if (singlePanelReader.matches && !files.hidden) {
+      setPanel(source, sourceToggle, false);
+      filesBeforeSource = false;
+    }
   });
   sourceToggle.addEventListener('click', () => {
     if (focusMode) setFocus(false);
-    setPanel(source, sourceToggle, source.hidden);
-    if (compactReader.matches && !source.hidden) setPanel(files, filesToggle, false);
+    const show = source.hidden;
+    if (show && singlePanelReader.matches && !files.hidden) {
+      filesBeforeSource = true;
+      setPanel(files, filesToggle, false);
+    }
+    setPanel(source, sourceToggle, show);
+    if (!show) restoreFiles();
   });
   focusToggle.addEventListener('click', () => setFocus(!focusMode));
   readerSurface.addEventListener('keydown', event => {
     if (event.key !== 'Escape') return;
     if (focusMode) { setFocus(false); focusToggle.focus(); }
-    else if (!source.hidden) { setPanel(source, sourceToggle, false); sourceToggle.focus(); }
+    else if (!source.hidden) { setPanel(source, sourceToggle, false); restoreFiles(); sourceToggle.focus(); }
     else if (compactReader.matches && !files.hidden) { setPanel(files, filesToggle, false); filesToggle.focus(); }
   });
-  compactReader.addEventListener('change', () => { if (!focusMode) setPanel(files, filesToggle, !compactReader.matches); });
+  compactReader.addEventListener('change', () => { if (!focusMode) setPanel(files, filesToggle, !compactReader.matches && (source.hidden || !singlePanelReader.matches)); });
+  singlePanelReader.addEventListener('change', () => {
+    if (focusMode || source.hidden) return;
+    if (singlePanelReader.matches && !files.hidden) {
+      filesBeforeSource = true;
+      setPanel(files, filesToggle, false);
+    } else if (!singlePanelReader.matches) restoreFiles();
+  });
+}
+// Read-only event polling keeps the session lease alive. Mutations use CSRF forms.
+const hostSessionSurface = document.querySelector('[data-host-session]');
+if (hostSessionSurface) {
+  const terminalHostStates = new Set(['completed', 'failed', 'interrupted', 'disconnected', 'outcome_unknown']);
+  let hostMessages = {};
+  try { hostMessages = JSON.parse(hostSessionSurface.dataset.hostMessages ?? '{}'); } catch {}
+  let hostSequence = Number(hostSessionSurface.dataset.hostSequence ?? 0);
+  const hostReplyItems = new Map([...hostSessionSurface.querySelectorAll('[data-host-message-item]')].map(item => [item.dataset.hostMessageItem, { item, text: item.querySelector('pre') }]));
+  let hostPollingClosed = false;
+  const hostText = (selector, value) => { const node = hostSessionSurface.querySelector(selector); if (node) node.textContent = String(value ?? ''); };
+  const hostHidden = (selector, hidden) => { const node = hostSessionSurface.querySelector(selector); if (node) node.hidden = hidden; };
+  const pollHostSession = async () => {
+    if (hostPollingClosed || (terminalHostStates.has(hostSessionSurface.dataset.hostStatus) && hostSequence >= Number(hostSessionSurface.dataset.hostLastSequence ?? 0))) return;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 10_000);
+    try {
+      const endpoint = new URL(hostSessionSurface.dataset.hostEventsUrl, window.location.href);
+      if (endpoint.origin !== window.location.origin) throw new Error('Invalid session origin');
+      endpoint.searchParams.set('after_sequence', String(hostSequence));
+      const response = await fetch(endpoint.pathname + endpoint.search, { credentials: 'same-origin', signal: controller.signal, headers: { accept: 'application/json' } });
+      const envelope = await response.json();
+      const result = envelope?.result;
+      const session = result?.session;
+      if (!response.ok || envelope?.ok !== true || !session || session.session_id !== hostSessionSurface.dataset.hostSession || session.project_id !== hostSessionSurface.dataset.hostProject || !Array.isArray(result.events)) throw new Error('Session read failed');
+      const list = hostSessionSurface.querySelector('[data-host-events]');
+      for (const event of result.events) {
+        if (!Number.isSafeInteger(event.sequence) || event.sequence <= hostSequence) continue;
+        if (typeof event.text !== 'string' || !['status', 'message', 'permission', 'error', 'tool'].includes(event.kind)) continue;
+        const key = event.item_id ?? String(event.sequence);
+        const previous = event.kind === 'message' ? hostReplyItems.get(key) : null;
+        if (previous?.text) {
+          previous.text.textContent += event.text;
+          previous.item.dataset.hostSequence = String(event.sequence);
+        } else {
+          const item = document.createElement('li');
+          item.dataset.hostSequence = String(event.sequence); item.dataset.hostEventKind = event.kind;
+          const text = document.createElement('pre'); text.textContent = event.text;
+          item.append(text);
+          const target = event.kind === 'message' ? list : hostSessionSurface.querySelector('[data-host-technical-events]');
+          target?.append(item);
+          if (event.kind === 'message') { item.dataset.hostMessageItem = key; hostReplyItems.set(key, { item, text }); }
+        }
+        hostSequence = event.sequence;
+      }
+      if (Number.isSafeInteger(result.last_sequence) && result.last_sequence >= hostSequence) hostSequence = result.last_sequence;
+      hostSessionSurface.dataset.hostSequence = String(hostSequence);
+      hostSessionSurface.dataset.hostStatus = session.status;
+      hostSessionSurface.dataset.hostLastSequence = String(session.last_sequence ?? hostSequence);
+      hostText('[data-host-status-label]', hostMessages[session.status] ?? session.status);
+      hostText('[data-host-result-label]', session.result_available ? hostMessages.result : hostMessages.result_pending);
+      hostText('[data-host-error]', session.error?.message); hostHidden('[data-host-error]', !session.error);
+      hostSessionSurface.querySelectorAll('[data-host-revision]').forEach(input => { input.value = String(session.revision); });
+      const pending = session.pending_permission;
+      hostHidden('[data-host-permission]', !pending);
+      hostText('[data-host-permission-description]', pending?.description);
+      const requestInput = hostSessionSurface.querySelector('[data-host-request]'); if (requestInput) requestInput.value = pending?.request_id ?? '';
+      const expiry = hostSessionSurface.querySelector('[data-host-permission-expires]'); if (expiry) { expiry.textContent = pending?.expires_at ?? ''; expiry.dateTime = pending?.expires_at ?? ''; }
+      hostHidden('[data-host-cancel]', terminalHostStates.has(session.status) || session.status === 'cancelling');
+      hostHidden('[data-host-reconnect]', session.status !== 'disconnected');
+      hostHidden('[data-host-reconnect-help]', session.status !== 'disconnected');
+      hostHidden('[data-host-empty]', Boolean(list?.children.length));
+      if ((!terminalHostStates.has(session.status) || hostSequence < session.last_sequence) && !hostPollingClosed) window.setTimeout(pollHostSession, 1000);
+    } catch {
+      hostText('[data-host-connection]', hostMessages.poll_failed);
+      hostPollingClosed = true;
+    } finally { window.clearTimeout(timeout); }
+  };
+  window.addEventListener('pagehide', () => { hostPollingClosed = true; }, { once: true });
+  window.setTimeout(pollHostSession, 1000);
 }

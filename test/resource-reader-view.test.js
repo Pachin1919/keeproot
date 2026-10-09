@@ -11,6 +11,25 @@ const model = (overrides = {}) => ({ project: { id: 'P-reader', name: 'Reader Pr
   reader: { project_id: 'P-reader', resource_id: 'R-one', name: 'sample.md', relative_path: 'notes/sample.md', sha256: 'abc123', bytes: 20, kind: 'markdown', text: '# Title\n\nReadable body.' }, ...overrides });
 const render = (value, locale = 'en') => renderResourceReaderView(value, { csrfToken: 'csrf-reader', locale });
 
+test('Reader groups same-named resources by folder without losing identity, return scope or escaped full names', () => {
+  const html = render(model({ resources: [
+    { resource_id: 'R-one', name: 'sample.md', relative_path: '01_资料/sample.md' },
+    { resource_id: 'R-two', name: 'sample.md', relative_path: '02_成果/sample.md' },
+    { resource_id: 'R-root', name: '<name>.txt', relative_path: '<name>.txt' },
+  ] }), 'zh-CN');
+  assert.match(html, /class="reader-file-group"><h3 title="01_资料">01_资料/u);
+  assert.match(html, /class="reader-file-group"><h3 title="02_成果">02_成果/u);
+  assert.match(html, /项目根目录/u);
+  assert.match(html, /title="02_成果\/sample.md" aria-label="sample.md — 02_成果\/sample.md"/u);
+  assert.match(html, /&lt;name&gt;\.txt/u);
+  assert.doesNotMatch(html, /<name>/u);
+  const urls = [...html.matchAll(/<a href="([^"]+resources\/read\?[^"]+)" title=/gu)].map(match => new URL(match[1].replaceAll('&amp;', '&'), 'http://atlas.local'));
+  assert.deepEqual(new Set(urls.map(url => url.searchParams.get('resource_id'))), new Set(['R-one', 'R-two', 'R-root']));
+  assert.ok(urls.every(url => url.searchParams.get('return_to') === returnHref));
+  assert.match(html, /aria-current="page"><strong>sample.md/u);
+  assert.match(html, /<details class="reader-actions-menu"><summary class="reader-button">更多/u);
+});
+
 test('Escaped Markdown and wiki links remain text even beside the same resolved link', () => {
   const text = String.raw`\[Literal](a.md) \[[folder/a|Literal]] [Open](a.md) [[folder/a|Open]] \[Web](https://example.test)`;
   const tokens = readerLinkTokens(text);

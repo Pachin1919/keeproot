@@ -1,3 +1,4 @@
+import { brandDefaultUiCopy } from './brand.js';
 import { WORK_MESSAGES } from './work-messages.js';
 import { RESOURCE_MESSAGES } from './resource-messages.js';
 import { SETTINGS_MESSAGES } from './settings-messages.js';
@@ -118,6 +119,8 @@ const MESSAGES = Object.freeze({
     "reader.read": "Read",
     "reader.title": "Resource reader",
     "reader.files": "Files",
+    "reader.root_folder": "Project files",
+    "reader.more_actions": "More",
     "reader.focus": "Focus reading",
     "reader.source": "Source and relationships",
     "reader.source_help": "Open the same Resource to inspect its stored source, relationships, and related work.",
@@ -1134,7 +1137,7 @@ const MESSAGES = Object.freeze({
     'settings.language_select': 'Interface language',
     'settings.locale_en': 'English',
     'settings.locale_zh_cn': '简体中文',
-    'settings.save': 'Save settings',
+    'settings.save': 'Save and close',
     'settings.reset': 'Restore defaults',
     'settings.language_packs': 'Language packs',
     'settings.language_packs_description': 'Add a reviewed JSON language pack for this local Runtime. Atlas validates it before installation.',
@@ -1356,6 +1359,8 @@ const MESSAGES = Object.freeze({
     "reader.read": "阅读",
     "reader.title": "资源阅读",
     "reader.files": "文件",
+    "reader.root_folder": "项目根目录",
+    "reader.more_actions": "更多",
     "reader.focus": "专注阅读",
     "reader.source": "来源与关系",
     "reader.source_help": "打开同一资源，查看已存来源、关系和相关工作。",
@@ -2373,7 +2378,7 @@ const MESSAGES = Object.freeze({
     'settings.language_select': '界面语言',
     'settings.locale_en': 'English',
     'settings.locale_zh_cn': '简体中文',
-    'settings.save': '保存设置',
+    'settings.save': '保存并退出',
     'settings.reset': '恢复默认设置',
     'settings.language_packs': '语言包',
     'settings.language_packs_description': '为此本地 Runtime 添加已审核的 JSON 语言包。Atlas 会在安装前验证它。',
@@ -2516,7 +2521,7 @@ function catalogMessage(locale, namespace, key, catalog) {
 
 export function translateUi(locale, key, catalog = null) {
   const normalized = normalizeUiLocale(locale);
-  return catalogMessage(normalized, 'atlas', key, catalog) ?? MESSAGES[normalized]?.[key] ?? MESSAGES.en[key] ?? key;
+  return catalogMessage(normalized, 'atlas', key, catalog) ?? brandDefaultUiCopy(MESSAGES[normalized]?.[key] ?? MESSAGES.en[key] ?? key);
 }
 
 export function translateModuleUi(locale, namespace, key, catalog = null, fallbackMessages = {}) {

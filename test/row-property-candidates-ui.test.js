@@ -10,7 +10,7 @@ import { createContentLocationService } from '../src/content-location-service.js
 import { createProjectViewService } from '../src/project-view-service.js';
 import { startAtlasUiServer } from '../src/ui-server.js';
 
-const pythonPath = path.resolve('test/.tmp/v20-01-isolated-install/desktop-ui/venv/Scripts/python.exe');
+const pythonPath = (process.env.ATLAS_TEST_PYTHON ?? process.env.ATLAS_CONTENT_PYTHON ?? path.resolve('test/.tmp/v20-01-isolated-install/desktop-ui/venv/Scripts/python.exe'));
 function makeBook(file) {
   const script = String.raw`import sys,zipfile
 with zipfile.ZipFile(sys.argv[1],'w',zipfile.ZIP_DEFLATED) as z:

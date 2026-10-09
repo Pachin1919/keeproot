@@ -7,6 +7,7 @@ import {fileURLToPath} from 'node:url';
 import {prepareProductDemo,serveProductDemo,loadProductDemo} from '../scripts/demo.js';
 import {isPathInside} from '../src/paths.js';
 import {Registry} from '../src/registry.js';
+import {RUNTIME_HANDSHAKE_TIMEOUTS} from '../src/runtime-location.js';
 
 const repo=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 test('demo UI assembles the rule service and shows an empty Project without creating rules',async t=>{
@@ -35,6 +36,7 @@ function isolatedScript(t){
   for(const dir of ['scripts','src','fixtures'])fs.mkdirSync(path.join(fake,dir),{recursive:true});
   fs.copyFileSync(path.join(repo,'scripts/demo.js'),path.join(fake,'scripts/demo.js'));
   fs.copyFileSync(path.join(repo,'src/paths.js'),path.join(fake,'src/paths.js'));
+  fs.writeFileSync(path.join(fake,'src/runtime-location.js'), `export const RUNTIME_HANDSHAKE_TIMEOUTS = ${JSON.stringify(RUNTIME_HANDSHAKE_TIMEOUTS)};`);
   fs.writeFileSync(path.join(fake,'package.json'),'{"type":"module"}');
   fs.writeFileSync(path.join(fake,'src/tracker.js'),'export class Tracker { constructor(){throw new Error("legacy stopped after cleanup");} }');
   fs.cpSync(path.join(repo,'fixtures/demo-vault'),path.join(fake,'fixtures/demo-vault'),{recursive:true});

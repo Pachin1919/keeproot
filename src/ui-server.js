@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -50,6 +51,8 @@ import { renderRoundTimelineView } from './ui/views/round-timeline-view.js';
 import { RoundRecovery } from './round-recovery.js';
 import { createHandoffService } from './handoff-service.js';
 import { renderHandoffView } from './ui/views/handoff-view.js';
+import { createHostSessionService } from './host-session-service.js';
+import { renderHostSessionView, renderHostSessionError } from './ui/views/host-session-view.js';
 import { browseProjectFiles, projectDirectory, projectPath, searchProjectFiles } from './ui/project-files.js';
 import {
   readRecentWorkState, removeRecentWork,
@@ -361,6 +364,7 @@ export async function startAtlasUiServer({
   resourceControl: injectedResourceControl = null,
   captureSourceOptions = {},
   dataWorkService = null,
+  hostSessionOptions = {},
   openLocalFileFn = openLocalFile,
 }) {
   // Read installation identity once; this is manifest provenance, not a full file audit.
@@ -383,7 +387,9 @@ export async function startAtlasUiServer({
   const csrfToken = crypto.randomBytes(32).toString('hex');
   const uiClientRunId = `UI-${crypto.randomUUID()}`;
   let preferences = readUiPreferences(stateDir);
+  const navigationContext = new AsyncLocalStorage();
   const displayOptions = () => ({
+    ...navigationContext.getStore(),
     locale: preferences.locale,
     languageCatalog: loadLanguageCatalog(stateDir),
     htmlAttributes: preferenceHtmlAttributes(preferences),
@@ -732,7 +738,7 @@ export async function startAtlasUiServer({
     });
     return {
       projects: entries,
-      selected_project_id: entries.find((entry) => entry.folder_available)?.id ?? entries[0]?.id ?? null,
+      selected_project_id: null,
       notice: recentState.error ? 'Recent Project work could not be loaded. Registered Projects are still available.' : null,
       bootstrap_connect_scans: bootstrap.status().filter((scan) => scan.status === 'initialized').slice(0, 20).flatMap((scan) => {
         try {
@@ -806,6 +812,11 @@ export async function startAtlasUiServer({
     ? new RoundRecovery({ stateDir, registry }) : null;
   const handoffs = handoffRecovery
     ? createHandoffService({ registry, rules, saveService, dataWork, roundRecovery: handoffRecovery, resourceControl }) : null;
+  const hostSessions = createHostSessionService({ stateDir, handoffs, resolveProject: projectId => {
+    const entry = projectEntry(projectId);
+    return { ...entry, project: registry.list().find(project => project.id === projectId) };
+  },
+    config: hostSessionOptions.config, clientFactory: hostSessionOptions.clientFactory });
   tableModule = createTableWorkModule({
     dataWork, savedWork,
     resolveProject: (projectId) => {
@@ -1035,8 +1046,13 @@ export async function startAtlasUiServer({
   };
   let settleClosed;
   const closed = new Promise((resolve) => { settleClosed = resolve; });
-  const server = http.createServer(async (request, response) => {
+  const server = http.createServer((request, response) => navigationContext.run({}, async () => {
     const url = new URL(request.url, `http://${host}`);
+    // A global page may offer a return link; the hint never selects a write destination.
+    if (['/projects', '/activity', '/files', '/settings', '/search', '/modules'].includes(url.pathname) && url.searchParams.has('project_id')) {
+      try { navigationContext.getStore().project = projectEntry(url.searchParams.get('project_id')).project; navigationContext.getStore().projectReturnContext = true; }
+      catch { navigationContext.getStore().projectUnavailable = true; }
+    }
     try {
       if (request.method === 'POST' && !tableWorkEnabled()) {
         const multiMutation = url.pathname.match(/^\/work\/(DWT-[a-f0-9]{32})\/(?:action|reuse|conflict|save\/review|save\/confirm)$/u);
@@ -3246,7 +3262,7 @@ export async function startAtlasUiServer({
         if (action === 'compare' && !operation && request.method === 'GET') {
           const choices = searchProjectFiles(entry.root, '', { acceptFile: (item) => contentComparisonSupported(item.relative_path) }).items;
           renderCompare(response, {
-            mode: 'project-choose', choices, compare_action: `${entry.base}/compare/run`,
+            project: entry.project, mode: 'project-choose', choices, compare_action: `${entry.base}/compare/run`,
             compare_href: `${entry.base}/compare`, back_href: `${entry.base}/files`, nav_current: 'Projects',
           }); return;
         }
@@ -3281,7 +3297,7 @@ export async function startAtlasUiServer({
             const comparisonId = `CMP-${crypto.randomBytes(16).toString('hex')}`;
             comparisons.set(comparisonId, {
               created_at: Date.now(), left_path: leftPath, right_path: rightPath, comparison,
-              compare_href: `${entry.base}/compare`, back_href: entry.base, nav_current: 'Projects',
+              compare_href: `${entry.base}/compare`, back_href: entry.base, nav_current: 'Projects', project: entry.project,
             });
             redirect(response, `/compare/result/${encodeURIComponent(comparisonId)}`); return;
           } catch (error) {
@@ -3354,7 +3370,7 @@ export async function startAtlasUiServer({
           return;
         }
         renderCompare(response, {
-          mode: 'result', comparison_id: compareResultMatch[1], comparison: stored.comparison,
+          project: stored.project, mode: 'result', comparison_id: compareResultMatch[1], comparison: stored.comparison,
           compare_href: stored.compare_href, back_href: stored.back_href, nav_current: stored.nav_current,
         });
         return;
@@ -3997,6 +4013,10 @@ export async function startAtlasUiServer({
               accent: form.get('selected_accent') ?? form.get('accent'),
               contrast: form.get('contrast'),
               text_size: form.get('text_size'),
+              ui_scale: form.get('ui_scale') ?? preferences.ui_scale,
+              font_family: form.get('font_family') ?? preferences.font_family,
+              reading_font: form.get('reading_font') ?? preferences.reading_font,
+              reading_spacing: form.get('reading_spacing') ?? preferences.reading_spacing,
               density: form.get('density'),
               project_rail_width: form.get('project_rail_width'),
               app_rail_width: form.get('app_rail_width'),
@@ -4014,7 +4034,16 @@ export async function startAtlasUiServer({
           }));
           return;
         }
+        if (form.get('action') === 'save') {
+          const destination = new URL(returnHref, 'http://atlas.local');
+          const navigationProject = navigationContext.getStore()?.project;
+          // Preserve the verified navigation hint; scoped object routes still resolve their own Project.
+          if (navigationProject?.id) destination.searchParams.set('project_id', navigationProject.id);
+          redirect(response, `${destination.pathname}${destination.search}${destination.hash}`); return;
+        }
         const redirectSearch = new URLSearchParams({ saved: '1' });
+        const navigationProject = navigationContext.getStore()?.project;
+        if (navigationProject?.id) redirectSearch.set('project_id', navigationProject.id);
         if (form.has('return_to')) redirectSearch.set('return_to', returnHref);
         response.writeHead(303, { location: `/settings?${redirectSearch}`, 'cache-control': 'no-store' });
         response.end();
@@ -4339,6 +4368,81 @@ export async function startAtlasUiServer({
         }
         return;
       }
+      const hostSessionMatch = url.pathname.match(/^\/projects\/([^/]+)\/host-sessions(?:\/(HSE-[a-f0-9-]+)(?:\/(status|events|deny|cancel|reconnect))?)?$/u);
+      if (hostSessionMatch) {
+        const [, encodedProjectId, sessionId, operation] = hostSessionMatch;
+        const projectId = decodeURIComponent(encodedProjectId);
+        const jsonRead = request.method === 'GET' && ['status', 'events'].includes(operation);
+        let entry;
+        let handoffId = null;
+        try {
+          let form;
+          if (request.method === 'POST') {
+            form = await readForm(request, 64 * 1024);
+            if (!equalSecret(csrfToken, form.get('csrf'))) {
+              sendJson(response, 403, { ok: false, error: { code: 'ATLAS_CSRF', message: 'Atlas UI session token is invalid.' } }); return;
+            }
+            const fields = !sessionId ? ['csrf', 'handoff_id', 'expected_digest', 'expected_work_revision', 'request_key', 'prompt']
+              : operation === 'deny' ? ['csrf', 'expected_revision', 'request_id'] : ['csrf', 'expected_revision'];
+            if ([...form.keys()].some(key => !fields.includes(key) || form.getAll(key).length !== 1)) {
+              throw Object.assign(new Error('Unsupported Host session form field.'), { code: 'ATLAS_INVALID_ARGUMENT' });
+            }
+          }
+          entry = projectEntry(projectId);
+          if (request.method === 'POST' && !sessionId) {
+            const availability = hostSessions.availability();
+            if (!availability.enabled) throw Object.assign(new Error(availability.reason || 'AI sessions are not enabled.'), { code: 'HOST_DISABLED' });
+            handoffId = String(form.get('handoff_id') ?? '');
+            const revision = String(form.get('expected_work_revision') ?? '');
+            if (!handoffId || handoffId.length > 128 || !/^[a-f0-9]{64}$/u.test(form.get('expected_digest') ?? '')
+              || !/^[1-9]\d*$/u.test(revision) || !Number.isSafeInteger(Number(revision))
+              || !/^[A-Za-z0-9._:-]{1,128}$/u.test(form.get('request_key') ?? '')
+              || !String(form.get('prompt') ?? '').trim() || String(form.get('prompt')).length > 16000) {
+              throw Object.assign(new Error('The reviewed Handoff identity or session instruction is invalid.'), { code: 'ATLAS_INVALID_ARGUMENT' });
+            }
+            const session = await hostSessions.start(projectId, { handoff_id: handoffId, expected_digest: form.get('expected_digest'),
+              expected_work_revision: Number(revision), request_key: form.get('request_key'), prompt: form.get('prompt') });
+            redirect(response, `${entry.base}/host-sessions/${encodeURIComponent(session.session_id)}`); return;
+          }
+          if (!sessionId || !/^HSE-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u.test(sessionId)) {
+            throw Object.assign(new Error('The recorded AI session is unavailable.'), { code: 'ATLAS_NOT_FOUND' });
+          }
+          if (request.method === 'GET' && (!operation || jsonRead)) {
+            const after = operation === 'events' ? String(url.searchParams.get('after_sequence') ?? '0') : '0';
+            if (!/^\d+$/u.test(after) || !Number.isSafeInteger(Number(after))) throw Object.assign(new Error('Invalid event sequence.'), { code: 'ATLAS_INVALID_ARGUMENT' });
+            const result = operation === 'status' ? { session: await hostSessions.show(projectId, sessionId) }
+              : await hostSessions.events(projectId, sessionId, Number(after));
+            if (jsonRead) sendJson(response, 200, { ok: true, result });
+            else sendPage(response, 200, renderHostSessionView({ ...result, project: entry.project }, { csrfToken, ...displayOptions() }));
+            return;
+          }
+          if (request.method === 'POST' && ['deny', 'cancel', 'reconnect'].includes(operation)) {
+            const revision = String(form.get('expected_revision') ?? '');
+            if (!/^\d+$/u.test(revision) || !Number.isSafeInteger(Number(revision))) throw Object.assign(new Error('Invalid session revision.'), { code: 'ATLAS_INVALID_ARGUMENT' });
+            if (operation === 'deny') {
+              const requestId = String(form.get('request_id') ?? '');
+              if (!requestId || requestId.length > 256) throw Object.assign(new Error('The current permission request is required.'), { code: 'ATLAS_INVALID_ARGUMENT' });
+              await hostSessions.decide(projectId, sessionId, { request_id: requestId, expected_revision: Number(revision), decision: 'deny' });
+            } else await hostSessions[operation](projectId, sessionId, { expected_revision: Number(revision) });
+            redirect(response, `${entry.base}/host-sessions/${encodeURIComponent(sessionId)}`); return;
+          }
+          throw Object.assign(new Error('This session action is unavailable.'), { code: 'ATLAS_INVALID_ARGUMENT' });
+        } catch (error) {
+          const status = ['HOST_DISABLED', 'ATLAS_HOST_DISABLED'].includes(error.code) ? 503 : ['ATLAS_PROJECT_MISMATCH', 'ATLAS_PATH_BOUNDARY'].includes(error.code) ? 403
+            : error.code === 'ATLAS_NOT_FOUND' ? 404 : error.code === 'ATLAS_STATE_CONFLICT' ? 409 : 400;
+          if (jsonRead) sendJson(response, status, { ok: false, error: { code: error.code ?? 'HOST_PROTOCOL', message: safeNotice(error) } });
+          else {
+            let current = null;
+            if (entry && sessionId) { try { current = await hostSessions.events(projectId, sessionId); } catch {} }
+            sendPage(response, status, current
+              ? renderHostSessionView({ ...current, project: entry.project, notice: safeNotice(error) }, { csrfToken, ...displayOptions() })
+              : renderHostSessionError({ project: entry?.project ?? null, notice: safeNotice(error),
+                disabled: ['HOST_DISABLED', 'ATLAS_HOST_DISABLED'].includes(error.code),
+                backHref: entry ? handoffId ? `${entry.base}/handoffs/${encodeURIComponent(handoffId)}` : entry.base : '/projects' }, displayOptions()));
+          }
+          return;
+        }
+      }
       const handoffCreateMatch = url.pathname.match(/^\/projects\/([^/]+)\/handoffs$/u);
       if (handoffCreateMatch && request.method === 'POST') {
         if (!handoffs) { sendPage(response, 503, errorView('Host Handoff is unavailable in this installation.')); return; }
@@ -4392,7 +4496,8 @@ export async function startAtlasUiServer({
           } catch { return { id: saveId, name: saveId, href: null }; }
         });
         const work = dataWork.session(handoff.work_id);
-        renderHandoff(response, { base: entry.base, project: entry.project, handoff, resource_items: resourceItems, save_items: saveItems, work_name: work?.project_id === projectId ? work.intent : null });
+        renderHandoff(response, { base: entry.base, project: entry.project, handoff, resource_items: resourceItems, save_items: saveItems, work_name: work?.project_id === projectId ? work.intent : null,
+          host_availability: hostSessions.availability(), host_request_key: `UI-HOST-${crypto.randomUUID()}` });
         return;
       }
       const projectMatch = url.pathname.match(/^\/projects\/([^/]+)$/u);
@@ -4417,13 +4522,14 @@ export async function startAtlasUiServer({
     } catch (error) {
       sendPage(response, error.code === 'ATLAS_PATH_BOUNDARY' ? 403 : 400, errorView(safeNotice(error)));
     }
-  });
+  }));
   let address;
   try {
     address = await listenOnUsablePort(server, { host, port });
   } catch (error) {
     clearInterval(selectionExpiry);
     desktopSelections.clear();
+    hostSessions.dispose();
     projectMove?.dispose();
     projectMembership?.dispose();
     contentLocations?.dispose();
@@ -4437,6 +4543,7 @@ export async function startAtlasUiServer({
     desktopSelections.clear();
     bootstrap.dispose();
     handoffRecovery?.dispose();
+    hostSessions.dispose();
     projectMove?.dispose();
     projectMembership?.dispose();
     contentLocations?.dispose();
@@ -4460,6 +4567,7 @@ export async function startAtlasUiServer({
     closed,
     close: () => new Promise((resolve, reject) => {
       if (!server.listening) {
+        hostSessions.dispose();
         bootstrap.dispose();
         projectMove?.dispose();
         projectMembership?.dispose();

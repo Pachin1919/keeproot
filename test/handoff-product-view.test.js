@@ -36,6 +36,6 @@ test('Home explicitly selects saved results by name without guessing or selectin
   assert.match(html, /type="checkbox" name="save_ids" value="SAV-result"/u);
   assert.doesNotMatch(html, /type="checkbox" name="save_ids"[^>]*checked|placeholder="SAV-/u);
   assert.match(html, /地区汇总.csv/u);
-  assert.match(html, /创建接续包时Atlas会再次核验/u);
+  assert.match(html, /创建接续包时Keeproot会再次核验/u);
   assert.match(html, /<option value="DWT-test">合并地区资料/u);
 });

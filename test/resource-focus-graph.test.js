@@ -15,7 +15,7 @@ import { createTableWorkModule } from '../src/table-work-module.js';
 import { startAtlasUiServer } from '../src/ui-server.js';
 import { MODULE_PROTOCOL_VERSION } from '../src/protocol.js';
 
-const python = path.resolve('test/.tmp/v20-01-isolated-install/desktop-ui/venv/Scripts/python.exe');
+const python = (process.env.ATLAS_TEST_PYTHON ?? process.env.ATLAS_CONTENT_PYTHON ?? path.resolve('test/.tmp/v20-01-isolated-install/desktop-ui/venv/Scripts/python.exe'));
 const pythonRoot = path.resolve('python'); const pythonSourceRoot = path.resolve('python/src');
 function runDataWork(args) {
   const argv = ['-m', 'atlas_content', 'data-work', '--file', args.filePath, '--expected-sha256', args.expectedSha256, '--action', args.action];

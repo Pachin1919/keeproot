@@ -13,7 +13,7 @@ import { createTableWorkModule } from '../src/table-work-module.js';
 import { MODULE_PROTOCOL_VERSION } from '../src/protocol.js';
 import { renderDataWorkView } from '../src/ui/views/data-work-view.js';
 
-const python = path.resolve('test/.tmp/v20-01-isolated-install/desktop-ui/venv/Scripts/python.exe');
+const python = (process.env.ATLAS_TEST_PYTHON ?? process.env.ATLAS_CONTENT_PYTHON ?? path.resolve('test/.tmp/v20-01-isolated-install/desktop-ui/venv/Scripts/python.exe'));
 const pythonRoot = path.resolve('python');
 const pythonSourceRoot = path.resolve('python/src');
 
