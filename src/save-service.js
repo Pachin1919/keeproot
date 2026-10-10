@@ -516,9 +516,12 @@ export class SaveService {
         shown.undo_available = false;
       }
     }
+    const recoveryMatches = Boolean(row.project?.id && row.target?.path && row.target?.resource_path != null
+      && projected.project?.id === row.project.id && projected.target?.path === row.target.path
+      && projected.target?.resource_path === row.target.resource_path);
     return { ...projected, verified: shown.verified, current_output: shown.current_output,
-      undo_available: projected.project.id === row.project.id && projected.target.path === row.target.path && projected.target.resource_path === row.target.resource_path && shown.undo_available,
-      redo_available: projected.project.id === row.project.id && projected.target.path === row.target.path && projected.target.resource_path === row.target.resource_path && shown.redo_available };
+      undo_available: recoveryMatches && shown.undo_available,
+      redo_available: recoveryMatches && shown.redo_available };
   }
 
   // Read projection only. Original Save, Intake journal and verification receipts stay immutable.

@@ -34,7 +34,12 @@ export function renderResourceReaderView(model, options = {}) {
   } catch {}
   let body;
   if (model.notice) body = `<div class="reader-empty" role="alert"><h2>${h(t('unavailable'))}</h2><p>${h(model.notice)}</p><a href="${h(detailsHref)}">${h(t('details'))}</a></div>`;
-  else if (reader.kind === 'markdown' && typeof reader.text === 'string') body = `<article class="reader-paper reader-markdown">${renderMarkdown(reader.text, model.links ?? [])}</article>`;
+  else if (reader.kind === 'markdown' && typeof reader.text === 'string') {
+    const header = /^---\r?\n([\s\S]{0,16384}?)\r?\n---(?:\r?\n|$)/u.exec(reader.text);
+    const captured = header && /^source_url:/mu.test(header[1]) && /^capture_mode:/mu.test(header[1]);
+    const metadata = captured ? `<details class="reader-source-metadata"><summary>${h(u('source_metadata'))}</summary><pre>${h(header[1])}</pre></details>` : '';
+    body = `<article class="reader-paper reader-markdown">${metadata}${renderMarkdown(captured ? reader.text.slice(header[0].length) : reader.text, model.links ?? [])}</article>`;
+  }
   else if (reader.kind === 'text' && typeof reader.text === 'string') body = `<article class="reader-paper"><pre class="reader-text">${h(reader.text)}</pre></article>`;
   else if (reader.kind === 'table' && reader.table) {
     const table = reader.table;

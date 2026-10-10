@@ -390,3 +390,12 @@ body .is-compact-app-rail .brand-mark .product-mark, .atlas-reader-body .brand-m
 .toolbox-page .toolbox-tools label:has(input:checked) { background:var(--surface-muted); border-color:var(--accent); }
 .toolbox-page .toolbox-tools input { flex:none; margin:0; }
 @media(max-width:640px) { .reader-edit-versions { grid-template-columns:minmax(0,1fr); } .reader-task-actions { align-items:stretch; } .reader-task-actions .reader-button { white-space:normal; } .reader-text-editor { padding:10px; min-height:45vh; } }
+
+.toolbox-conversion { margin-top:22px; }
+.toolbox-conversion form { display:grid; grid-template-columns: minmax(0,2fr) minmax(0,1fr); gap:16px; margin:18px 0; }
+.toolbox-conversion label { display:grid; gap:7px; min-width:0; }
+.toolbox-conversion label:first-of-type { grid-column:1/-1; }
+.toolbox-tools label { display:flex; align-items:flex-start; flex:1 1 220px; }
+.toolbox-tools small { display:block; font-size:var(--font-size-small); max-width:36ch; margin-top:6px; }
+.toolbox-work-exit { display:flex; flex-wrap:wrap; align-items:center; gap:14px; margin-bottom:16px; }
+@media(max-width:640px) { .toolbox-conversion form { grid-template-columns:minmax(0,1fr); } }

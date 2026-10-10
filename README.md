@@ -10,6 +10,7 @@ Current version: **2.0.0-preview.1**. This is preview source, not a stable relea
 
 - Browse and read Markdown, text, images, PDF, DOCX and CSV/XLSX in the workspace.
 - Open Toolbox in the left navigation, select CSV/XLSX materials, and enter a Python table recipe: align, combine, filter, convert types, deduplicate and sort; preview and save the full result.
+- In Toolbox → Content conversion, turn a supported static public URL into a real `.md` file: choose an existing folder, preview, explicitly Save, then read. Source JSON and conversation export capture remain separate options.
 - Edit Markdown or text alongside reading: preview changes, explicitly save to the same Resource, or Undo the edit. Editing does not launch an AI session.
 - Calculate grouped sums, two-axis pivot totals/shares/ranks, and monthly totals with period growth. [Processing implementation and limits](<docs/Atlas 技术作品与企业评审说明.md#python-processing>).
 - Reuse a work configuration with explicitly selected new sources; review source changes.

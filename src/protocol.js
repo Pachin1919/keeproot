@@ -4,6 +4,12 @@ export const MODULE_PROTOCOL_VERSION = 'atlas.module.v1';
 
 // Current callable additions. CLI help and Host discovery consume this same data.
 export const CURRENT_COMMAND_GUIDE = Object.freeze([
+  { commands: ['capture source prepare-markdown'],
+    purpose: 'Prepare a real Markdown candidate from bounded public HTTP content for explicit Save confirmation.',
+    required: '--url, --project, --folder, --name, --request-key, --tool, --client-run-id and --json',
+    returns: 'Save identity, target, candidate Work/hash/bytes and public capture scope; no target file before Save',
+    on_failure: 'Correct URL or existing output folder/name; inaccessible shares require the existing export capture flow. Dynamic content and page layout are not proven.',
+    example: 'atlas capture source prepare-markdown --url <public_url> --project <project_id> --folder <existing_folder> --name <name> --request-key <key> --tool <host> --client-run-id <run_id> --json' },
   { commands: ['handoff create', 'handoff list', 'handoff show', 'handoff read'],
     purpose: 'Read or create a bounded continuation for an existing Table Work.',
     required: '--project; create also --request-file; show/read also handoff_id',
@@ -92,7 +98,7 @@ export const CAPABILITIES = Object.freeze({
       'prepare', 'preview', 'approve', 'reject', 'execute', 'rollback',
       'plan-prepare', 'plan-preview', 'plan-approve', 'plan-reject', 'plan-execute', 'plan-rollback',
     ],
-    capture: ['fetch', 'localize', 'sample', 'source-prepare', 'source-inspect-export', 'source-prepare-export', 'source-show', 'source-read'],
+    capture: ['fetch', 'localize', 'sample', 'source-prepare', 'source-prepare-markdown', 'source-inspect-export', 'source-prepare-export', 'source-show', 'source-read'],
     content: ['inspect', 'compare', 'branches', 'prepare-data', 'localize-conversation'],
     work: ['stage', 'status', 'release'],
     storage: ['status', 'plan', 'execute'],

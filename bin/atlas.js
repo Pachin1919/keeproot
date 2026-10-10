@@ -168,6 +168,9 @@ Usage:
   atlas capture sample <work_id> [--start-character <number>] [--characters <1..4000>]
   atlas capture source prepare --url <public_url> --project <project_id> --folder <existing_project_folder>
                                --name <base_name> --request-key <key> --tool <host> --client-run-id <id>
+  atlas capture source prepare-markdown --url <public_url> --project <project_id> --folder <existing_project_folder>
+    --name <plain_name> --request-key <key> --tool <host> --client-run-id <run_id> --json
+    Prepares a real Markdown candidate; explicitly confirm it with atlas save. Static public content only.
   atlas capture source inspect-export --input <conversations.json> [--limit <1..100>] [--cursor <opaque>] [--json]
   atlas capture source prepare-export --input <conversations.json> --expected-input-sha256 <hash> --selection <index:hash>
                                       --project <project_id> --folder <existing_project_folder> --name <base_name>
@@ -2609,7 +2612,7 @@ async function handleCapture(capture, captureSourceModule, args) {
   const [action, ...rest] = args;
   if (action === 'source') {
     const [sourceAction, ...sourceArgs] = rest;
-    if (sourceAction === 'prepare') {
+    if (sourceAction === 'prepare' || sourceAction === 'prepare-markdown') {
       const options = {};
       for (let index = 0; index < sourceArgs.length; index += 1) {
         const token = sourceArgs[index];
@@ -2620,17 +2623,18 @@ async function handleCapture(capture, captureSourceModule, args) {
         else if (token === '--request-key') options.requestKey = sourceArgs[++index];
         else {
           const consumed = parseCallerFlag(options, sourceArgs, index);
-          if (consumed == null) throw new Error(`Unknown capture source prepare argument: ${token}`);
+          if (consumed == null) throw new Error(`Unknown capture source ${sourceAction} argument: ${token}`);
           index = consumed;
         }
       }
       if (!options.url || !options.projectId || !options.folder || !options.name || !options.requestKey || !options.tool || !options.clientRunId) {
-        throw new Error('capture source prepare requires --url, --project, --folder, --name, --request-key, --tool, and --client-run-id.');
+        throw new Error(`capture source ${sourceAction} requires --url, --project, --folder, --name, --request-key, --tool, and --client-run-id.`);
       }
+      if(sourceAction==='prepare-markdown' && !outputJson)throw new Error('capture source prepare-markdown requires --json.');
       const envelope = await captureSourceModule.invoke({ protocol: MODULE_PROTOCOL_VERSION, module_id: 'atlas.capture-source',
-        project_id: options.projectId, action: 'capture-url', parameters: { ...options, caller: { tool: options.tool, client_run_id: options.clientRunId } } });
+        project_id: options.projectId, action: sourceAction==='prepare-markdown'?'capture-markdown':'capture-url', parameters: { ...options, caller: { tool: options.tool, client_run_id: options.clientRunId } } });
       const receipt = envelope.data;
-      emit('capture.source.prepare', receipt, (data) => console.log(data.status === 'export_required'
+      emit(sourceAction==='prepare-markdown'?'capture.source.prepare_markdown':'capture.source.prepare', receipt, (data) => console.log(data.status === 'export_required'
         ? data.reason : `${data.status}: ${data.save_id} (${data.version_id}).`));
       return;
     }

@@ -5,7 +5,7 @@ export const CAPTURE_SOURCE_MODULE_DESCRIPTOR = Object.freeze({
   module_id: 'atlas.capture-source',
   module_version: '1.0.0',
   contract: 'static_first_party',
-  actions: Object.freeze(['inspect-export', 'prepare-export', 'capture-url', 'show', 'read']),
+  actions: Object.freeze(['inspect-export', 'prepare-export', 'capture-url', 'capture-markdown', 'show', 'read']),
 });
 
 const ACTIONS = new Set(CAPTURE_SOURCE_MODULE_DESCRIPTOR.actions);
@@ -59,6 +59,9 @@ export function createCaptureSourceModule({ captureSource, availability = null }
       data = await captureSource.prepareExport({ ...parameters, projectId });
     } else if (action === 'capture-url') {
       data = await captureSource.prepare({ ...parameters, projectId });
+    } else if (action === 'capture-markdown') {
+      if(typeof captureSource.prepareMarkdown!=='function')throw moduleError('ATLAS_MODULE_ACTION_UNSUPPORTED','This Runtime does not provide public Markdown preparation.');
+      data = await captureSource.prepareMarkdown({ ...parameters, projectId });
     } else if (action === 'show') {
       const saveId = parameters.saveId ?? parameters.save_id;
       if (typeof saveId !== 'string' || !saveId.trim()) throw moduleError('ATLAS_MODULE_INVALID_REQUEST', 'Capture Source show requires a Save ID.');

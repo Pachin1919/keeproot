@@ -11,6 +11,7 @@ import {
   normalizeUiPreferences, preferenceHtmlAttributes, preferenceRailStyle, readUiPreferences, resetUiPreferences, writeUiPreferences,
 } from './ui/preferences.js';
 import { escapeHtml, renderNav } from './ui/components.js';
+import { translateUi } from './ui/i18n.js';
 import { uiStyles } from './ui/styles.js';
 import { renderSettingsView } from './ui/views/settings-view.js';
 import { loadLanguageCatalog, inspectLanguagePack, installLanguagePack } from './ui/language-packs.js';
@@ -36,6 +37,7 @@ import { createDocumentUpdateService } from './document-update-service.js';
 import { renderContentLocationView } from './ui/views/content-location-view.js';
 import { createContentLocationService } from './content-location-service.js';
 import { createResourceReaderService } from './resource-reader-service.js';
+import { boundedRecipeDraft, toolboxErrorKey } from './ui/toolbox-flow.js';
 import { renderToolboxView } from './ui/views/toolbox-view.js';
 import { renderResourceReaderView } from './ui/views/resource-reader-view.js';
 import { createCaptureSourceService } from './capture-source-service.js';
@@ -408,6 +410,8 @@ export async function startAtlasUiServer({
   const batchImports = new Map();
   const workSelections = new Map();
   const toolboxHints = new Map();
+  const toolboxDrafts = new Map();
+  const recipeDrafts = new Map();
   const workDraftConflicts = new Map();
   const desktopSelections = createDesktopSelectionService({ maxBatchFiles: MAX_BATCH_FILES, now, queueLifetimeMs });
   const projectOnboarding = createProjectOnboardingService({ registry });
@@ -543,6 +547,7 @@ export async function startAtlasUiServer({
   };
   const workSelectionBackHref = (entry, selection) => {
     if (selection?.reader_return_href) return selection.reader_return_href;
+    if (selection?.toolbox_return_href) return selection.toolbox_return_href;
     const origin = selection?.return_state?.origin ?? {};
     if (origin.kind === 'view' && origin.id) return `${entry.base}/resources?view=${encodeURIComponent(origin.id)}`;
     const query = new URLSearchParams();
@@ -815,6 +820,21 @@ export async function startAtlasUiServer({
     if (typeof value !== 'string' || /[\\\r\n]/u.test(value)) return entry.base + '/resources';
     try { const parsed=new URL(value,'http://atlas.local'); return parsed.origin==='http://atlas.local' && parsed.pathname===entry.base+'/resources' ? parsed.pathname+parsed.search : entry.base+'/resources'; } catch { return entry.base+'/resources'; }
   };
+  const toolboxMaterialFact=(entry,id)=>{
+    const fact=workSourceFact(entry,id);
+    let stat;try{stat=fs.lstatSync(projectPath(entry.root,fact.relative_path));}catch{throw new Error('Selected Resource is unavailable.');}
+    if(!stat.isFile() || stat.isSymbolicLink())throw new Error('Selected Resource is unavailable.');
+    return fact;
+  };
+  const renderToolbox=(response,project,extra={},status=200)=>{
+    const resources=[];
+    if(project && resourceControl)for(const fact of resourceControl.projectResources(project.id)){try{resources.push(workSourceFact(projectEntry(project.id),fact.resource_id));}catch{}}
+    const folders=project ? projectImport.projectChoices().find(item=>item.id===project.id && item.available)?.folders ?? []:[];
+    sendPage(response,status,renderToolboxView({project,projects:activeProjects(),resources,folders,paused:!tableWorkEnabled(),capture_paused:!captureSourceModule || !moduleAvailability.get('atlas.capture-source').enabled,markdown:{request_key:'toolbox-md:'+crypto.randomUUID()},...extra},{csrfToken,...displayOptions()}));
+  };
+  const toolboxSaveReturn=(record,value)=>{
+    try{const parsed=new URL(value,'http://atlas.local');return parsed.origin==='http://atlas.local' && parsed.pathname==='/toolbox' && parsed.searchParams.get('project_id')===record.project?.id ? '/toolbox?project_id='+encodeURIComponent(record.project.id):null;}catch{return null;}
+  };
   const handoffRecovery = registry?.ledger?.db && typeof rules?.context === 'function' && saveService
     ? new RoundRecovery({ stateDir, registry }) : null;
   const handoffs = handoffRecovery
@@ -843,7 +863,10 @@ export async function startAtlasUiServer({
     if (!project && model.session?.project_id) {
       try { project = projectEntry(model.session.project_id).project; } catch { project = model.session.project ?? null; }
     }
-    sendPage(response, statusCode, renderDataWorkView({ ...model, tool_hint: toolboxHints.get(model.session?.session_id)?.tool, ...(model.mode === 'sources' && toolboxHints.get(model.session?.session_id)?.reader_return_href ? {back_href:toolboxHints.get(model.session.session_id).reader_return_href} : {}), project, csrf: csrfToken, module_paused: !tableWorkEnabled() }, displayOptions()));
+    const draft=recipeDrafts.get(model.session?.session_id);
+    const validDraft=draft && draft.revision===model.session?.revision && now()-draft.created_at<30*60_000 ? draft.entries:null;
+    if(draft && !validDraft)recipeDrafts.delete(model.session?.session_id);
+    sendPage(response, statusCode, renderDataWorkView({ ...model, recipe_draft:validDraft, toolbox_exit:toolboxHints.get(model.session?.session_id)?.exit_href, tool_hint: toolboxHints.get(model.session?.session_id)?.tool, ...(model.mode === 'sources' && toolboxHints.get(model.session?.session_id)?.reader_return_href ? {back_href:toolboxHints.get(model.session.session_id).reader_return_href} : {}), project, csrf: csrfToken, module_paused: !tableWorkEnabled() }, displayOptions()));
   };
   const renderWorkTarget = (response, model, statusCode = 200) => sendPage(response, statusCode, renderWorkTargetView({ ...model, csrf: csrfToken, module_paused: !tableWorkEnabled() }, displayOptions()));
 
@@ -1282,6 +1305,7 @@ export async function startAtlasUiServer({
         const id = saveMatch[1];
         const action = saveMatch[2];
         const record = saveService.show(id);
+        const toolbox_return=toolboxSaveReturn(record,url.searchParams.get('return_to'));
         projectEntry(record.project?.id);
         if (request.method === 'GET' && !action) {
           const captureRead = record.source?.kind === 'capture_source' && captureSourceModule
@@ -1298,7 +1322,7 @@ export async function startAtlasUiServer({
           try { protected_rounds = recovery.protectedRoundsForSave({ projectId: record.project.id, saveId: id, targetPath: record.target?.resource_path }); }
           catch { /* A recovery lookup failure must not hide the original Save receipt. */ }
           finally { recovery.dispose(); }
-          sendPage(response, 200, renderSaveResultView({ ...reviewed, capture_source: captureRead, board_delivery, protected_rounds, csrf: csrfToken }, displayOptions()));
+          sendPage(response, 200, renderSaveResultView({ ...reviewed, capture_source: captureRead, board_delivery, protected_rounds, toolbox_return, csrf: csrfToken }, displayOptions()));
           return;
         }
         if (request.method === 'POST' && action) {
@@ -1310,9 +1334,10 @@ export async function startAtlasUiServer({
             if (action === 'execute') saveService.execute(id, { reason: 'User confirmed the Save preview in Desktop.', expectedPreviewRevision: form.get('preview_revision') || null });
             else if (action === 'undo') saveService.undo(id);
             else saveService.redo(id);
-            redirect(response, `/saves/${encodeURIComponent(id)}`);
+            const savedReturn=toolboxSaveReturn(record,form.get('return_to'));
+            redirect(response, `/saves/${encodeURIComponent(id)}`+(savedReturn?'?'+new URLSearchParams({return_to:savedReturn}):''));
           } catch (error) {
-            sendPage(response, 409, renderSaveResultView({ ...saveService.review(id), csrf: csrfToken, notice: safeNotice(error) }, displayOptions()));
+            sendPage(response, 409, renderSaveResultView({ ...saveService.review(id), toolbox_return:toolboxSaveReturn(record,form.get('return_to')), csrf: csrfToken, notice: safeNotice(error) }, displayOptions()));
           }
           return;
         }
@@ -1979,6 +2004,7 @@ export async function startAtlasUiServer({
             if (selection.tool_hint) toolboxHints.set(work.session_id, {
               tool: selection.tool_hint,
               reader_return_href: selection.reader_return_href ?? null,
+              exit_href: selection.reader_return_href ?? selection.toolbox_return_href ?? null,
             });
             workSelections.delete(entry.project.id);
             recordWorkContinue(work);
@@ -2052,13 +2078,14 @@ export async function startAtlasUiServer({
             actionCompleted = true;
           } catch (error) {
             const action = String(form.get('action') ?? '');
-            if (error?.code === 'ATLAS_STATE_CONFLICT' && ['confirm_mapping', 'recipe'].includes(action)) {
+            if (error?.code === 'ATLAS_STATE_CONFLICT' && ['confirm_mapping', 'recipe'].includes(action) && (action !== 'recipe' || Number(form.get('base_revision')) !== dataWork.session(sessionId)?.revision)) {
               const token = storeWorkDraftConflict(sessionId, action, form, Number(form.get('base_revision')), dataWork.session(sessionId)?.revision ?? null);
               redirect(response, `/work/${encodeURIComponent(sessionId)}?draft_conflict=${encodeURIComponent(token)}`); return;
             }
-            notices.set(noticeKey, safeNotice(error));
+            if (action === 'recipe' && Number(form.get('base_revision')) === dataWork.session(sessionId)?.revision) recipeDrafts.set(sessionId,{revision:Number(form.get('base_revision')),entries:boundedRecipeDraft(form),created_at:now()});
+            notices.set(noticeKey,translateUi(displayOptions().locale,'toolbox.'+(toolboxErrorKey(error)==='capture_paused'?'paused':toolboxErrorKey(error)),displayOptions().languageCatalog));
           }
-          if (actionCompleted) recordWorkContinue(dataWork.session(sessionId));
+          if (actionCompleted) { if(form.get('action')==='recipe')recipeDrafts.delete(sessionId); recordWorkContinue(dataWork.session(sessionId)); }
           redirect(response, `/work/${encodeURIComponent(sessionId)}`); return;
         }
         if (operation === 'details' && request.method === 'GET') {
@@ -2813,14 +2840,25 @@ export async function startAtlasUiServer({
       }
       // Toolbox is presentation over the existing Table Work selection and review.
       if (url.pathname === '/toolbox' && request.method === 'GET') {
-        const context = navigationContext.getStore();
-        const project = context.project ?? null;
-        const resources = [];
-        if (project && resourceControl) for (const fact of resourceControl.projectResources(project.id)) {
-          try { resources.push(workSourceFact(projectEntry(project.id), fact.resource_id)); } catch {}
-        }
-        const notice = notices.get('toolbox:' + (project?.id ?? 'none')); notices.delete('toolbox:' + (project?.id ?? 'none'));
-        sendPage(response, 200, renderToolboxView({ project, projects: activeProjects(), resources, paused: !tableWorkEnabled(), notice }, { csrfToken, ...displayOptions() })); return;
+        const project = navigationContext.getStore().project ?? null;
+        const notice_key = notices.get('toolbox:'+(project?.id ?? 'none')); notices.delete('toolbox:'+(project?.id ?? 'none'));
+        renderToolbox(response,project,{...toolboxDrafts.get(project?.id),notice_key}); return;
+      }
+      const markdownRoute=url.pathname.match(/^\/projects\/([^/]+)\/toolbox\/markdown$/u);
+      if(markdownRoute && request.method==='POST') {
+        const form=await readForm(request);
+        if(!equalSecret(csrfToken,form.get('csrf'))){sendPage(response,403,errorView('Atlas UI session token is invalid.'));return;}
+        const entry=projectEntry(decodeURIComponent(markdownRoute[1]));
+        const markdown={url:String(form.get('url') ?? '').slice(0,2048),folder:String(form.get('folder') ?? '').slice(0,1024),name:String(form.get('name') ?? '').slice(0,120),request_key:String(form.get('request_key') ?? '').slice(0,200)};
+        try {
+          if(!captureSourceModule)throw new Error('Capture Source module is unavailable.');
+          const prepared=(await captureSourceModule.invoke({protocol:MODULE_PROTOCOL_VERSION,module_id:'atlas.capture-source',project_id:entry.project.id,action:'capture-markdown',parameters:{url:markdown.url,folder:markdown.folder,name:markdown.name,requestKey:markdown.request_key,caller:{actor:'user',tool:'atlas-ui',client_run_id:'toolbox-markdown:'+entry.project.id}}})).data;
+          if(prepared.status==='export_required'){renderToolbox(response,entry.project,{markdown,notice_key:'export_error'},422);return;}
+          if(!prepared.project?.id || !prepared.target?.path) {
+            renderToolbox(response,entry.project,{markdown,notice:translateUi(displayOptions().locale,'toolbox.capture_pending',displayOptions().languageCatalog)+' '+prepared.save_id+' ('+prepared.status+')'},409);return;
+          }
+          redirect(response,'/saves/'+encodeURIComponent(prepared.save_id)+'?'+new URLSearchParams({return_to:'/toolbox?project_id='+entry.project.id}));
+        }catch(error){renderToolbox(response,entry.project,{markdown,notice_key:toolboxErrorKey(error)},409);}return;
       }
       const toolboxStart = url.pathname.match(/^\/projects\/([^/]+)\/toolbox\/start$/u);
       if (toolboxStart && request.method === 'POST') {
@@ -2832,17 +2870,24 @@ export async function startAtlasUiServer({
           if (!tableWorkEnabled()) throw new Error('Table processing is paused. Open Modules to enable Table Work.');
           const ids = [...new Set(form.getAll('resource_ids').map(String))];
           if (!ids.length) throw new Error('Choose at least one CSV or XLSX material.');
-          for (const id of ids) workSourceFact(entry,id);
+          for (const id of ids) toolboxMaterialFact(entry,id);
           const tool = String(form.get('tool') ?? 'pipeline');
           if (!['pipeline','aggregate','pivot','trend'].includes(tool)) throw new Error('Choose an available Table tool.');
           const returnHref = readerReturnHref(entry,form.get('return_to'));
           const readerId = String(form.get('reader_resource_id') ?? '');
           if (readerId && !ids.includes(readerId)) throw new Error('Reader material must belong to this selection.');
           workSelections.set(projectId,{project_id:projectId,resource_ids:ids,tool_hint:tool,
+            toolbox_return_href:'/toolbox?project_id='+projectId,
             ...(readerId ? {reader_return_href:entry.base + '/resources/read?' + new URLSearchParams({resource_id:readerId,return_to:returnHref})} : {}),
             return_state:{folder:new URL(returnHref,'http://atlas.local').searchParams.get('folder') ?? '',resource_id:readerId || null,origin:{kind:'files',folder:new URL(returnHref,'http://atlas.local').searchParams.get('folder') ?? ''}}});
           redirect(response,entry.base + '/work/review');
-        } catch(error) { notices.set('toolbox:' + projectId,safeNotice(error)); redirect(response,'/toolbox?project_id=' + encodeURIComponent(projectId)); }
+         } catch(error) {
+          let selected_ids=[];
+          try {const entry=projectEntry(projectId);selected_ids=[...new Set(form.getAll('resource_ids').map(String))].filter(id=>{try{toolboxMaterialFact(entry,id);return true;}catch{return false;}});}catch{}
+          const chosen=String(form.get('tool') ?? 'pipeline');
+          toolboxDrafts.set(projectId,{selected_ids,tool:['pipeline','aggregate','pivot','trend'].includes(chosen)?chosen:'pipeline'});
+          notices.set('toolbox:'+projectId,toolboxErrorKey(error)==='capture_paused'?'paused':toolboxErrorKey(error));redirect(response,'/toolbox?project_id='+encodeURIComponent(projectId));
+        }
         return;
       }
       const manualRoute = url.pathname.match(/^\/projects\/([^/]+)\/resources\/edit(?:\/(preview|confirm|undo|recover))?$/u);

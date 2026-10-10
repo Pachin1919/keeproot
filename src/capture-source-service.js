@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fetchPublicDocument } from './public-web-capture.js';
 import { RuntimeStorage } from './runtime-storage.js';
+import { BrowserCapture } from './browser-capture.js';
 import { diffChatGptConversations, inspectChatGptExport, normalizeChatGptConversation, selectChatGptExportConversation, verifyChatGptExportInput } from './chatgpt-export-capture.js';
 
 const PARSER_ID = 'atlas.public-web-source';
@@ -211,6 +212,60 @@ export class CaptureSourceService {
 
   #versions(projectId, sourceId) {
     return this.saveService.captureSourceSaves({ projectId, sourceId });
+  }
+
+  async prepareMarkdown({ url, projectId, folder, name, requestKey, caller = {} }) {
+    if(typeof requestKey!=='string' || !requestKey.trim() || requestKey.length>256 || typeof caller.tool!=='string' || !caller.tool.trim() || caller.tool.length>128 || typeof caller.client_run_id!=='string' || !caller.client_run_id.trim() || caller.client_run_id.length>128)throw conflict('Public Markdown requires a bounded request key and caller tool/client_run_id.');
+    const sourceUrl=canonicalUrl(url); const parsed=new URL(sourceUrl);
+    if(!['http:','https:'].includes(parsed.protocol) || parsed.username || parsed.password)throw conflict('Public Markdown supports only public HTTP/HTTPS URLs without embedded credentials.');
+    const folderRelative=String(folder??'').trim()==='.'?'.':safeRelative(folder,'Markdown folder');
+    const baseName=String(name??'').trim().replace(/\.md$/iu,'');
+    if(!baseName || /[\\/:*?"<>|\u0000-\u001f\u007f]/u.test(baseName) || /[. ]$/u.test(baseName) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(baseName) || Buffer.byteLength(`${baseName}.md`,'utf8')>255)throw conflict('Markdown name must be a plain non-reserved file name of at most 255 UTF-8 bytes.');
+    const normalizedCaller={tool:caller.tool.trim(),client_run_id:caller.client_run_id.trim()};
+    const key=requestKey.trim();
+    const request={url:sourceUrl,project_id:projectId,folder:folderRelative,name:baseName,caller:normalizedCaller,request_key:key};
+    const replay=()=>{
+      const existing=this.saveService.findByRequestKey({channel:'host',caller:normalizedCaller,requestKey:key});
+      if(!existing)return null;
+      if(existing.source?.kind!=='public_markdown' || JSON.stringify(existing.parameters?.public_markdown?.request)!==JSON.stringify(request))throw conflict('This public Markdown request key was already used for different URL, Project or output facts.');
+      return this.#markdownReceipt(existing);
+    };
+    const existing=replay();if(existing)return existing;
+    const project=this.#project(projectId);
+    const folderPath=path.resolve(project.projectRoot,...folderRelative.split('/'));
+    if(folderPath!==project.projectRoot)assertNoLinks(project.projectRoot,folderPath);
+    // Inspect every existing ancestor, including the registered Root itself.
+    let cursor=path.parse(folderPath).root;
+    for(const part of folderPath.slice(cursor.length).split(path.sep).filter(Boolean)) {
+      cursor=path.join(cursor,part);let stat;
+      try{stat=fs.lstatSync(cursor);}catch{throw conflict('Markdown folder must already exist inside the active Project.');}
+      if(stat.isSymbolicLink() || !stat.isDirectory())throw conflict('Markdown folder must be a directory without symbolic links or junctions.');
+    }
+    const target=path.posix.join(project.projectPath,folderRelative,`${baseName}.md`);
+    const targetPath=path.join(folderPath,`${baseName}.md`);
+    try{fs.lstatSync(targetPath);throw conflict('Markdown target already exists. Choose a new output name; Atlas will not overwrite it.');}catch(error){if(error.code!=='ENOENT')throw error;}
+    const capture=new BrowserCapture({stateDir:this.stateDir,fetchImpl:this.fetchImpl,...(this.lookupHost?{lookupHost:this.lookupHost}:{})});
+    try {
+      let fetched;
+      try{fetched=await capture.fetchPublic({url:sourceUrl});}catch(error){if(error.code==='ATLAS_CAPTURE_EXPORT_REQUIRED')return exportRequired(sourceUrl,error.capture);throw error;}
+      const raced=replay();if(raced)return raced;
+      const facts={requested_url:sourceUrl,final_url:canonicalUrl(fetched.final_url),capture_mode:fetched.capture_mode,capture_scope:fetched.capture_scope,completeness:fetched.completeness,content_hash:fetched.content_hash,output_bytes:fetched.output_bytes,work_id:fetched.work_id,downloaded_bytes:fetched.downloaded_bytes,content_type:fetched.content_type,http_status:fetched.http_status,redirect_count:fetched.redirect_count,resolver_mode:fetched.resolver_mode,network_used:true,browser_used:false};
+      const saveOptions={root:project.workspaceRoot,candidateFile:fetched.candidate_path,expectedCandidateHash:fetched.content_hash,projectId,target,origin:'download',kind:'source',channel:'host',caller:normalizedCaller,requestKey:key,
+        source:{kind:'public_markdown',url:sourceUrl,final_url:facts.final_url,sha256:fetched.content_hash,bytes:fetched.output_bytes,work_id:fetched.work_id,capture_mode:facts.capture_mode,capture_scope:facts.capture_scope,completeness:facts.completeness},
+        parameters:{public_markdown:{request,capture:facts}},resultSummary:{format:'markdown',capture_mode:facts.capture_mode,capture_scope:facts.capture_scope,completeness:facts.completeness}};
+      let saved;
+      try {
+        const plan=this.saveService.plan(saveOptions);
+        if(plan.status!=='ready' || !plan.plan_revision || plan.target!==target)throw conflict(plan.reason??'Markdown target is not ready for Save.');
+        saved=this.saveService.prepare({...saveOptions,expectedPlanRevision:plan.plan_revision});
+      }catch(error){const completed=replay();if(completed)return completed;throw error;}
+      return this.#markdownReceipt(saved);
+    } finally { capture.dispose(); }
+  }
+
+  #markdownReceipt(saved) {
+    const facts=saved.parameters?.public_markdown?.capture??{};
+    return {...saved,...facts,preview_href:`/saves/${encodeURIComponent(saved.save_id)}`};
   }
 
   async prepare({ url, projectId, folder, name, requestKey, caller = {} }) {

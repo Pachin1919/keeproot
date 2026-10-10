@@ -16,6 +16,19 @@ Open the local address printed by the terminal. If the page is English, choose S
 
 The prepared sample contains two fictional CSV sources and a stored recipe. Save a new filename in `02_成果`, then read the result. It contains three values: 100, 80 and 20. Their arithmetic sum is 200; the recipe does not create a total row. Sources and earlier results are retained. Default filename format switching replaces the known extension rather than appending a second one.
 
+## Toolbox: public URL to Markdown and table requirements
+
+Choose a Project, then open Toolbox in the left navigation. Under Content conversion, enter a public URL, choose an existing folder and filename, then Preview. Confirm the content and destination before Save. Open the saved material and Read. Only directly readable static public pages are supported; authenticated/dynamic sources require the separate export workflow. Captured source metadata is expandable above the article; editing keeps the complete file.
+
+| Table tool | Required inputs |
+|---|---|
+| Combine and clean | CSV/XLSX and aligned fields; joins need matching keys |
+| Group and sum | A grouping field, numeric measure and unit |
+| Pivot | Two distinct grouping fields, a separate numeric measure and unit |
+| Monthly trend | Date field, numeric measure, valid month periods and unit |
+
+Missing selections, invalid fields and nonnumeric measures stop the operation. Ordinary validation errors retain the current-revision form so you can correct it. A stale draft cannot overwrite a newer revision. Back to Toolbox/Read leaves the Work available and does not Save a result. UI drafts are process-local, not restart-persistent. New Markdown preparation retains its inputs on error; an interrupted pending request stays explicit rather than repeating a write. Inspect that Save record before submitting another request.
+
 ## Try a simple analysis
 
 The prepared sample demonstrates combining and deduplicating, so it does not show an analysis summary by default. In Table Work, reuse the sample work to create a separate work, retain its column alignment and `id` deduplication, then choose grouped sum in the processing recipe. Use `region` as the dimension, `amount` as the measure, `sum` as the formula and an explicit unit. Set Sort field to No sort because `id` is not part of the grouped output. Save Recipe, then Preview before saving a new filename.

@@ -14,7 +14,7 @@ test('Capture Source Module validates its envelope and delegates bounded source 
   };
   const module = createCaptureSourceModule({ captureSource });
   assert.equal(module.describe().module_id, 'atlas.capture-source');
-  assert.deepEqual(module.describe().actions, ['inspect-export', 'prepare-export', 'capture-url', 'show', 'read']);
+  assert.deepEqual(module.describe().actions, ['inspect-export', 'prepare-export', 'capture-url', 'capture-markdown', 'show', 'read']);
   assert.deepEqual(CAPTURE_SOURCE_MODULE_DESCRIPTOR.actions, module.describe().actions);
 
   const inspected = await module.invoke({ protocol: MODULE_PROTOCOL_VERSION, module_id: 'atlas.capture-source', action: 'inspect-export', parameters: { inputPath: 'fixture.json', limit: 5 } });

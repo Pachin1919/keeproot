@@ -2,6 +2,17 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { renderResourceReaderView } from '../src/ui/views/resource-reader-view.js';
 const render = text => renderResourceReaderView({project:{id:'P-md'},reader:{kind:'markdown',text,name:'说明.md'},links:[]});
+
+test('captured Markdown keeps source metadata collapsed without changing the article or interpreting metadata HTML', () => {
+ const text='---\nsource_url: "https://example.test/"\nsource_title: "<script>bad()</script>"\ncaptured_at: "2026-10-10T00:00:00Z"\ncapture_mode: "public_http"\n---\n\n# Public article\n\nReadable body.';
+ const html=render(text),body=html.match(/<article[^>]*>([\s\S]*?)<\/article>/u)[1];
+ assert.match(body,/<details class="reader-source-metadata"><summary>Source information<\/summary>/u);
+ assert.doesNotMatch(body,/<details[^>]*\bopen\b|<script|<h[1-6][^>]*>source_url:/u);
+ assert.match(body,/&lt;script&gt;bad\(\)&lt;\/script&gt;/u);
+ assert.match(body,/<h1[^>]*>Public article<\/h1>/u);
+ assert.match(body,/<p>Readable body\.<\/p>/u);
+ assert.match(render('---\nOrdinary paragraph\n---\n\n# Article'),/Ordinary paragraph/u);
+});
 test('Markdown reader supports tables, nested lists, quotations and emphasis without loading content', () => {
  const html=render('# 标题\n\n| 项目 | 数值 |\n| --- | ---: |\n| 研究 | 85 |\n\n- 第一层\n  - 第二层 **重点**\n\n> 引用 *内容*\n\n~~已过期~~');
  assert.match(html,/<table>/);assert.match(html,/<th[^>]*>数值<\/th>/);assert.match(html,/<td[^>]*>85<\/td>/);
